@@ -52,20 +52,10 @@ flowchart TD
 Services talk over REST. Each one is independently buildable and has its own
 Dockerfile; `docker-compose.yml` wires them together for local development.
 
-### Why separate services
-
-The boundaries are drawn around *trust*, not around convenience:
-
-- **`credentials/` is the only service that can decrypt a token.** Nothing else in the
-  system holds the master key. The agent asks for an authorized client, not for
-  secrets.
-- **`auth/` is the only service that talks to external OAuth providers.** It hands
-  tokens to `credentials/` and never stores them itself.
-- **`agent/` runs model-directed code** — the least trusted component — so it gets the
-  narrowest surface: it can request actions, never raw credentials.
-
-That separation is the point of the project. A monolith would work; it just wouldn't
-make these boundaries enforceable.
+Boundaries are drawn around *trust*, not convenience — `credentials` is the only
+service that can decrypt, `auth` stores nothing, and `agent` runs model-directed code
+so it gets the narrowest surface. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the
+request flows, token lifecycle, and data model.
 
 ## Security
 
@@ -106,7 +96,7 @@ holster/
 │   └── credentials/      encrypted token storage and refresh
 ├── agent/                LangChain agent and per-service tools
 ├── db/migrations/        Supabase schema
-└── docs/                 architecture notes and decision records
+└── ARCHITECTURE.md       services, trust boundaries, data model
 ```
 
 ## License
