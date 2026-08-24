@@ -7,21 +7,17 @@ Guidance for Claude Code working in this repo.
 Holster — a unified AI chat interface over the user's connected apps. See
 [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Planning docs live **outside** the repo, in the parent directory:
-`../TASKS.md` (build plan) and `../DECISIONS.md` (why it's built this way).
-Read `../TASKS.md` before starting work — it defines the task order and branch names.
+Planning and process live **outside** the repo, in the parent directory:
 
-## Workflow
+| File | What |
+|---|---|
+| `../DEVOPS.md` | The work process, end to end. **Follow it for every task.** |
+| `../TASKS.md` | Build plan — task order and branch names |
+| `../DECISIONS.md` | Why the project is built this way |
 
-- **One branch per task**, named in `../TASKS.md`. Never commit to `main`.
-- **Ask before every commit. Ask again before every push.** Approval does not carry
-  forward to the next commit.
-- Open a PR; do not merge to `main` directly.
+## Code style
 
-## Style
-
-- Code comments: short and only where the code isn't self-evident.
-- PR descriptions: what changed and why, a few lines. No ceremony sections.
+- Comments: short, and only where the code isn't self-evident.
 - Match surrounding code. Don't introduce a second way to do something that already
   has one.
 
