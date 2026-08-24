@@ -56,7 +56,13 @@ Two features: connection management, and one chat. Resist additions.
 | `agent/` | Python, FastAPI, LangChain |
 | `db/` | Supabase (PostgreSQL) |
 
+**Package manager is `bun`.** Never run `npm`/`pnpm`/`yarn` in `web/` — it creates a
+competing lockfile. Use `bun install`, `bun add`, `bun run dev`.
+
 Icons are `lucide-react` — the set shadcn/ui ships. Do not add a second icon library.
+
+Next.js 16 differs from older versions. `web/AGENTS.md` points at
+`node_modules/next/dist/docs/` — read the relevant guide before writing app code.
 
 ## Secrets
 
