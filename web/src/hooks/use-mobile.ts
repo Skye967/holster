@@ -21,6 +21,6 @@ export function useIsMobile() {
     subscribe,
     () => getMediaQueryList().matches,
     // No viewport on the server — render the desktop sidebar.
-    () => false
+    () => false,
   )
 }

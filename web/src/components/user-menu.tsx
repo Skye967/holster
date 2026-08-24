@@ -1,7 +1,7 @@
-"use client";
+"use client"
 
-import { useClerk, useUser } from "@clerk/nextjs";
-import { ChevronsUpDown, LogOut } from "lucide-react";
+import { useClerk, useUser } from "@clerk/nextjs"
+import { ChevronsUpDown, LogOut } from "lucide-react"
 
 import {
   DropdownMenu,
@@ -11,17 +11,17 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+} from "@/components/ui/dropdown-menu"
 import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
-} from "@/components/ui/sidebar";
-import { Skeleton } from "@/components/ui/skeleton";
+} from "@/components/ui/sidebar"
+import { Skeleton } from "@/components/ui/skeleton"
 
 export function UserMenu() {
-  const { isLoaded, user } = useUser();
-  const { signOut } = useClerk();
+  const { isLoaded, user } = useUser()
+  const { signOut } = useClerk()
 
   if (!isLoaded || !user) {
     return (
@@ -31,12 +31,12 @@ export function UserMenu() {
           <Skeleton className="h-12 w-full" />
         </SidebarMenuItem>
       </SidebarMenu>
-    );
+    )
   }
 
-  const email = user.primaryEmailAddress?.emailAddress;
+  const email = user.primaryEmailAddress?.emailAddress
   // Clerk allows an account with no name set — fall back to the email.
-  const name = user.fullName ?? email ?? "Account";
+  const name = user.fullName ?? email ?? "Account"
 
   return (
     <SidebarMenu>
@@ -72,5 +72,5 @@ export function UserMenu() {
         </DropdownMenu>
       </SidebarMenuItem>
     </SidebarMenu>
-  );
+  )
 }

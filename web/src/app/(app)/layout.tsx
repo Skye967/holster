@@ -1,20 +1,20 @@
-import { auth } from "@clerk/nextjs/server";
-import { cookies } from "next/headers";
+import { auth } from "@clerk/nextjs/server"
+import { cookies } from "next/headers"
 
-import { AppSidebar } from "@/components/app-sidebar";
+import { AppSidebar } from "@/components/app-sidebar"
 import {
   SidebarInset,
   SidebarProvider,
   SidebarTrigger,
-} from "@/components/ui/sidebar";
+} from "@/components/ui/sidebar"
 
 export default async function AppLayout({ children }: LayoutProps<"/">) {
-  await auth.protect();
+  await auth.protect()
 
   // SidebarProvider writes this cookie on toggle — read it back so a collapsed
   // sidebar survives a reload.
-  const cookieStore = await cookies();
-  const defaultOpen = cookieStore.get("sidebar_state")?.value !== "false";
+  const cookieStore = await cookies()
+  const defaultOpen = cookieStore.get("sidebar_state")?.value !== "false"
 
   return (
     <SidebarProvider defaultOpen={defaultOpen}>
@@ -26,5 +26,5 @@ export default async function AppLayout({ children }: LayoutProps<"/">) {
         <div className="flex-1">{children}</div>
       </SidebarInset>
     </SidebarProvider>
-  );
+  )
 }

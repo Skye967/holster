@@ -4,11 +4,11 @@ Next.js frontend. TypeScript, Tailwind, shadcn/ui, Clerk for auth.
 
 ## Routes
 
-| Route | Purpose |
-|---|---|
-| `/sign-in`, `/sign-up` | Clerk-hosted authentication |
-| `/chat` | The single unified conversation (default view after sign-in) |
-| `/connections` | Add and remove authorized apps |
+| Route                  | Purpose                                                      |
+| ---------------------- | ------------------------------------------------------------ |
+| `/sign-in`, `/sign-up` | Clerk-hosted authentication                                  |
+| `/chat`                | The single unified conversation (default view after sign-in) |
+| `/connections`         | Add and remove authorized apps                               |
 
 ## Notes
 
@@ -16,7 +16,7 @@ Next.js frontend. TypeScript, Tailwind, shadcn/ui, Clerk for auth.
   exactly. Don't introduce a second icon library.
 - **The browser never receives an OAuth token.** Connecting an app is a redirect to
   the provider; the resulting tokens go straight to `services/credentials` and stay
-  server-side. The frontend only ever learns *that* a service is connected.
+  server-side. The frontend only ever learns _that_ a service is connected.
 - **No service picker in chat.** The agent decides what to reach for. If you find
   yourself adding a dropdown to choose a service, that's scope creep.
 

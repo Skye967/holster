@@ -1,10 +1,10 @@
-"use client";
+"use client"
 
-import { MessageSquare, Plug } from "lucide-react";
-import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { MessageSquare, Plug } from "lucide-react"
+import Link from "next/link"
+import { usePathname } from "next/navigation"
 
-import { UserMenu } from "@/components/user-menu";
+import { UserMenu } from "@/components/user-menu"
 import {
   Sidebar,
   SidebarContent,
@@ -14,15 +14,15 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
-} from "@/components/ui/sidebar";
+} from "@/components/ui/sidebar"
 
 const nav = [
   { title: "Chat", href: "/chat", icon: MessageSquare },
   { title: "Connections", href: "/connections", icon: Plug },
-];
+]
 
 export function AppSidebar() {
-  const pathname = usePathname();
+  const pathname = usePathname()
 
   return (
     <Sidebar>
@@ -59,5 +59,5 @@ export function AppSidebar() {
         <UserMenu />
       </SidebarFooter>
     </Sidebar>
-  );
+  )
 }
