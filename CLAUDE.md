@@ -37,6 +37,11 @@ These are the point of the project. Do not break them for convenience.
 - **Row-level security on every user-scoped table**, keyed on the Clerk user ID.
 - **The agent never writes to a connected service.** It reads, searches, and drafts.
   Sending requires user approval.
+- **`proxy.ts` is not an authorization boundary.** It only attaches auth state. Every
+  page, route handler, and server action that touches protected data calls
+  `await auth.protect()` itself. Do not reintroduce `createRouteMatcher` — it is
+  deprecated, and path matching can diverge from how Next routes requests, leaving
+  protected resources reachable.
 
 ## Scope
 
