@@ -1,0 +1,77 @@
+# Local development topology.
+#
+# Services are commented out until they exist — uncomment each one as it lands so
+# that `docker compose up` always works on a fresh clone rather than failing on a
+# missing build context.
+
+services:
+  # --- Frontend -------------------------------------------------------------
+  # web:
+  #   build: ./web
+  #   ports: ["3000:3000"]
+  #   environment:
+  #     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+  #     CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
+  #     NEXT_PUBLIC_GATEWAY_URL: ${NEXT_PUBLIC_GATEWAY_URL}
+  #   depends_on: [gateway]
+
+  # --- API gateway ----------------------------------------------------------
+  # gateway:
+  #   build: ./services/gateway
+  #   ports: ["8080:8080"]
+  #   environment:
+  #     AUTH_SERVICE_URL: ${AUTH_SERVICE_URL}
+  #     CREDENTIALS_SERVICE_URL: ${CREDENTIALS_SERVICE_URL}
+  #     AGENT_SERVICE_URL: ${AGENT_SERVICE_URL}
+  #   depends_on: [auth, credentials, agent]
+
+  # --- Auth: Clerk verification + external OAuth flows ----------------------
+  # auth:
+  #   build: ./services/auth
+  #   ports: ["8081:8081"]
+  #   environment:
+  #     CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
+  #     DATABASE_URL: ${DATABASE_URL}
+  #     CREDENTIALS_SERVICE_URL: ${CREDENTIALS_SERVICE_URL}
+  #     OAUTH_REDIRECT_BASE_URL: ${OAUTH_REDIRECT_BASE_URL}
+  #     GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+  #     GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+
+  # --- Credentials: the only service holding the master key -----------------
+  # credentials:
+  #   build: ./services/credentials
+  #   ports: ["8082:8082"]
+  #   environment:
+  #     DATABASE_URL: ${DATABASE_URL}
+  #     CREDENTIALS_MASTER_KEY: ${CREDENTIALS_MASTER_KEY}
+
+  # --- Agent: LangChain orchestration ---------------------------------------
+  # agent:
+  #   build: ./agent
+  #   ports: ["8000:8000"]
+  #   environment:
+  #     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  #     CREDENTIALS_SERVICE_URL: ${CREDENTIALS_SERVICE_URL}
+  #     DATABASE_URL: ${DATABASE_URL}
+
+  # --- Local Postgres -------------------------------------------------------
+  # Supabase hosts the real database; this is a local stand-in so the stack runs
+  # offline. Point DATABASE_URL at Supabase to use the hosted one instead.
+  postgres:
+    image: postgres:16-alpine
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: holster
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d holster"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
