@@ -1,7 +1,7 @@
-import { auth } from "@clerk/nextjs/server";
+import { auth } from "@clerk/nextjs/server"
 
 export default async function ConnectionsPage() {
-  await auth.protect();
+  await auth.protect()
 
   return (
     <div className="p-6">
@@ -10,5 +10,5 @@ export default async function ConnectionsPage() {
         No services connected yet.
       </p>
     </div>
-  );
+  )
 }
