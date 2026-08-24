@@ -1,6 +1,14 @@
 # db
 
-Supabase (PostgreSQL). Migrations in `migrations/`, applied in filename order.
+Supabase (PostgreSQL). Schema reference for the tables below.
+
+Migrations live in `supabase/migrations/` at the repo root, not here — that is the
+only path the Supabase CLI discovers. Filenames are timestamp-prefixed and applied
+in that order:
+
+```
+supabase db push --db-url "$DATABASE_URL"
+```
 
 ## Planned schema
 
