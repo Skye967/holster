@@ -95,7 +95,8 @@ holster/
 │   ├── auth/             Clerk session verification + external OAuth
 │   └── credentials/      encrypted token storage and refresh
 ├── agent/                LangChain agent and per-service tools
-├── db/migrations/        Supabase schema
+├── db/                   Schema reference
+├── supabase/migrations/  Supabase migrations
 └── ARCHITECTURE.md       services, trust boundaries, data model
 ```
 
