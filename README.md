@@ -1,11 +1,12 @@
 # Holster
 
-A unified AI chat interface over the apps you already use.
+Search and recommendation across the streaming services you actually subscribe to.
 
-Most apps have poor search. Netflix can't tell you what you'd actually want to watch
-tonight, Instagram can't find that post your friend made last month, and YouTube's
-search ignores half your subscriptions. Holster puts one conversation in front of all
-of them: authorize an app once, then just ask.
+Every streaming service recommends from its own catalog. Netflix is structurally
+incapable of telling you that the thing you'd like is on Hulu — so you pay for four
+services and still scroll for twenty minutes. Holster puts one conversation in front of
+all of them: say what you're in the mood for, get back something you can actually watch
+tonight, on a service you already have.
 
 ## Status
 
@@ -13,25 +14,25 @@ Early. Scaffolding is in place; services are being built one at a time.
 
 | Component | Stack | Status |
 |---|---|---|
-| `web/` | Next.js, TypeScript, Tailwind, shadcn/ui | Not started |
+| `web/` | Next.js, TypeScript, Tailwind, shadcn/ui | Shell + auth done |
 | `services/gateway/` | Go | Not started |
 | `services/auth/` | Go | Not started |
 | `services/credentials/` | Go | Not started |
 | `agent/` | Python, FastAPI, LangChain | Not started |
-| `db/` | Supabase (PostgreSQL) | Not started |
+| `db/` | Supabase (PostgreSQL) | Initial schema |
 
 ## Scope
 
 Two features. Deliberately.
 
-1. **Connections** — add and remove authorized apps. Adding is a search: type the app
-   name, confirm it's the right one from its description, get redirected to that
-   service's own OAuth screen, come back connected.
-2. **Chat** — one conversation, no service picker. The agent has access to everything
-   you've authorized and decides what to reach for based on what you asked.
+1. **Connections** — two kinds. Tick the streaming services you subscribe to (there is
+   no OAuth for Netflix or Hulu; none is published). Separately, connect Spotify or
+   YouTube over OAuth so recommendations know what you've been into.
+2. **Chat** — one conversation, no service picker. The agent decides what to reach for
+   based on what you asked.
 
-Holster reads and researches. It can draft a reply for you to review. It never sends
-anything on your behalf.
+Every connected scope is read-only. Holster reads and recommends; it never writes to a
+connected service.
 
 ## Architecture
 
@@ -42,8 +43,9 @@ flowchart TD
     G --> A["services/auth/<br/>Go — OAuth flows"]
     G --> C["services/credentials/<br/>Go — token vault"]
     G --> AG["agent/<br/>Python + LangChain"]
+    AG -->|"catalog query"| TMDB([TMDB])
     AG -->|"needs a token"| C
-    AG -->|"authorized API calls"| EXT([YouTube, Gmail, ...])
+    AG -->|"authorized API calls"| EXT([Spotify, YouTube])
     A --> DB[("Supabase<br/>PostgreSQL")]
     C --> DB
     AG --> DB
@@ -67,8 +69,7 @@ OAuth tokens are the entire risk surface here, so:
   from a master key held only in `services/credentials/`. A dump of the database is
   not a dump of anyone's accounts.
 - **Access tokens refresh in the background** and are never sent to the browser.
-- **Nothing is written to a third-party service on your behalf** without you approving
-  it first.
+- **Every scope is read-only.** Nothing is ever written to a connected service.
 
 Secrets come from the environment. See `.env.example` — it lists every variable and
 holds no real values. Never commit a filled-in `.env`.
@@ -99,6 +100,12 @@ holster/
 ├── supabase/migrations/  Supabase migrations
 └── ARCHITECTURE.md       services, trust boundaries, data model
 ```
+
+## Credits
+
+Catalog and streaming-availability data from [TMDB](https://www.themoviedb.org/) and
+[JustWatch](https://www.justwatch.com/). This product uses the TMDB API but is not
+endorsed or certified by TMDB.
 
 ## License
 
