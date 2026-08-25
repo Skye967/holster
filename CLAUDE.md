@@ -45,12 +45,20 @@ These are the point of the project. Do not break them for convenience.
 
 ## Scope
 
-Two features: connection management, and one chat. Resist additions.
+Search and recommendation across the streaming services a user subscribes to. Two
+features: connection management, and one chat. Resist additions.
 
-- **No service picker in the chat.** Choosing a provider is the agent's job. A
-  dropdown to pick a service is scope creep, not a feature.
-- Provider search is limited to providers with a registered OAuth client. "Any app"
-  is not possible — OAuth requires prior registration.
+- **No service picker in the chat.** Choosing a tool is the agent's job. A dropdown to
+  pick a service is scope creep, not a feature.
+- **Two classes of tool.** Catalog tools (TMDB) use one app-level key and work for
+  every user with no connection. Connected tools (Spotify, YouTube) need a per-user
+  OAuth token and go through `credentials`. Do not blur them.
+- **Streaming services are a preference, not a connection.** Netflix and Hulu publish
+  no OAuth. Users tick what they subscribe to; those rows hold no secret and must not
+  go near `credentials`.
+- **Every catalog query carries `watch_region`.** Availability is country-specific.
+- Adding a provider is config, not a new handler. If it needs Go changes, the registry
+  design failed.
 
 ## Stack
 
