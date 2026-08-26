@@ -1,25 +1,32 @@
 # gateway
 
-Go. The only service the frontend talks to.
+Go. The only service the frontend talks to, and the only one that writes.
 
 ## Responsibility
 
-Terminate requests from `web/`, verify the caller's Clerk session, and fan out to the
-internal services. Nothing else in the system is exposed to the browser.
+Terminate requests from `web/`, verify the caller's Clerk session, own every database
+write, and hand catalog questions to `agent/`. Nothing else in the system is exposed to
+the browser.
 
 ## Endpoints (planned)
 
-| Method | Path | Goes to |
+| Method | Path | Does |
 |---|---|---|
-| `POST` | `/api/chat` | `agent/` |
-| `GET` | `/api/connections` | `credentials/` |
-| `POST` | `/api/connections/search` | `auth/` — find a provider by name |
-| `POST` | `/api/connections/:provider` | `auth/` — begin OAuth |
-| `DELETE` | `/api/connections/:provider` | `credentials/` — revoke and delete |
+| `GET` | `/health` | liveness |
+| `POST` | `/api/chat` | assemble context, call `agent/`, persist the exchange |
+| `GET` | `/api/subscriptions` | available providers for the user's country, plus their picks |
+| `POST` | `/api/subscriptions/:id` | tick a service |
+| `DELETE` | `/api/subscriptions/:id` | untick a service |
+| `POST` | `/api/titles/:id/verdict` | liked, disliked, seen, not interested |
 
 ## Rules
 
-- Resolves the Clerk user ID once, at the edge, and passes it inward. Internal
-  services trust the gateway for identity and do not re-verify sessions.
-- Never touches the master encryption key, and never proxies a raw token to the
-  client.
+- Resolves the Clerk user ID once, at the edge, and passes it inward. The agent trusts
+  the gateway for identity and does not re-verify sessions.
+- **Owns every write.** The agent has no write path to the database by design; if a
+  feature needs one, it belongs here.
+- Assembles the context the agent needs — subscriptions, country, recent verdicts — so
+  the agent never needs broad database access.
+- Serves the cached provider list from `streaming_providers`, refreshing it from TMDB
+  when the row for that country is older than 24h. If TMDB fails, serve the stale row
+  rather than failing the request.

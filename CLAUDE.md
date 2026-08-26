@@ -4,8 +4,8 @@ Guidance for Claude Code working in this repo.
 
 ## What this is
 
-Holster — a unified AI chat interface over the user's connected apps. See
-[README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
+Holster — chat-driven search and recommendation across the streaming services a user
+subscribes to. See [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Planning and process live **outside** the repo, in the parent directory:
 
@@ -25,18 +25,24 @@ Planning and process live **outside** the repo, in the parent directory:
 
 These are the point of the project. Do not break them for convenience.
 
-- **Only `services/credentials` decrypts.** It alone reads `CREDENTIALS_MASTER_KEY`.
-  Never pass that key to another service, and never import decryption as a library
-  elsewhere.
-- **Never return a plaintext token over the network** — not to the agent, not to the
-  gateway, not to the browser. Callers ask `credentials` to perform the request.
-- **`services/auth` stores nothing.** It forwards tokens to `credentials` and drops
-  them.
-- **Token columns are `bytea` and always ciphertext.** No migration may add a `text`
-  token column.
+The agent runs model-directed control flow over text anyone can edit — film overviews,
+reviews, user messages. Assume it will eventually be manipulated, and keep that
+survivable.
+
+- **The agent never writes.** Not to the database, not anywhere. Every mutation goes
+  through the gateway. Its database role has no `insert`, `update` or `delete` grant,
+  and that grant must not be added.
+- **The agent is never reachable from the internet.** Only the gateway is exposed.
+- **Agent tools are a fixed, declared list.** Never add a tool that takes a URL, an
+  endpoint, or a raw query from the model. Parameters may be filled in from a declared
+  set; the destination may not.
+- **The agent holds exactly one secret** — the TMDB key, which is app-level. If a
+  change would give it a second, that change is wrong.
 - **Row-level security on every user-scoped table**, keyed on the Clerk user ID.
-- **The agent never writes to a connected service.** It reads, searches, and drafts.
-  Sending requires user approval.
+- **Every catalog query carries `watch_region`.** Availability is country-specific.
+- **No table holds a credential.** Holster stores no secret belonging to any other
+  service, for any user. There is no encryption layer because there is nothing to
+  encrypt — do not reintroduce one without reintroducing the thing it protects.
 - **`proxy.ts` is not an authorization boundary.** It only attaches auth state. Every
   page, route handler, and server action that touches protected data calls
   `await auth.protect()` itself. Do not reintroduce `createRouteMatcher` — it is
@@ -50,22 +56,20 @@ features: connection management, and one chat. Resist additions.
 
 - **No service picker in the chat.** Choosing a tool is the agent's job. A dropdown to
   pick a service is scope creep, not a feature.
-- **Two classes of tool.** Catalog tools (TMDB) use one app-level key and work for
-  every user with no connection. Connected tools (Spotify, YouTube) need a per-user
-  OAuth token and go through `credentials`. Do not blur them.
 - **Streaming services are a preference, not a connection.** Netflix and Hulu publish
-  no OAuth. Users tick what they subscribe to; those rows hold no secret and must not
-  go near `credentials`.
-- **Every catalog query carries `watch_region`.** Availability is country-specific.
-- Adding a provider is config, not a new handler. If it needs Go changes, the registry
-  design failed.
+  no OAuth. Users tick what they subscribe to; those rows hold no secret.
+- **No OAuth to third-party services.** Spotify and YouTube were planned and cut. Do
+  not add a provider without revisiting `DECISIONS.md` — the whole credential
+  architecture was removed with them, and adding one back means adding all of it back.
+- **Taste comes from inside the app** — what the user subscribes to, what they type,
+  and the verdicts they give on titles. Not from an external history feed.
 
 ## Stack
 
 | Path | Stack |
 |---|---|
 | `web/` | Next.js, TypeScript, Tailwind, shadcn/ui, Clerk |
-| `services/*` | Go |
+| `services/gateway/` | Go |
 | `agent/` | Python, FastAPI, LangChain |
 | `db/` | Supabase (PostgreSQL) |
 
@@ -76,6 +80,13 @@ Icons are `lucide-react` — the set shadcn/ui ships. Do not add a second icon l
 
 Next.js 16 differs from older versions. `web/AGENTS.md` points at
 `node_modules/next/dist/docs/` — read the relevant guide before writing app code.
+
+## Attribution
+
+TMDB's free tier is non-commercial and requires attribution: the TMDB logo plus
+*"This product uses the TMDb API but is not endorsed or certified by TMDb"* in an About
+or Credits section. Watch-provider data comes from JustWatch and must be credited to
+them. This is a shipping requirement, not a nicety.
 
 ## Secrets
 

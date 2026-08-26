@@ -23,7 +23,7 @@ create table connected_services (
   unique (user_id, provider)
 );
 
--- Deny-by-default until T7 adds policies. Supabase exposes public tables
+-- Deny-by-default until T10 adds policies. Supabase exposes public tables
 -- through PostgREST, so tables without RLS are readable by anyone holding
 -- the publishable key.
 alter table users enable row level security;
