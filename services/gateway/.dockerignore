@@ -1,0 +1,7 @@
+# Keep the build context to source only. Without this, `COPY . .` would ship a
+# locally built binary and any stray .env into the image layers.
+gateway
+.env
+.env.*
+*_test.go
+README.md

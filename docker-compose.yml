@@ -2,7 +2,8 @@
 #
 # Services are commented out until they exist — uncomment each one as it lands so
 # that `docker compose up` always works on a fresh clone rather than failing on a
-# missing build context.
+# missing build context. Services that need secrets also need their `.env`
+# entries filled in; they refuse to start without them, by design.
 
 services:
   # --- Frontend -------------------------------------------------------------
@@ -16,16 +17,16 @@ services:
   #   depends_on: [gateway]
 
   # --- API gateway: the only exposed service, and the only writer -----------
-  # gateway:
-  #   build: ./services/gateway
-  #   ports: ["8080:8080"]
-  #   environment:
-  #     CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
-  #     CLERK_JWKS_URL: ${CLERK_JWKS_URL}
-  #     DATABASE_URL: ${DATABASE_URL}
-  #     AGENT_SERVICE_URL: ${AGENT_SERVICE_URL}
-  #     TMDB_API_KEY: ${TMDB_API_KEY}
-  #   depends_on: [agent, postgres]
+  # No depends_on yet — the gateway opens no database connection until T8.
+  gateway:
+    build: ./services/gateway
+    ports: ["${GATEWAY_PORT:-8080}:${GATEWAY_PORT:-8080}"]
+    environment:
+      CLERK_JWKS_URL: ${CLERK_JWKS_URL}
+      CLERK_ISSUER: ${CLERK_ISSUER}
+      CLERK_AUTHORIZED_PARTIES: ${CLERK_AUTHORIZED_PARTIES}
+      GATEWAY_PORT: ${GATEWAY_PORT:-8080}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
 
   # --- Agent: LangChain orchestration, read-only, not exposed ---------------
   # agent:
