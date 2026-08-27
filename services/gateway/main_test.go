@@ -18,7 +18,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
@@ -209,55 +208,38 @@ func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 	}
 }
 
-// failureClass must stay a closed set: the sampler keys on it, so an unbounded
-// label set would be a memory-exhaustion vector.
-func TestFailureClassIsClosed(t *testing.T) {
+// authFailure is a log field and a future metric label, so its range must stay
+// closed and must never carry token-derived data.
+func TestAuthFailureIsClosedSet(t *testing.T) {
 	allowed := map[string]bool{
+		"expired": true, "malformed": true, "not_yet_valid": true,
 		"no_kid": true, "no_subject": true, "unauthorized_party": true,
 		"bad_signature": true, "bad_issuer": true, "missing_claim": true,
-		"unverifiable": true, "other": true,
+		"unverifiable": true,
 	}
-	inputs := []error{
+	routine := map[string]bool{"expired": true, "malformed": true, "not_yet_valid": true}
+
+	for _, err := range []error{
+		jwt.ErrTokenExpired, jwt.ErrTokenMalformed, jwt.ErrTokenNotValidYet,
 		errNoKID, errNoSubject, errUnauthorizedParty,
 		jwt.ErrTokenSignatureInvalid, jwt.ErrTokenInvalidIssuer,
 		jwt.ErrTokenRequiredClaimMissing, jwt.ErrTokenUnverifiable,
 		errors.New("something nobody anticipated"),
 		fmt.Errorf("attacker controlled %s", strings.Repeat("A", 5000)),
-	}
-	for _, err := range inputs {
-		if class := failureClass(err); !allowed[class] {
-			t.Errorf("failureClass(%v) = %q, outside the closed set", err, class)
+	} {
+		reason, anomaly := authFailure(fmt.Errorf("wrapped: %w", err))
+		if !allowed[reason] {
+			t.Errorf("authFailure(%v) = %q, outside the closed set", err, reason)
+		}
+		if anomaly == routine[reason] {
+			t.Errorf("authFailure(%v) = %q, anomaly=%v — misclassified", err, reason, anomaly)
 		}
 	}
 }
 
-func TestTruncateError(t *testing.T) {
-	short := errors.New("token has no subject")
-	if got := truncateError(short); got != short.Error() {
-		t.Errorf("short error was altered: %q", got)
-	}
-
-	long := fmt.Errorf(`key not found %q`, strings.Repeat("P", 4000))
-	got := truncateError(long)
-	if len(got) > maxLoggedError+len("…(truncated)") {
-		t.Errorf("truncated length = %d, want <= %d", len(got), maxLoggedError+len("…(truncated)"))
-	}
-	if !strings.HasSuffix(got, "(truncated)") {
-		t.Errorf("truncation not marked: %q", got)
-	}
-
-	// A multi-byte sequence must not be split into invalid UTF-8, or the log
-	// handler will emit replacement characters for attacker-chosen input.
-	multi := errors.New(strings.Repeat("é", 4000))
-	if got := truncateError(multi); !utf8.ValidString(got) {
-		t.Error("truncation produced invalid UTF-8")
-	}
-}
-
-// Attacker-controlled data reaches error strings via the kid. keyfunc's refresh
-// limiter changes the error after the first request, so this asserts on the
-// FIRST one — testing later requests reads a false negative.
-func TestOversizedKIDDoesNotInflateLog(t *testing.T) {
+// Nothing token-derived may reach the log, at any size. The raw error is not
+// logged precisely because keyfunc embeds the key id in it.
+func TestOversizedKIDNeverReachesLog(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	h := newTestHandler(t, key, "kid_A")
 
@@ -271,121 +253,52 @@ func TestOversizedKIDDoesNotInflateLog(t *testing.T) {
 	srv.ServeHTTP(httptest.NewRecorder(), req)
 
 	t.Logf("log line for a 4000-char kid: %d bytes", buf.Len())
-	if buf.Len() > 1000 {
-		t.Errorf("a 4000-char kid produced a %d byte log line, want bounded", buf.Len())
+	if bytes.Contains(buf.Bytes(), []byte("PPPP")) {
+		t.Error("the key id reached the log")
 	}
-	// A run longer than the truncation limit means truncation did not apply.
-	if bytes.Contains(buf.Bytes(), bytes.Repeat([]byte("P"), maxLoggedError+1)) {
-		t.Error("the oversized kid reached the log untruncated")
-	}
-}
-
-// One noisy class must not consume another's budget.
-func TestSamplerDoesNotStarveOtherClasses(t *testing.T) {
-	s := newLogSampler(time.Second, 5)
-
-	flooded := 0
-	for range 10000 {
-		if ok, _ := s.allow("bad_signature"); ok {
-			flooded++
-		}
-	}
-	if flooded > 5 {
-		t.Errorf("flood produced %d lines, want <= burst of 5", flooded)
-	}
-
-	genuine := 0
-	for range 50 {
-		if ok, _ := s.allow("unauthorized_party"); ok {
-			genuine++
-		}
-	}
-	if genuine == 0 {
-		t.Error("a different class was starved out by the flood")
+	if buf.Len() > 300 {
+		t.Errorf("log line is %d bytes, want a bounded reason code", buf.Len())
 	}
 }
 
-// Suppression must not be silent.
-func TestSamplerReportsDrops(t *testing.T) {
-	s := newLogSampler(10*time.Millisecond, 1)
-	if ok, dropped := s.allow("k"); !ok || dropped != 0 {
-		t.Fatalf("first call: ok=%v dropped=%d, want true/0", ok, dropped)
-	}
-	for range 99 {
-		s.allow("k")
-	}
-	time.Sleep(20 * time.Millisecond)
-	ok, dropped := s.allow("k")
-	if !ok {
-		t.Fatal("limiter did not refill")
-	}
-	if dropped != 99 {
-		t.Errorf("dropped = %d, want 99", dropped)
-	}
-	// The counter resets once reported, so drops are not double counted.
-	time.Sleep(20 * time.Millisecond)
-	if _, dropped := s.allow("k"); dropped != 0 {
-		t.Errorf("dropped = %d after reporting, want 0", dropped)
-	}
-}
-
-// Routine token lifecycle must not be logged; anomalies must be.
-func TestRoutineFailureClassification(t *testing.T) {
-	routine := []error{jwt.ErrTokenExpired, jwt.ErrTokenMalformed, jwt.ErrTokenNotValidYet}
-	for _, err := range routine {
-		if !routineFailure(fmt.Errorf("wrapped: %w", err)) {
-			t.Errorf("%v classified as an anomaly, want routine", err)
-		}
-	}
-
-	anomalies := []error{
-		jwt.ErrTokenSignatureInvalid,
-		jwt.ErrTokenInvalidIssuer,
-		jwt.ErrTokenUnverifiable,
-		errNoKID,
-		errNoSubject,
-		errUnauthorizedParty,
-	}
-	for _, err := range anomalies {
-		if routineFailure(fmt.Errorf("wrapped: %w", err)) {
-			t.Errorf("%v classified as routine, want anomaly", err)
-		}
-	}
-}
-
-// An attacker must not be able to drive unbounded log volume.
-func TestAnomalyLoggingIsRateLimited(t *testing.T) {
+// Routine lifecycle failures log at INFO, anomalies at WARN, so volume can be
+// filtered by level in the collector rather than dropped here.
+func TestLogLevelByFailureKind(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	h := newTestHandler(t, key, "kid_A")
 
 	var buf bytes.Buffer
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
 	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil))) })
-
 	srv := correlationID(h.authMiddleware(http.HandlerFunc(h.example)))
-	attacker, _ := rsa.GenerateKey(rand.Reader, 2048)
 
-	// 500 forged signatures: an anomaly class, so eligible for logging.
-	for range 500 {
+	send := func(token string) string {
+		buf.Reset()
 		req := httptest.NewRequest("GET", "/api/example", nil)
-		req.Header.Set("Authorization", "Bearer "+mint(t, "kid_A", attacker, validClaims()))
+		req.Header.Set("Authorization", "Bearer "+token)
 		srv.ServeHTTP(httptest.NewRecorder(), req)
-	}
-	if lines := bytes.Count(buf.Bytes(), []byte("\n")); lines > 10 {
-		t.Errorf("500 forged tokens produced %d log lines, want <= 10 (burst)", lines)
+		var rec map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+			t.Fatalf("no log record: %v (%q)", err, buf.String())
+		}
+		return rec["level"].(string) + " " + rec["reason"].(string)
 	}
 
-	// Routine expiry must produce nothing at all.
-	buf.Reset()
 	expired := validClaims()
 	expired.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Hour))
-	for range 100 {
-		req := httptest.NewRequest("GET", "/api/example", nil)
-		req.Header.Set("Authorization", "Bearer "+mint(t, "kid_A", key, expired))
-		srv.ServeHTTP(httptest.NewRecorder(), req)
+	if got := send(mint(t, "kid_A", key, expired)); got != "INFO expired" {
+		t.Errorf("expired token logged as %q, want \"INFO expired\"", got)
 	}
-	if buf.Len() != 0 {
-		t.Errorf("expired tokens logged %d bytes, want 0: %s", buf.Len(), buf.String())
+
+	other, _ := rsa.GenerateKey(rand.Reader, 2048)
+	if got := send(mint(t, "kid_A", other, validClaims())); got != "WARN bad_signature" {
+		t.Errorf("forged signature logged as %q, want \"WARN bad_signature\"", got)
+	}
+
+	badAzp := validClaims()
+	badAzp.Azp = "https://evil.example.com"
+	if got := send(mint(t, "kid_A", key, badAzp)); got != "WARN unauthorized_party" {
+		t.Errorf("wrong azp logged as %q, want \"WARN unauthorized_party\"", got)
 	}
 }
 

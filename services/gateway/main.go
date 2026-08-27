@@ -10,15 +10,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
-	"unicode/utf8"
 
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	"golang.org/x/time/rate"
 )
 
 // Private key type so context values cannot collide with another package's.
@@ -46,116 +43,50 @@ var (
 	errUnauthorizedParty = errors.New("unauthorized party")
 )
 
-// failureClass maps a rejection onto a closed set of labels. It must stay closed:
-// logSampler keys on it, so a label derived from error text would let anyone who
-// can influence an error message grow the sampler's map without bound.
-func failureClass(err error) string {
-	switch {
-	case errors.Is(err, errNoKID):
-		return "no_kid"
-	case errors.Is(err, errNoSubject):
-		return "no_subject"
-	case errors.Is(err, errUnauthorizedParty):
-		return "unauthorized_party"
-	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
-		return "bad_signature"
-	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
-		return "bad_issuer"
-	case errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
-		return "missing_claim"
-	case errors.Is(err, jwt.ErrTokenUnverifiable):
-		return "unverifiable"
-	default:
-		return "other"
-	}
-}
-
-// maxLoggedError caps the error text on a log line. Error strings can embed
-// attacker-controlled data — an unknown kid reaches keyfunc's `key not found "…"`
-// error, and a token header may carry up to MaxHeaderBytes of it. failureClass
-// bounds the log's key; this bounds its value.
-const maxLoggedError = 200
-
-func truncateError(err error) string {
-	s := err.Error()
-	if len(s) <= maxLoggedError {
-		return s
-	}
-	// Cut on a rune boundary so an attacker-supplied multi-byte sequence cannot
-	// be split into invalid UTF-8.
-	cut := maxLoggedError
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + "…(truncated)"
-}
-
-// logSampler bounds how often each class may be logged and counts what it drops
-// in between. Keying per class is what stops a flood of one failure from hiding
-// another; the drop count is what stops suppression from being silent.
+// authFailure is why a token was rejected. Fixed set: it is a log field and an
+// eventual metric label, so it must never carry token-derived data. The bool
+// separates ordinary token lifecycle from anomalies worth a warning.
 //
-// Modelled on zap's sampler, which keys the same way, but with a hard bucket
-// rather than zap's "every Mth thereafter" — output must stay bounded under a
-// flood, not merely proportional.
-type logSampler struct {
-	mu       sync.Mutex
-	every    time.Duration
-	burst    int
-	limiters map[string]*rate.Limiter
-	dropped  map[string]uint64
-}
-
-func newLogSampler(every time.Duration, burst int) *logSampler {
-	return &logSampler{
-		every:    every,
-		burst:    burst,
-		limiters: map[string]*rate.Limiter{},
-		dropped:  map[string]uint64{},
+// Clerk performs authentication; this service only verifies tokens, so an expired
+// one is a 60s timer elapsing, not a failed credential attempt.
+func authFailure(err error) (reason string, anomaly bool) {
+	switch {
+	case errors.Is(err, jwt.ErrTokenExpired):
+		return "expired", false
+	case errors.Is(err, jwt.ErrTokenMalformed):
+		return "malformed", false
+	case errors.Is(err, jwt.ErrTokenNotValidYet):
+		return "not_yet_valid", false
+	case errors.Is(err, errNoKID):
+		return "no_kid", true
+	case errors.Is(err, errNoSubject):
+		return "no_subject", true
+	case errors.Is(err, errUnauthorizedParty):
+		return "unauthorized_party", true
+	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
+		return "bad_signature", true
+	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
+		return "bad_issuer", true
+	case errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
+		return "missing_claim", true
+	default:
+		return "unverifiable", true
 	}
-}
-
-// allow reports whether to log this class now, and how many of it were dropped
-// since the last one that was logged.
-func (s *logSampler) allow(class string) (bool, uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	l, ok := s.limiters[class]
-	if !ok {
-		l = rate.NewLimiter(rate.Every(s.every), s.burst)
-		s.limiters[class] = l
-	}
-	if !l.Allow() {
-		s.dropped[class]++
-		return false, 0
-	}
-	n := s.dropped[class]
-	delete(s.dropped, class)
-	return true, n
 }
 
 type Handler struct {
 	keyfunc jwt.Keyfunc
 	issuer  string
 	parties map[string]struct{}
-	sampler *logSampler
 }
 
-// newHandler owns the Handler's invariants: the keyfunc is guarded, the sampler
-// is set, and the origin allowlist is non-empty. An empty allowlist would reject
-// every request, so it is a startup error rather than a runtime surprise.
+// newHandler guards the keyfunc and rejects an empty origin allowlist, which
+// would 401 every request — a startup error rather than a runtime surprise.
 func newHandler(kf jwt.Keyfunc, issuer string, parties map[string]struct{}) (*Handler, error) {
 	if len(parties) == 0 {
 		return nil, errors.New("no authorized parties configured")
 	}
-	return &Handler{
-		keyfunc: requireKID(kf),
-		issuer:  issuer,
-		parties: parties,
-		// 1/s per class, burst 5: enough to watch a fault develop, bounded enough
-		// that a flood cannot fill the disk.
-		sampler: newLogSampler(time.Second, 5),
-	}, nil
+	return &Handler{keyfunc: requireKID(kf), issuer: issuer, parties: parties}, nil
 }
 
 // requireKID rejects a token that names no signing key. Do not remove this as
@@ -169,17 +100,6 @@ func requireKID(next jwt.Keyfunc) jwt.Keyfunc {
 		}
 		return next(token)
 	}
-}
-
-// routineFailure reports whether a rejection is ordinary token lifecycle rather
-// than a security event. Clerk tokens live 60s, so every idle tab produces these
-// (TASKS.md: "401 is routine, not an error") and logging them buries the
-// anomalies. Clerk performs authentication; this service only verifies tokens,
-// so an expired one is a timer elapsing, not a failed credential attempt.
-func routineFailure(err error) bool {
-	return errors.Is(err, jwt.ErrTokenExpired) ||
-		errors.Is(err, jwt.ErrTokenMalformed) ||
-		errors.Is(err, jwt.ErrTokenNotValidYet)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -231,19 +151,19 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 
 		claims, err := h.verifyToken(parts[1])
 		if err != nil {
-			// Anomalies are logged so a JWKS or config fault is distinguishable
-			// from users with stale tokens. Never log the token: it is a live
-			// bearer credential. Never log a claimed sub: it is attacker
-			// controlled until the signature verifies.
-			if class := failureClass(err); !routineFailure(err) {
-				if ok, dropped := h.sampler.allow(class); ok {
-					slog.Warn("auth rejected",
-						"class", class,
-						"correlation_id", r.Context().Value(ctxCorrelationID),
-						"error", truncateError(err),
-						"dropped_since_last", dropped)
-				}
+			// Only the reason code is logged. Never the token, which is a live
+			// bearer credential; never a claimed sub, which is attacker
+			// controlled until the signature verifies; and never the raw error,
+			// which can embed an attacker-chosen key id. keyfunc logs the
+			// underlying JWKS detail itself. Volume is the collector's job.
+			reason, anomaly := authFailure(err)
+			level := slog.LevelInfo
+			if anomaly {
+				level = slog.LevelWarn
 			}
+			slog.Log(r.Context(), level, "auth rejected",
+				"reason", reason,
+				"correlation_id", r.Context().Value(ctxCorrelationID))
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
 			return
 		}
