@@ -19,6 +19,24 @@ the browser.
 | `DELETE` | `/api/subscriptions/:id` | untick a service |
 | `POST` | `/api/titles/:id/verdict` | liked, disliked, seen, not interested |
 
+## Running locally
+
+Config comes from the environment only — there is no `.env` loading in the service.
+Under `docker compose up` the variables come from the repo-root `.env`. To run it
+directly, export them first:
+
+```sh
+set -a; source ../../.env; set +a
+go run .
+```
+
+Required: `CLERK_JWKS_URL`, `CLERK_ISSUER`, `CLERK_AUTHORIZED_PARTIES`. The service
+exits immediately if any is missing. `GATEWAY_PORT` defaults to 8080.
+
+`CLERK_AUTHORIZED_PARTIES` is the comma-separated list of origins allowed to mint
+session tokens, checked against the token's `azp` claim. It must include every origin
+the web app is served from, or every request fails with `unauthorized party`.
+
 ## Rules
 
 - Resolves the Clerk user ID once, at the edge, and passes it inward. The agent trusts
