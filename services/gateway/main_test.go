@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -215,7 +216,19 @@ func TestAuthFailureIsClosedSet(t *testing.T) {
 		"expired": true, "malformed": true, "not_yet_valid": true,
 		"no_kid": true, "no_subject": true, "unauthorized_party": true,
 		"bad_signature": true, "bad_issuer": true, "missing_claim": true,
-		"unverifiable": true,
+		"unverifiable": true, "other": true,
+	}
+
+	// "unverifiable" means no key could be obtained. An unrelated failure must
+	// not borrow that label and send the reader to JWKS.
+	for _, err := range []error{
+		errors.New("database exploded"),
+		context.DeadlineExceeded,
+		jwt.ErrTokenInvalidAudience,
+	} {
+		if reason, _ := authFailure(err); reason != "other" {
+			t.Errorf("authFailure(%v) = %q, want %q", err, reason, "other")
+		}
 	}
 	routine := map[string]bool{"expired": true, "malformed": true, "not_yet_valid": true}
 
@@ -261,14 +274,14 @@ func TestOversizedKIDNeverReachesLog(t *testing.T) {
 	}
 }
 
-// Routine lifecycle failures log at INFO, anomalies at WARN, so volume can be
-// filtered by level in the collector rather than dropped here.
+// Routine lifecycle logs at DEBUG, anomalies at WARN, so verbosity is a level
+// decision the environment makes rather than something dropped in code.
 func TestLogLevelByFailureKind(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	h := newTestHandler(t, key, "kid_A")
 
 	var buf bytes.Buffer
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil))) })
 	srv := correlationID(h.authMiddleware(http.HandlerFunc(h.example)))
 
@@ -286,8 +299,8 @@ func TestLogLevelByFailureKind(t *testing.T) {
 
 	expired := validClaims()
 	expired.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Hour))
-	if got := send(mint(t, "kid_A", key, expired)); got != "INFO expired" {
-		t.Errorf("expired token logged as %q, want \"INFO expired\"", got)
+	if got := send(mint(t, "kid_A", key, expired)); got != "DEBUG expired" {
+		t.Errorf("expired token logged as %q, want \"DEBUG expired\"", got)
 	}
 
 	other, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -299,6 +312,40 @@ func TestLogLevelByFailureKind(t *testing.T) {
 	badAzp.Azp = "https://evil.example.com"
 	if got := send(mint(t, "kid_A", key, badAzp)); got != "WARN unauthorized_party" {
 		t.Errorf("wrong azp logged as %q, want \"WARN unauthorized_party\"", got)
+	}
+}
+
+// The default level must be quiet: a deploy that configures nothing must not
+// emit a line per expired token, which is the highest-volume rejection there is.
+func TestDefaultLevelSuppressesRoutineFailures(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	h := newTestHandler(t, key, "kid_A")
+
+	var buf bytes.Buffer
+	var level slog.LevelVar // zero value is LevelInfo, matching the default
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: &level})))
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil))) })
+	srv := correlationID(h.authMiddleware(http.HandlerFunc(h.example)))
+
+	expired := validClaims()
+	expired.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Hour))
+	for range 1000 {
+		req := httptest.NewRequest("GET", "/api/example", nil)
+		req.Header.Set("Authorization", "Bearer "+mint(t, "kid_A", key, expired))
+		srv.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("1000 expired tokens wrote %d bytes at the default level, want 0", buf.Len())
+	}
+
+	// Anomalies must still surface at that level.
+	buf.Reset()
+	attacker, _ := rsa.GenerateKey(rand.Reader, 2048)
+	req := httptest.NewRequest("GET", "/api/example", nil)
+	req.Header.Set("Authorization", "Bearer "+mint(t, "kid_A", attacker, validClaims()))
+	srv.ServeHTTP(httptest.NewRecorder(), req)
+	if !bytes.Contains(buf.Bytes(), []byte(`"reason":"bad_signature"`)) {
+		t.Errorf("anomaly suppressed at the default level: %q", buf.String())
 	}
 }
 

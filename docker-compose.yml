@@ -26,6 +26,7 @@ services:
       CLERK_ISSUER: ${CLERK_ISSUER}
       CLERK_AUTHORIZED_PARTIES: ${CLERK_AUTHORIZED_PARTIES}
       GATEWAY_PORT: ${GATEWAY_PORT:-8080}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
 
   # --- Agent: LangChain orchestration, read-only, not exposed ---------------
   # agent:

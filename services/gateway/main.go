@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -69,8 +70,12 @@ func authFailure(err error) (reason string, anomaly bool) {
 		return "bad_issuer", true
 	case errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
 		return "missing_claim", true
-	default:
+	case errors.Is(err, jwt.ErrTokenUnverifiable):
 		return "unverifiable", true
+	default:
+		// Deliberately not "unverifiable": that means no key could be obtained,
+		// and mislabelling an unrelated failure sends the reader to JWKS.
+		return "other", true
 	}
 }
 
@@ -157,7 +162,9 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 			// which can embed an attacker-chosen key id. keyfunc logs the
 			// underlying JWKS detail itself. Volume is the collector's job.
 			reason, anomaly := authFailure(err)
-			level := slog.LevelInfo
+			// Routine lifecycle is DEBUG so the default level is quiet: an
+			// unconfigured deploy must not emit a line per expired token.
+			level := slog.LevelDebug
 			if anomaly {
 				level = slog.LevelWarn
 			}
@@ -219,10 +226,22 @@ func authorizedParties(env string) map[string]struct{} {
 	return parties
 }
 
+// setupLogging sends structured JSON to stdout and nothing else: routing and
+// retention belong to the execution environment, not here. LOG_LEVEL is the only
+// verbosity control. LevelVar rather than a plain Level so it can be changed at
+// runtime later without restructuring.
+func setupLogging() {
+	var level slog.LevelVar
+	if err := level.UnmarshalText([]byte(cmp.Or(os.Getenv("LOG_LEVEL"), "info"))); err != nil {
+		log.Fatalf("LOG_LEVEL: %v", err)
+	}
+	// keyfunc logs its JWKS refresh failures to slog.Default(), so this puts
+	// those in the same stream, at the same level.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &level})))
+}
+
 func main() {
-	// JSON to stdout. keyfunc logs its JWKS refresh failures to slog.Default(),
-	// so setting this puts those in the same stream as our own lines.
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	setupLogging()
 
 	jwksURL := mustEnv("CLERK_JWKS_URL")
 	issuer := mustEnv("CLERK_ISSUER")
