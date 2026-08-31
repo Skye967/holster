@@ -30,19 +30,20 @@ push re-runs them and fails on the first `create table`.
 users                    mirror of Clerk identities
   id                     text primary key   -- Clerk user ID
   email                  text not null      -- Clerk instance requires email sign-up
+  country                text not null      -- ISO 3166-1 alpha-2, defaults 'US'
   created_at             timestamptz
 
-connected_services       dead as of the OAuth cut — dropped in T9
-                         (kept here only until that migration lands)
-  id                     uuid primary key
+streaming_subscriptions  one row per service the user subscribes to
   user_id                text references users(id) on delete cascade
-  provider               text               -- 'google', 'youtube', ...
-  encrypted_access_token bytea              -- never plaintext
-  encrypted_refresh_token bytea             -- never plaintext
-  expires_at             timestamptz
-  scopes                 text[]
+  tmdb_provider_id       integer            -- TMDB watch-provider ID (Netflix = 8)
   created_at             timestamptz
-  unique (user_id, provider)
+  primary key (user_id, tmdb_provider_id)
+
+streaming_providers      cache of TMDB's watch-provider list, one row per country
+  country                text primary key
+  providers              jsonb              -- [{provider_id, provider_name,
+                                            --   logo_path, display_priority}]
+  fetched_at             timestamptz        -- lazy-refreshed past 24h (T15)
 
 conversations
   id                     uuid primary key
