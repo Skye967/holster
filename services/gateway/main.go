@@ -17,6 +17,8 @@ import (
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Private key type so context values cannot collide with another package's.
@@ -31,16 +33,27 @@ const (
 // stays well under a full lifetime.
 const clockLeeway = 5 * time.Second
 
+// Ceiling on the per-request provisioning upsert — a single-row write on a
+// primary key, so this is generous even to Supabase. A var, not a const, so a
+// test can shorten it without waiting the full two seconds.
+var provisionTimeout = 2 * time.Second
+
 type Claims struct {
 	// Origin the token was issued to. Clerk's defence against a token minted
 	// for one frontend being replayed against another.
 	Azp string `json:"azp"`
+	// Added by the gateway JWT template. Required: the Clerk instance is
+	// configured for email sign-up, so a token without one is malformed rather
+	// than a legitimate account. Not a schema constraint — an absent claim
+	// unmarshals to "", which users.email NOT NULL would accept.
+	Email string `json:"email"`
 	jwt.RegisteredClaims
 }
 
 var (
 	errNoKID             = errors.New("token has no kid header")
 	errNoSubject         = errors.New("token has no subject")
+	errNoEmail           = errors.New("token has no email")
 	errUnauthorizedParty = errors.New("unauthorized party")
 )
 
@@ -50,28 +63,36 @@ var (
 //
 // Clerk performs authentication; this service only verifies tokens, so an expired
 // one is a 60s timer elapsing, not a failed credential attempt.
+//
+// Anomalies come first because jwt's validator joins every claim failure into one
+// error: errors.Is matches all of them, so this order alone decides the label.
+// Expiry first would file a replayed cross-audience token as a routine expiry.
 func authFailure(err error) (reason string, anomaly bool) {
 	switch {
-	case errors.Is(err, jwt.ErrTokenExpired):
-		return "expired", false
-	case errors.Is(err, jwt.ErrTokenMalformed):
-		return "malformed", false
-	case errors.Is(err, jwt.ErrTokenNotValidYet):
-		return "not_yet_valid", false
 	case errors.Is(err, errNoKID):
 		return "no_kid", true
 	case errors.Is(err, errNoSubject):
 		return "no_subject", true
+	case errors.Is(err, errNoEmail):
+		return "no_email", true
 	case errors.Is(err, errUnauthorizedParty):
 		return "unauthorized_party", true
 	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
 		return "bad_signature", true
 	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
 		return "bad_issuer", true
+	case errors.Is(err, jwt.ErrTokenInvalidAudience):
+		return "bad_audience", true
 	case errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
 		return "missing_claim", true
 	case errors.Is(err, jwt.ErrTokenUnverifiable):
 		return "unverifiable", true
+	case errors.Is(err, jwt.ErrTokenExpired):
+		return "expired", false
+	case errors.Is(err, jwt.ErrTokenMalformed):
+		return "malformed", false
+	case errors.Is(err, jwt.ErrTokenNotValidYet):
+		return "not_yet_valid", false
 	default:
 		// Deliberately not "unverifiable": that means no key could be obtained,
 		// and mislabelling an unrelated failure sends the reader to JWKS.
@@ -80,18 +101,36 @@ func authFailure(err error) (reason string, anomaly bool) {
 }
 
 type Handler struct {
-	keyfunc jwt.Keyfunc
-	issuer  string
-	parties map[string]struct{}
+	keyfunc  jwt.Keyfunc
+	issuer   string
+	audience string
+	parties  map[string]struct{}
+	// Injected so the auth path is testable without a database. Production
+	// wiring is upsertUser; the SQL itself is covered by its own test.
+	ensureUser func(ctx context.Context, id, email string) error
 }
 
 // newHandler guards the keyfunc and rejects an empty origin allowlist, which
 // would 401 every request — a startup error rather than a runtime surprise.
-func newHandler(kf jwt.Keyfunc, issuer string, parties map[string]struct{}) (*Handler, error) {
+func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]struct{},
+	ensureUser func(ctx context.Context, id, email string) error) (*Handler, error) {
+
 	if len(parties) == 0 {
 		return nil, errors.New("no authorized parties configured")
 	}
-	return &Handler{keyfunc: requireKID(kf), issuer: issuer, parties: parties}, nil
+	if audience == "" {
+		return nil, errors.New("no audience configured")
+	}
+	if ensureUser == nil {
+		return nil, errors.New("no user provisioner configured")
+	}
+	return &Handler{
+		keyfunc:    requireKID(kf),
+		issuer:     issuer,
+		audience:   audience,
+		parties:    parties,
+		ensureUser: ensureUser,
+	}, nil
 }
 
 // requireKID rejects a token that names no signing key. Do not remove this as
@@ -118,6 +157,7 @@ func (h *Handler) verifyToken(tokenString string) (*Claims, error) {
 	_, err := jwt.ParseWithClaims(tokenString, claims, h.keyfunc,
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(h.issuer),
+		jwt.WithAudience(h.audience),
 		jwt.WithExpirationRequired(),
 		jwt.WithLeeway(clockLeeway),
 	)
@@ -129,13 +169,49 @@ func (h *Handler) verifyToken(tokenString string) (*Claims, error) {
 		return nil, errNoSubject
 	}
 
+	// Authorization before payload adequacy: a token minted for an origin we do
+	// not allow must report unauthorized_party, not a missing-claim reason it
+	// would also fail on. Backend-API tokens carry neither azp nor the template's
+	// email, and they are the case this ordering exists for.
+	//
 	// Clerk's docs allow skipping this when azp is absent. We don't: tokens
 	// minted through the Backend API carry no azp, and those are not sessions.
 	if _, ok := h.parties[claims.Azp]; !ok {
 		return nil, errUnauthorizedParty
 	}
 
+	if claims.Email == "" {
+		return nil, errNoEmail
+	}
+
 	return claims, nil
+}
+
+// upsertUser mirrors the Clerk identity into users. Runs on every request rather
+// than on a user.created webhook because it repairs itself; see ../../DECISIONS.md.
+//
+// The WHERE guard is what makes that affordable: without it ON CONFLICT DO UPDATE
+// rewrites the row every time. TestUpsertUser holds it to that.
+func upsertUser(db *pgxpool.Pool) func(context.Context, string, string) error {
+	return func(ctx context.Context, id, email string) error {
+		_, err := db.Exec(ctx, `
+			insert into users (id, email) values ($1, $2)
+			on conflict (id) do update set email = excluded.email
+			where users.email is distinct from excluded.email`, id, email)
+		return err
+	}
+}
+
+// dbError renders a database error for logging. A server-side error becomes its
+// SQLSTATE alone: PostgreSQL puts row values in a constraint violation's DETAIL,
+// so the message would carry the user's own data. Everything else — connection,
+// timeout, cancellation — has no row data in it and is logged as-is.
+func dbError(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return err.Error()
 }
 
 func correlationID(next http.Handler) http.Handler {
@@ -172,6 +248,32 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 				"reason", reason,
 				"correlation_id", r.Context().Value(ctxCorrelationID))
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
+			return
+		}
+
+		// Fail closed: without the row, anything with a user foreign key would
+		// fail later and less clearly.
+		//
+		// The deadline matters because r.Context() has none — no http.Server
+		// timeout cancels it, only client disconnect — so a database that
+		// blackholes packets would otherwise hold this goroutine until TCP gives
+		// up, minutes later, with no 503 ever written.
+		provisionCtx, cancel := context.WithTimeout(r.Context(), provisionTimeout)
+		err = h.ensureUser(provisionCtx, claims.Subject, claims.Email)
+		cancel()
+		if err != nil {
+			// A caller that hung up cancels provisionCtx, and pgx surfaces that
+			// as context.Canceled — not a provisioning failure, and nothing to
+			// write to either since the connection is already gone. Our own 2s
+			// deadline is context.DeadlineExceeded and a real database error is
+			// neither, so both of those still log and return 503.
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			slog.ErrorContext(r.Context(), "user provisioning failed",
+				"correlation_id", r.Context().Value(ctxCorrelationID),
+				"error", dbError(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "temporarily unavailable"})
 			return
 		}
 
@@ -245,7 +347,9 @@ func main() {
 
 	jwksURL := mustEnv("CLERK_JWKS_URL")
 	issuer := mustEnv("CLERK_ISSUER")
+	audience := mustEnv("CLERK_AUDIENCE")
 	parties := authorizedParties(mustEnv("CLERK_AUTHORIZED_PARTIES"))
+	databaseURL := mustEnv("DATABASE_URL")
 
 	port := os.Getenv("GATEWAY_PORT")
 	if port == "" {
@@ -268,9 +372,52 @@ func main() {
 		log.Fatalf("jwks: %v", err)
 	}
 
-	h, err := newHandler(jwks.Keyfunc, issuer, parties)
+	// Set here rather than in DATABASE_URL so they survive pointing the gateway at
+	// Supabase.
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
-		log.Fatalf("CLERK_AUTHORIZED_PARTIES: %v", err)
+		log.Fatalf("DATABASE_URL: %v", err)
+	}
+	poolConfig.ConnConfig.RuntimeParams["application_name"] = "holster-gateway"
+	// Backstop, not the request budget. pgx's default cancellation handler only
+	// puts a deadline on the client socket, so a query provisionTimeout gave up on
+	// keeps running on the server. Set above provisionTimeout so the request
+	// deadline is what normally fires and this catches only what outlives it.
+	poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = "3000"
+	// pgx sizes the pool from runtime.NumCPU() — host cores, not the cgroup
+	// limit — so the default is 4 on a small VM but 16+ on a large node, and
+	// neither is the right basis for a gateway that makes one short DB round
+	// trip per request. Pick a small explicit ceiling instead. If this ever runs
+	// more than one replica, replicas × MaxConns must stay under the Supabase
+	// tier's pooler limit.
+	poolConfig.MaxConns = 10
+
+	db, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		log.Fatalf("database: %v", err)
+	}
+	defer db.Close()
+
+	// Reachability and schema in one round trip, at startup rather than on the
+	// first request: a bad DATABASE_URL should stop a deploy, not surface as a 503
+	// to a user. A ping alone would not catch the likelier failure — compose runs
+	// migrations only when the data directory is empty, so a volume from before
+	// they existed answers fine and has no tables.
+	startupCtx, cancelStartup := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelStartup()
+	var schemaReady bool
+	if err := db.QueryRow(startupCtx,
+		`select to_regclass('public.users') is not null`).Scan(&schemaReady); err != nil {
+		log.Fatalf("database unreachable: %v", err)
+	}
+	if !schemaReady {
+		log.Fatal("database has no users table; run 'docker compose down -v' to re-seed the " +
+			"local stack, or apply migrations to your configured database (see db/README.md)")
+	}
+
+	h, err := newHandler(jwks.Keyfunc, issuer, audience, parties, upsertUser(db))
+	if err != nil {
+		log.Fatalf("handler: %v", err)
 	}
 
 	server := &http.Server{

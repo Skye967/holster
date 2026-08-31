@@ -17,7 +17,6 @@ services:
   #   depends_on: [gateway]
 
   # --- API gateway: the only exposed service, and the only writer -----------
-  # No depends_on yet — the gateway opens no database connection until T8.
   gateway:
     build: ./services/gateway
     ports: ["${GATEWAY_PORT:-8080}:${GATEWAY_PORT:-8080}"]
@@ -25,8 +24,16 @@ services:
       CLERK_JWKS_URL: ${CLERK_JWKS_URL}
       CLERK_ISSUER: ${CLERK_ISSUER}
       CLERK_AUTHORIZED_PARTIES: ${CLERK_AUTHORIZED_PARTIES}
+      CLERK_AUDIENCE: ${CLERK_AUDIENCE}
+      # Defaults to the compose-network Postgres. `localhost` in DATABASE_URL
+      # means the gateway's own container, not the database — set the host to
+      # `postgres`, or leave it unset to take this default.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:password@postgres:5432/holster}
       GATEWAY_PORT: ${GATEWAY_PORT:-8080}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # --- Agent: LangChain orchestration, read-only, not exposed ---------------
   # agent:
@@ -40,6 +47,11 @@ services:
   # --- Local Postgres -------------------------------------------------------
   # Supabase hosts the real database; this is a local stand-in so the stack runs
   # offline. Point DATABASE_URL at Supabase to use the hosted one instead.
+  #
+  # Migrations are mounted from supabase/migrations — the path the Supabase CLI
+  # discovers, and so the only place they live. Postgres runs them once, when the
+  # data directory is empty: after that the volume persists and new files are
+  # ignored. `docker compose down -v` to re-init.
   postgres:
     image: postgres:16-alpine
     ports: ["5432:5432"]
@@ -49,12 +61,18 @@ services:
       POSTGRES_DB: holster
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+      - ./supabase/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d holster"]
+      # -h forces a TCP check. Without it pg_isready answers on the unix socket
+      # that the entrypoint's init-time server serves with listen_addresses='',
+      # so the probe passes before the real server accepts connections.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d holster"]
       interval: 5s
       timeout: 5s
       retries: 5
+      # First-run initdb plus migrations can outlast interval × retries. Failures
+      # in this window do not count against retries; the first success ends it.
+      start_period: 60s
 
 volumes:
   postgres_data:

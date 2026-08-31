@@ -22,11 +22,13 @@ import (
 
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
-	testIssuer = "https://holster.clerk.accounts.dev"
-	testOrigin = "https://holster.app"
+	testIssuer   = "https://holster.clerk.accounts.dev"
+	testOrigin   = "https://holster.app"
+	testAudience = "holster-gateway"
 )
 
 func jwksJSON(kid string, key *rsa.PrivateKey) []byte {
@@ -54,11 +56,13 @@ func mint(t *testing.T, kid string, key *rsa.PrivateKey, claims *Claims) string 
 
 // validClaims returns claims a real Clerk session token would carry.
 func validClaims() *Claims {
-	return &Claims{Azp: testOrigin, RegisteredClaims: jwt.RegisteredClaims{
-		Subject:   "user_abc",
-		Issuer:    testIssuer,
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute)),
-	}}
+	return &Claims{Azp: testOrigin, Email: "user@example.com",
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user_abc",
+			Issuer:    testIssuer,
+			Audience:  jwt.ClaimStrings{testAudience},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute)),
+		}}
 }
 
 // newTestHandler serves the given key from a stub JWKS endpoint.
@@ -73,7 +77,9 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := newHandler(jwks.Keyfunc, testIssuer, map[string]struct{}{testOrigin: {}})
+	// Provisioning is a no-op here; the SQL has its own test.
+	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
+		func(context.Context, string, string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,10 +208,253 @@ func TestRejectionReasons(t *testing.T) {
 	}
 }
 
+// A token minted for a different consumer of the same Clerk instance must not
+// authenticate here. RFC 8725 requires the audience check; azp is not a substitute.
+func TestAudienceIsRequired(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	h := newTestHandler(t, key, "kid_A")
+
+	wrong := validClaims()
+	wrong.Audience = jwt.ClaimStrings{"some-other-service"}
+	if _, err := h.verifyToken(mint(t, "kid_A", key, wrong)); err == nil {
+		t.Error("accepted a token minted for another audience")
+	}
+
+	absent := validClaims()
+	absent.Audience = nil
+	_, err := h.verifyToken(mint(t, "kid_A", key, absent))
+	if err == nil {
+		t.Error("accepted a token with no audience — the default session token shape")
+	}
+	// A wholly-absent aud reports missing_claim, not bad_audience: jwt collapses
+	// "required claim absent" into one error and cannot say which claim. Both
+	// reject and both are anomalies; this pins the label a dashboard would see.
+	if reason, _ := authFailure(err); reason != "missing_claim" {
+		t.Errorf("no-audience reason = %q, want %q", reason, "missing_claim")
+	}
+}
+
+// The Clerk instance requires email sign-up, so a token without the claim is
+// malformed. Not a schema constraint — an absent claim unmarshals to "", which
+// users.email NOT NULL would accept.
+func TestEmailIsRequired(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	h := newTestHandler(t, key, "kid_A")
+
+	noEmail := validClaims()
+	noEmail.Email = ""
+	_, err := h.verifyToken(mint(t, "kid_A", key, noEmail))
+	if !errors.Is(err, errNoEmail) {
+		t.Errorf("err = %v, want errors.Is(_, errNoEmail)", err)
+	}
+	if reason, _ := authFailure(err); reason != "no_email" {
+		t.Errorf("reason = %q, want %q", reason, "no_email")
+	}
+}
+
+// Provisioning runs on every authenticated request and carries the token's
+// identity, not anything the caller supplied.
+func TestProvisioningReceivesTokenIdentity(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(jwksJSON("kid_A", key))
+	}))
+	defer srv.Close()
+	jwks, err := keyfunc.NewDefaultCtx(t.Context(), []string{srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotID, gotEmail string
+	var calls int
+	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
+		func(_ context.Context, id, email string) error {
+			calls++
+			gotID, gotEmail = id, email
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := correlationID(h.authMiddleware(http.HandlerFunc(h.example)))
+	req := httptest.NewRequest("GET", "/api/example", nil)
+	req.Header.Set("Authorization", "Bearer "+mint(t, "kid_A", key, validClaims()))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if calls != 1 {
+		t.Errorf("provisioner called %d times, want 1", calls)
+	}
+	if gotID != "user_abc" || gotEmail != "user@example.com" {
+		t.Errorf("provisioned (%q, %q), want (user_abc, user@example.com)", gotID, gotEmail)
+	}
+
+	// A rejected token must not reach provisioning at all.
+	calls = 0
+	req = httptest.NewRequest("GET", "/api/example", nil)
+	req.Header.Set("Authorization", "Bearer aaa.bbb.ccc")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	if calls != 0 {
+		t.Errorf("provisioner ran for an unauthenticated request")
+	}
+}
+
+// A provisioning failure must not let the request through: anything with a user
+// foreign key would fail later and less clearly.
+func TestProvisioningFailureBlocksRequest(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(jwksJSON("kid_A", key))
+	}))
+	defer srv.Close()
+	jwks, err := keyfunc.NewDefaultCtx(t.Context(), []string{srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
+		func(context.Context, string, string) error { return errors.New("connection refused") })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reached := false
+	handler := correlationID(h.authMiddleware(http.HandlerFunc(
+		func(http.ResponseWriter, *http.Request) { reached = true })))
+	req := httptest.NewRequest("GET", "/api/example", nil)
+	req.Header.Set("Authorization", "Bearer "+mint(t, "kid_A", key, validClaims()))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if reached {
+		t.Error("handler ran despite provisioning failing")
+	}
+}
+
+// A caller that hangs up mid-request is not an outage. Ordinary navigation
+// cancels the request context, and filing that as a provisioning failure puts it
+// in the same signal as a database that is genuinely down.
+func TestClientDisconnectIsNotAProvisioningFailure(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(jwksJSON("kid_A", key))
+	}))
+	defer srv.Close()
+	jwks, err := keyfunc.NewDefaultCtx(t.Context(), []string{srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
+		func(ctx context.Context, _, _ string) error { return ctx.Err() })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil))) })
+
+	reached := false
+	handler := correlationID(h.authMiddleware(http.HandlerFunc(
+		func(http.ResponseWriter, *http.Request) { reached = true })))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the client is already gone
+	req := httptest.NewRequest("GET", "/api/example", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+mint(t, "kid_A", key, validClaims()))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if reached {
+		t.Error("handler ran despite provisioning being cancelled")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("logged %q, want nothing for a client that hung up", buf.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("wrote %q to a connection that is already gone", rec.Body.String())
+	}
+}
+
+// A database that accepts the connection but never answers must surface as a
+// 503 on the provisioning deadline, not hang the request until the client or
+// the OS gives up.
+func TestProvisioningDeadlineReturns503(t *testing.T) {
+	old := provisionTimeout
+	provisionTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { provisionTimeout = old })
+
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(jwksJSON("kid_A", key))
+	}))
+	defer srv.Close()
+	jwks, err := keyfunc.NewDefaultCtx(t.Context(), []string{srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
+		func(ctx context.Context, _, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil))) })
+
+	reached := false
+	handler := correlationID(h.authMiddleware(http.HandlerFunc(
+		func(http.ResponseWriter, *http.Request) { reached = true })))
+	req := httptest.NewRequest("GET", "/api/example", nil)
+	req.Header.Set("Authorization", "Bearer "+mint(t, "kid_A", key, validClaims()))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if reached {
+		t.Error("handler ran despite provisioning timing out")
+	}
+	if buf.Len() == 0 {
+		t.Error("provisioning timeout logged nothing")
+	}
+}
+
 func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 	kf := func(*jwt.Token) (any, error) { return nil, nil }
-	if _, err := newHandler(kf, testIssuer, map[string]struct{}{}); err == nil {
+	noop := func(context.Context, string, string) error { return nil }
+	if _, err := newHandler(kf, testIssuer, testAudience, map[string]struct{}{}, noop); err == nil {
 		t.Error("built a Handler with no authorized parties, which would reject every request")
+	}
+}
+
+// A server-side error must reduce to its SQLSTATE — a constraint violation's
+// Message and Detail carry row values. Everything else logs in full, because
+// losing the connection error is losing the only diagnosis of an outage.
+func TestDBErrorHidesRowDataOnly(t *testing.T) {
+	pgErr := &pgconn.PgError{
+		Code:    "23505",
+		Message: `duplicate key value violates unique constraint "users_pkey"`,
+		Detail:  `Key (id)=(user_abc) already exists.`,
+	}
+	if got := dbError(fmt.Errorf("wrapped: %w", pgErr)); got != "23505" {
+		t.Errorf("dbError(PgError) = %q, want %q", got, "23505")
+	}
+
+	plain := errors.New("failed to connect to `user=postgres database=holster`: dial error")
+	if got := dbError(plain); got != plain.Error() {
+		t.Errorf("dbError(connection error) = %q, want the full message", got)
 	}
 }
 
@@ -214,8 +463,9 @@ func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 func TestAuthFailureIsClosedSet(t *testing.T) {
 	allowed := map[string]bool{
 		"expired": true, "malformed": true, "not_yet_valid": true,
-		"no_kid": true, "no_subject": true, "unauthorized_party": true,
-		"bad_signature": true, "bad_issuer": true, "missing_claim": true,
+		"no_kid": true, "no_subject": true, "no_email": true,
+		"unauthorized_party": true, "bad_signature": true, "bad_issuer": true,
+		"bad_audience": true, "missing_claim": true,
 		"unverifiable": true, "other": true,
 	}
 
@@ -224,7 +474,6 @@ func TestAuthFailureIsClosedSet(t *testing.T) {
 	for _, err := range []error{
 		errors.New("database exploded"),
 		context.DeadlineExceeded,
-		jwt.ErrTokenInvalidAudience,
 	} {
 		if reason, _ := authFailure(err); reason != "other" {
 			t.Errorf("authFailure(%v) = %q, want %q", err, reason, "other")
@@ -234,8 +483,9 @@ func TestAuthFailureIsClosedSet(t *testing.T) {
 
 	for _, err := range []error{
 		jwt.ErrTokenExpired, jwt.ErrTokenMalformed, jwt.ErrTokenNotValidYet,
-		errNoKID, errNoSubject, errUnauthorizedParty,
+		errNoKID, errNoSubject, errNoEmail, errUnauthorizedParty,
 		jwt.ErrTokenSignatureInvalid, jwt.ErrTokenInvalidIssuer,
+		jwt.ErrTokenInvalidAudience,
 		jwt.ErrTokenRequiredClaimMissing, jwt.ErrTokenUnverifiable,
 		errors.New("something nobody anticipated"),
 		fmt.Errorf("attacker controlled %s", strings.Repeat("A", 5000)),
@@ -471,7 +721,8 @@ func TestKeyRotationSelfHeals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := newHandler(jwks.Keyfunc, testIssuer, map[string]struct{}{testOrigin: {}})
+	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
+		func(context.Context, string, string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +751,8 @@ func TestUnknownKidDoesNotAmplify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := newHandler(jwks.Keyfunc, testIssuer, map[string]struct{}{testOrigin: {}})
+	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
+		func(context.Context, string, string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
