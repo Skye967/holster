@@ -134,7 +134,7 @@ users                     id (Clerk), email, country, created_at
 streaming_providers       country, providers (jsonb), fetched_at
                           primary key (country) — a cache, not reference data
 
-streaming_subscriptions   user_id, tmdb_provider_id
+streaming_subscriptions   user_id, tmdb_provider_id, created_at
                           primary key (user_id, tmdb_provider_id)
 
 title_verdicts            user_id, tmdb_id, media_type,
