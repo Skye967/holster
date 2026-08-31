@@ -27,11 +27,60 @@ directly, export them first:
 
 ```sh
 set -a; source ../../.env; set +a
-go run .
+DATABASE_URL=postgresql://postgres:password@localhost:5432/holster go run .
 ```
 
-Required: `CLERK_JWKS_URL`, `CLERK_ISSUER`, `CLERK_AUTHORIZED_PARTIES`. The service
-exits immediately if any is missing. `GATEWAY_PORT` defaults to 8080.
+`DATABASE_URL` is passed on the command line rather than kept in `.env` because the
+two ways of running need different hosts: `localhost` here, `postgres` inside the
+compose network. One variable cannot hold both, so `.env` leaves it unset, compose
+supplies its own default, and a host run names the value it needs.
+
+Required: `CLERK_JWKS_URL`, `CLERK_ISSUER`, `CLERK_AUTHORIZED_PARTIES`,
+`CLERK_AUDIENCE`, `DATABASE_URL`. The service exits immediately if any is missing,
+if the database is unreachable, or if the schema is not there. `GATEWAY_PORT`
+defaults to 8080.
+
+Set `DATABASE_URL` in `.env` only to point the gateway at Supabase. Use port 5432
+(session mode), not 6543: the transaction pooler reassigns connections between
+queries, which breaks the prepared statements pgx uses by default.
+
+`statement_timeout`, `application_name`, and the pool size are set in code rather
+than in the URL, so they survive that override. Pool size is a small fixed ceiling
+(pgx's default is derived from the host CPU count, which is the wrong basis for a
+gateway that makes one short query per request); if this ever runs more than one
+replica, `replicas × MaxConns` must stay under the Supabase tier's pooler limit.
+
+The local database is seeded from `supabase/migrations` on first start only.
+Postgres runs those once, when its data directory is empty — after that the volume
+persists and new migration files are ignored. `docker compose down -v` to re-init.
+
+## Tests
+
+```sh
+go test ./...                                    # unit tests, no database needed
+TEST_DATABASE_URL=postgresql://postgres:password@localhost:5432/holster go test ./...
+```
+
+Database tests skip unless `TEST_DATABASE_URL` is set. It is deliberately not
+`DATABASE_URL`, so running the suite cannot write to a configured production
+database.
+
+## User provisioning
+
+Every authenticated request upserts the caller into `users`, keyed on the Clerk
+user ID and carrying the `email` claim. Clerk creates the account on its side
+only; nothing writes ours.
+
+Per request rather than on a `user.created` webhook, and guarded by a `where … is
+distinct from` clause so an unchanged row is not rewritten — see `../../DECISIONS.md`
+and `upsertUser`.
+
+A provisioning failure returns 503 rather than letting the request through, bounded
+by a 2s deadline so an unresponsive database cannot hold the request open.
+
+The gateway connects as the table owner, which bypasses the row-level security
+enabled in the initial migration. T10 replaces that with a restricted role and
+real policies.
 
 ## Logs
 
@@ -48,6 +97,9 @@ runs the container, not to the service.
 
 Rejections log a reason code and correlation ID, never the token, the claimed
 subject, or the raw error — an unverified token's contents are attacker-controlled.
+
+A database error is logged as its SQLSTATE alone, since a constraint violation's
+`DETAIL` carries row values. Connection and timeout errors log in full.
 
 **One line per rejected request at `debug`.** That is unbounded by design: rate
 limiting belongs in the log collector, which can be retuned without a redeploy.
