@@ -1,0 +1,14 @@
+# Keep the build context to source only.
+.venv
+__pycache__
+*.pyc
+.git
+.gitignore
+.python-version
+.ruff_cache
+.mypy_cache
+.pytest_cache
+test_*.py
+README.md
+Dockerfile
+.dockerignore
