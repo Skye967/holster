@@ -6,11 +6,13 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
+    # The TMDB client, and Starlette's TestClient. A runtime dep since the
+    # container runs `uv sync --no-dev`.
+    "httpx2>=2.12.0",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.12.0",
     "mypy>=1.14",
     "pytest>=8.3",
     "ruff>=0.9",
