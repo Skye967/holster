@@ -1,6 +1,6 @@
 """Catalog tool — turns a message into ranked, real TMDB titles.
 
-Two model calls around one deterministic TMDB call, never an agent loop:
+Two model calls around one deterministic TMDB step, never an agent loop:
 
     interpret()  message      -> DiscoverIntent   (what to search for)
     tmdb.discover()           -> list[Title]       (TMDB applies every hard
@@ -13,7 +13,8 @@ Two model calls around one deterministic TMDB call, never an agent loop:
 This is structurally two calls, not a style choice: rank() must condition on
 the real candidates discover() returns, which do not exist until interpret()'s
 output has been used to call TMDB. A single call cannot see results it has not
-yet triggered.
+yet triggered. (On an empty result, this TMDB step retries with progressively
+fewer soft constraints — see search().)
 
 Both steps read untrusted text — the user's message and, in TMDB's overviews,
 third-party-editable text anyone can put a hostile instruction in (see
@@ -44,7 +45,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -153,12 +154,25 @@ class CatalogToolError(Exception):
     """
 
 
+# The soft constraints search() can drop, in the order it drops them, when a
+# query returns nothing. watch_region, watch_providers, media_type and every
+# exclusion are never in this list — the services a user ticked never bend
+# (TASKS.md T13.5).
+RelaxedConstraint = Literal["runtime", "year", "keywords"]
+
+
 @dataclass
 class CatalogResult:
     # None when search() short-circuits before calling interpret() at all
     # (e.g. the caller has no streaming subscriptions) — see search().
     intent: DiscoverIntent | None
     picks: list[tuple[Title, str]]  # (the real Title, the model's blurb)
+    # Soft constraints search() had to drop to get any candidates, in the order
+    # dropped; empty when the first query returned results. Reflects only the
+    # rungs actually tried — the ladder stops at the first one that returns
+    # candidates, so picks == [] doesn't imply every rung was exhausted; rank()
+    # can still find nothing worth surfacing in a non-empty candidate set.
+    relaxed: list[RelaxedConstraint]
 
 
 Interpreter = Callable[[str], Awaitable[DiscoverIntent]]
@@ -231,6 +245,15 @@ async def search(
     only from the caller — the real user's subscriptions and country — and
     are passed to discover() regardless of anything in ``intent``.
 
+    When the first discover() call returns nothing, soft constraints are
+    dropped one rung at a time — runtime, then year, then mood keywords — and
+    the query retried until candidates come back or the ladder is exhausted.
+    ``CatalogResult.relaxed`` records what was dropped. Services, region and
+    exclusions are never in the ladder. Each retry is a full discover() call
+    with its own retry/backoff; the ladder itself has no combined deadline
+    (not yet reachable from any endpoint; the task that wires this into a
+    request path should budget for it).
+
     Returns a picks-less CatalogResult with ``intent=None``, calling neither
     the model nor TMDB, when ``watch_providers`` is empty: a user with no
     ticked streaming services can't get results from any, so there is
@@ -245,30 +268,68 @@ async def search(
     not a case this function handles.
     """
     if not watch_providers:
-        return CatalogResult(intent=None, picks=[])
+        return CatalogResult(intent=None, picks=[], relaxed=[])
 
     intent = await interpret(message, model=interpret_model)
 
-    candidates = await client.discover(
-        media_type=intent.media_type,
-        watch_region=watch_region,
-        watch_providers=watch_providers,
-        cast=intent.cast or None,
-        crew=intent.crew or None,
-        keywords=intent.keywords or None,
-        without_keywords=intent.without_keywords or None,
-        genres=intent.genres or None,
-        without_genres=intent.without_genres or None,
-        max_runtime_minutes=intent.max_runtime_minutes,
-        release_year_gte=intent.release_year_gte,
-        release_year_lte=intent.release_year_lte,
-        sort_by=intent.sort_by,
-    )
+    # Mutable locals for the soft constraints, cleared one at a time below.
+    # The three ints are copied by value; `keywords` aliases intent.keywords —
+    # always rebind it (`keywords = []`), never mutate in place, or the change
+    # leaks into the CatalogResult.intent this function returns.
+    max_runtime_minutes = intent.max_runtime_minutes
+    release_year_gte = intent.release_year_gte
+    release_year_lte = intent.release_year_lte
+    keywords = intent.keywords
+
+    async def discover() -> list[Title]:
+        return await client.discover(
+            media_type=intent.media_type,
+            watch_region=watch_region,
+            watch_providers=watch_providers,
+            cast=intent.cast or None,
+            crew=intent.crew or None,
+            keywords=keywords or None,
+            without_keywords=intent.without_keywords or None,
+            genres=intent.genres or None,
+            without_genres=intent.without_genres or None,
+            max_runtime_minutes=max_runtime_minutes,
+            release_year_gte=release_year_gte,
+            release_year_lte=release_year_lte,
+            sort_by=intent.sort_by,
+        )
+
+    candidates = await discover()
+    relaxed: list[RelaxedConstraint] = []
+
+    # Adding a rung: guard on the field's own falsy value (`is not None` for
+    # an int, truthiness for a list — don't copy the other's test), and
+    # confirm the discover() closure above actually reads the new local, or
+    # `relaxed` will report a drop that never happened.
+    if not candidates and max_runtime_minutes is not None:
+        max_runtime_minutes = None
+        candidates = await discover()
+        relaxed.append("runtime")
+
+    year_is_set = release_year_gte is not None or release_year_lte is not None
+    if not candidates and year_is_set:
+        release_year_gte = release_year_lte = None
+        candidates = await discover()
+        relaxed.append("year")
+
+    # A keyword the model invented (e.g. a mood term with no TMDB match)
+    # never reaches the query in the first place — clearing it then would
+    # send an identical request and falsely claim a constraint was dropped.
+    # Only relax if at least one keyword actually resolved and mattered.
+    keywords_applied = any(client.is_keyword_resolved(k) for k in keywords)
+    if not candidates and keywords_applied:
+        keywords = []
+        candidates = await discover()
+        relaxed.append("keywords")
 
     ranked = await rank(message, candidates, limit=intent.limit, model=rank_model)
     by_id = {c["tmdb_id"]: c for c in candidates}
     picks = [(by_id[p.tmdb_id], p.blurb) for p in ranked]
-    return CatalogResult(intent=intent, picks=picks)
+    return CatalogResult(intent=intent, picks=picks, relaxed=relaxed)
 
 
 # ---------------------------------------------------------------------------
