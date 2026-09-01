@@ -105,6 +105,15 @@ def test_bad_watch_region_rejected() -> None:
         run(FakeTMDB().client().discover(media_type="movie", watch_region="usa"))
 
 
+def test_empty_watch_providers_rejected() -> None:
+    with pytest.raises(ValueError):
+        run(
+            FakeTMDB()
+            .client()
+            .discover(media_type="movie", watch_region="US", watch_providers=[])
+        )
+
+
 def test_bad_media_type_rejected() -> None:
     with pytest.raises(ValueError):
         run(FakeTMDB().client().discover(media_type="film", watch_region="US"))  # type: ignore[arg-type]

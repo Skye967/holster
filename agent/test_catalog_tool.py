@@ -1,0 +1,349 @@
+"""catalog_tool tests — offline, against fake interpret/rank models and a
+fake TMDB transport (same FakeTMDB shape as test_tmdb.py). No LangChain
+import here: interpret()/rank()/search() depend on plain callables, so a
+fake is just an ``async def``, matching TMDBClient's ``transport=`` seam.
+
+The live LLM path is in test_catalog_tool_live.py, which skips without
+ANTHROPIC_API_KEY — same shape as test_tmdb_live.py.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+from unittest.mock import AsyncMock
+
+import httpx2
+import pytest
+
+import tmdb
+from catalog_tool import (
+    CatalogToolError,
+    DiscoverIntent,
+    RankedPick,
+    RankResult,
+    interpret,
+    rank,
+    search,
+)
+from tmdb import Title, TMDBClient, TMDBUnavailable
+
+
+def run(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+class FakeTMDB:
+    """Records every outgoing request and replays queued responses by path —
+    identical shape to test_tmdb.py's fake, trimmed to what these tests need."""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx2.Request] = []
+        self._queues: dict[str, list[httpx2.Response]] = {}
+
+    def queue(self, path: str, *responses: httpx2.Response) -> None:
+        self._queues.setdefault("/3" + path, []).extend(responses)
+
+    def ok(self, path: str, payload: dict[str, Any]) -> None:
+        self.queue(path, httpx2.Response(200, json=payload))
+
+    def _handler(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(request)
+        queue = self._queues.get(request.url.path)
+        if queue:
+            return queue.pop(0)
+        return httpx2.Response(200, json={"results": []})
+
+    def client(self) -> TMDBClient:
+        return TMDBClient("test-token", transport=httpx2.MockTransport(self._handler))
+
+    def params_for(self, path: str) -> dict[str, str]:
+        for request in self.requests:
+            if request.url.path == "/3" + path:
+                return dict(request.url.params)
+        raise AssertionError(
+            f"no request to {path}: {[r.url.path for r in self.requests]}"
+        )
+
+
+MOVIE_A = {
+    "id": 101,
+    "title": "Fake Heist",
+    "release_date": "2020-01-01",
+    "overview": "A heist movie.",
+    "vote_average": 7.5,
+    "vote_count": 500,
+    "genre_ids": [80],
+}
+
+
+def _title(tmdb_id: int, media_type: tmdb.MediaType = "movie") -> Title:
+    return Title(
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+        title=f"Title {tmdb_id}",
+        year=2020,
+        overview="An overview.",
+        poster_url=None,
+        vote_average=7.0,
+        vote_count=500,
+        genre_ids=[],
+    )
+
+
+def _intent(**overrides: Any) -> DiscoverIntent:
+    return DiscoverIntent(media_type="movie", **overrides)
+
+
+async def _ok_interpret(message: str) -> DiscoverIntent:
+    return _intent()
+
+
+async def _rank_must_not_run(message: str, candidates: list[Title]) -> RankResult:
+    raise AssertionError("rank must not run once discover() has failed")
+
+
+def test_interpret_calls_model_and_returns_its_intent() -> None:
+    intent = _intent(keywords=["heist"])
+
+    async def fake(message: str) -> DiscoverIntent:
+        assert message == "something like Heat"
+        return intent
+
+    assert run(interpret("something like Heat", model=fake)) is intent
+
+
+def test_rank_drops_ids_outside_candidates() -> None:
+    candidates = [_title(1), _title(2)]
+
+    async def fake(message: str, cands: list[Title]) -> RankResult:
+        return RankResult(
+            picks=[
+                RankedPick(tmdb_id=1, blurb="fits"),
+                RankedPick(tmdb_id=999, blurb="hallucinated"),
+            ]
+        )
+
+    picks = run(rank("mood", candidates, limit=5, model=fake))
+    assert [p.tmdb_id for p in picks] == [1]
+
+
+def test_rank_dedupes_and_truncates_to_limit() -> None:
+    candidates = [_title(1), _title(2), _title(3)]
+
+    async def fake(message: str, cands: list[Title]) -> RankResult:
+        return RankResult(
+            picks=[
+                RankedPick(tmdb_id=1, blurb="a"),
+                RankedPick(tmdb_id=1, blurb="dup"),
+                RankedPick(tmdb_id=2, blurb="b"),
+                RankedPick(tmdb_id=3, blurb="c"),
+            ]
+        )
+
+    picks = run(rank("mood", candidates, limit=2, model=fake))
+    assert [p.tmdb_id for p in picks] == [1, 2]
+
+
+def test_rank_short_circuits_on_empty_candidates() -> None:
+    called = False
+
+    async def fake(message: str, cands: list[Title]) -> RankResult:
+        nonlocal called
+        called = True
+        return RankResult(picks=[])
+
+    assert run(rank("mood", [], limit=5, model=fake)) == []
+    assert not called
+
+
+def test_search_uses_callers_region_and_providers_never_the_models() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return _intent(keywords=["heist"])
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(picks=[])
+
+    result = run(
+        search(
+            "something",
+            client=fake_tmdb.client(),
+            watch_region="GB",
+            watch_providers=[8, 9],
+            interpret_model=fake_interpret,
+            rank_model=fake_rank,
+        )
+    )
+
+    params = fake_tmdb.params_for("/discover/movie")
+    assert params["watch_region"] == "GB"
+    assert params["with_watch_providers"] == "8|9"
+    # Correctness floors from tmdb.py — the model must not be able to lower
+    # either, and this must still hold once a request has gone through the
+    # full interpret() -> discover() -> rank() pipeline, not just discover()
+    # in isolation.
+    assert params["vote_count.gte"] == str(tmdb.MIN_VOTE_COUNT)
+    assert params["with_watch_monetization_types"] == "flatrate"
+    assert result.intent is not None
+    assert result.intent.keywords == ["heist"]
+
+
+def test_search_joins_blurb_with_the_real_title_not_model_metadata() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        [only] = candidates
+        return RankResult(
+            picks=[RankedPick(tmdb_id=only["tmdb_id"], blurb="great fit")]
+        )
+
+    result = run(
+        search(
+            "mood",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=_ok_interpret,
+            rank_model=fake_rank,
+        )
+    )
+
+    [(title, blurb)] = result.picks
+    assert title["title"] == "Fake Heist"
+    assert blurb == "great fit"
+
+
+def test_search_wraps_interpret_failure_as_catalog_tool_error() -> None:
+    fake_tmdb = FakeTMDB()
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        raise RuntimeError("anthropic timed out")
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        raise AssertionError("rank must not run once interpret() has failed")
+
+    with pytest.raises(CatalogToolError):
+        run(
+            search(
+                "something",
+                client=fake_tmdb.client(),
+                watch_region="US",
+                watch_providers=[8],
+                interpret_model=fake_interpret,
+                rank_model=fake_rank,
+            )
+        )
+
+
+def test_search_wraps_rank_failure_as_catalog_tool_error() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        raise RuntimeError("model returned an unparseable response")
+
+    with pytest.raises(CatalogToolError):
+        run(
+            search(
+                "something",
+                client=fake_tmdb.client(),
+                watch_region="US",
+                watch_providers=[8],
+                interpret_model=_ok_interpret,
+                rank_model=fake_rank,
+            )
+        )
+
+
+def test_search_lets_a_bad_watch_region_propagate_as_a_plain_value_error() -> None:
+    """watch_region comes from the caller, never from the model — a malformed
+    one is a caller bug to fix, not a case CatalogToolError should describe as
+    'the model produced something invalid'."""
+    fake_tmdb = FakeTMDB()
+
+    with pytest.raises(ValueError) as excinfo:
+        run(
+            search(
+                "something",
+                client=fake_tmdb.client(),
+                watch_region="usa",
+                watch_providers=[8],
+                interpret_model=_ok_interpret,
+                rank_model=_rank_must_not_run,
+            )
+        )
+    assert not isinstance(excinfo.value, CatalogToolError)
+
+
+def test_search_lets_tmdb_unavailable_propagate_unwrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tmdb, "_sleep", AsyncMock())
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.queue("/discover/movie", *[httpx2.Response(429) for _ in range(3)])
+
+    with pytest.raises(TMDBUnavailable):
+        run(
+            search(
+                "something",
+                client=fake_tmdb.client(),
+                watch_region="US",
+                watch_providers=[8],
+                interpret_model=_ok_interpret,
+                rank_model=_rank_must_not_run,
+            )
+        )
+
+
+def test_search_lets_tmdb_error_propagate_unwrapped() -> None:
+    """A non-transient status (e.g. an expired TMDB token) is a service/config
+    problem, not model-derived intent — it must not become CatalogToolError,
+    which would misattribute the cause."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.queue("/discover/movie", httpx2.Response(422, json={"success": False}))
+
+    with pytest.raises(tmdb.TMDBError) as excinfo:
+        run(
+            search(
+                "something",
+                client=fake_tmdb.client(),
+                watch_region="US",
+                watch_providers=[8],
+                interpret_model=_ok_interpret,
+                rank_model=_rank_must_not_run,
+            )
+        )
+    assert not isinstance(excinfo.value, tmdb.TMDBUnavailable)
+
+
+def test_search_short_circuits_on_empty_watch_providers() -> None:
+    fake_tmdb = FakeTMDB()
+    called = False
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        nonlocal called
+        called = True
+        return _intent()
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        raise AssertionError("rank must not run")
+
+    result = run(
+        search(
+            "something",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[],
+            interpret_model=fake_interpret,
+            rank_model=fake_rank,
+        )
+    )
+
+    assert result.intent is None
+    assert result.picks == []
+    assert not called
+    assert fake_tmdb.requests == []
