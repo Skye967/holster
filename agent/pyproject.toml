@@ -1,0 +1,30 @@
+[project]
+name = "holster-agent"
+version = "0.1.0"
+description = "Holster agent — LangChain orchestration and TMDB catalog tools"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.12.0",
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+# Run by uvicorn, not installed as a package — no wheel to build.
+[tool.uv]
+package = false
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["."]

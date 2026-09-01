@@ -39,16 +39,19 @@ services:
         condition: service_completed_successfully
 
   # --- Agent: LangChain orchestration, read-only, not exposed ---------------
-  # agent:
-  #   build: ./agent
-  #   ports: ["8000:8000"]
-  #   environment:
-  #     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-  #     TMDB_API_KEY: ${TMDB_API_KEY}
-  #     DATABASE_URL: ${DATABASE_URL_AGENT_READONLY}
-  #   depends_on:
-  #     db-init:
-  #       condition: service_completed_successfully
+  # No published port: reachable from other compose services, never from the host
+  # or the internet. Secrets and the read-only database URL arrive with the tasks
+  # that use them — TMDB in T12, verdict and conversation reads later.
+  agent:
+    build: ./agent
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
 
   # --- One-shot: give the T10 roles a local login --------------------------
   # gateway_app and agent_ro are created NOLOGIN by the migration (a committed
