@@ -40,12 +40,16 @@ services:
 
   # --- Agent: LangChain orchestration, read-only, not exposed ---------------
   # No published port: reachable from other compose services, never from the host
-  # or the internet. Secrets and the read-only database URL arrive with the tasks
-  # that use them — TMDB in T12, verdict and conversation reads later.
+  # or the internet. The read-only database URL and verdict/conversation reads
+  # arrive with the tasks that use them.
   agent:
     build: ./agent
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # The one secret the agent holds — app-level, opens nobody's account.
+      # Passed through plainly; the service fails fast if it's missing when the
+      # catalog tool is constructed, the same way the gateway checks its env.
+      TMDB_API_KEY: ${TMDB_API_KEY}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
       interval: 10s

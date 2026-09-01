@@ -53,10 +53,25 @@ curl -s localhost:8000/health                        # {"status": "ok"}
 The container runs `python main.py`, which configures logging and serves; the uvicorn
 CLI above is the same thing with reload for local work.
 
-`LOG_LEVEL` (`debug` | `info` | `warn` | `error`, default `info`) is the only knob so
-far. Logs are structured JSON to stdout, nothing else — routing and retention belong
-to whatever runs the container. Each line carries the `X-Correlation-ID` the gateway
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `TMDB_API_KEY` | yes | — | The v4 Read Access Token, sent as `Authorization: Bearer`. The one secret this service holds. Read when the catalog tool is constructed. |
+| `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
+
+Logs are structured JSON to stdout, nothing else — routing and retention belong to
+whatever runs the container. Each line carries the `X-Correlation-ID` the gateway
 minted, so a request can be followed across services.
+
+## TMDB client
+
+`tmdb.py` wraps the catalog API: title search, `discover` (filter by streaming
+service, region, runtime, year, genre, cast, crew, keywords), "more like this", and
+per-title streaming availability. Callers pass names — "Tilda Swinton", "heist" — and
+the client resolves them to TMDB IDs and caches the mapping. A `vote_count` floor is
+always applied and cannot be lowered; subscription matches are `flatrate` only. No
+results is an empty list; only TMDB being unreachable or 429/5xx raises
+`TMDBUnavailable`. It takes no URL or raw query from its caller, and reads no
+environment — the token is passed to `TMDBClient(...)`.
 
 ## Tests
 
@@ -64,3 +79,7 @@ minted, so a request can be followed across services.
 uv run pytest
 uv run ruff check . && uv run ruff format --check . && uv run mypy .
 ```
+
+`test_tmdb.py` runs offline against a mock transport. `test_tmdb_live.py` makes real
+calls and skips unless `TMDB_API_KEY` is set — the same pattern as the gateway's
+`TEST_DATABASE_URL` tests.
