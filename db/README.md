@@ -14,6 +14,11 @@ editing or adding a migration:
 docker compose down -v && docker compose up
 ```
 
+Skip the `down -v` and a newly added migration never runs, so anything it
+introduced is missing — the `db-init` service then fails on the absent roles and
+the gateway will not start. That is the intended loud failure for a stale schema;
+`down -v` is the fix.
+
 **Supabase (hosted):** it has no auto-apply, so push explicitly:
 
 ```
@@ -23,6 +28,25 @@ supabase db push --db-url "$DATABASE_URL"
 Do not run `supabase db push` against the local compose Postgres — the entrypoint
 already applied the files without recording them in `supabase_migrations`, so the
 push re-runs them and fails on the first `create table`.
+
+## Roles
+
+The T10 migration creates two service roles, `gateway_app` (the sole writer) and
+`agent_ro` (no write grant anywhere, and no read grants yet — later tasks add
+them), both `NOLOGIN`. A committed migration runs everywhere, so it carries no
+password.
+
+- **Local:** compose's `db-init` service applies `db/local-roles.sql` once
+  Postgres is healthy, granting both roles a login with the throwaway compose
+  password. The gateway waits for it.
+- **Supabase:** grant the login and set a password once, in the SQL editor or
+  dashboard:
+  ```
+  alter role gateway_app with login password '…';
+  alter role agent_ro   with login password '…';
+  ```
+  Then point `DATABASE_URL` at `gateway_app` and `DATABASE_URL_AGENT_READONLY` at
+  `agent_ro`.
 
 ## Planned schema
 

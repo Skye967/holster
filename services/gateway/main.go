@@ -17,6 +17,7 @@ import (
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -187,6 +188,27 @@ func (h *Handler) verifyToken(tokenString string) (*Claims, error) {
 	return claims, nil
 }
 
+// withUser runs fn inside a transaction with holster.user_id bound to the
+// caller's Clerk ID, so the RLS policies from 20260831233121_rls_roles.sql scope
+// every statement fn issues. This is the shape every user-scoped database
+// operation follows — see ../../DECISIONS.md and TASKS.md T10.
+//
+// The transaction is not optional. The gateway connects as gateway_app, a
+// non-owner role subject to row-level security. set_config with is_local => true
+// scopes the binding to this transaction, so it cannot leak to the next caller
+// on a pooled connection; a session-level SET would. Omitting the binding is not
+// an exposure but a self-inflicted outage: current_setting then returns NULL and
+// every policy predicate denies.
+func withUser(ctx context.Context, db *pgxpool.Pool, userID string, fn func(pgx.Tx) error) error {
+	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`select set_config('holster.user_id', $1, true)`, userID); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
+}
+
 // upsertUser mirrors the Clerk identity into users. Runs on every request rather
 // than on a user.created webhook because it repairs itself; see ../../DECISIONS.md.
 //
@@ -194,11 +216,13 @@ func (h *Handler) verifyToken(tokenString string) (*Claims, error) {
 // rewrites the row every time. TestUpsertUser holds it to that.
 func upsertUser(db *pgxpool.Pool) func(context.Context, string, string) error {
 	return func(ctx context.Context, id, email string) error {
-		_, err := db.Exec(ctx, `
-			insert into users (id, email) values ($1, $2)
-			on conflict (id) do update set email = excluded.email
-			where users.email is distinct from excluded.email`, id, email)
-		return err
+		return withUser(ctx, db, id, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
+				insert into users (id, email) values ($1, $2)
+				on conflict (id) do update set email = excluded.email
+				where users.email is distinct from excluded.email`, id, email)
+			return err
+		})
 	}
 }
 

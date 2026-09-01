@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -116,13 +119,14 @@ func TestUpsertUser(t *testing.T) {
 	}
 }
 
-// RLS must stay enabled on users: Supabase exposes tables through PostgREST, so
-// one without it is readable by anyone holding the publishable key.
+// RLS must stay enabled on users: on hosted Supabase, PostgREST exposes public
+// tables, so one without RLS is readable by anyone holding the anon key.
 //
-// Deliberately does not assert how the gateway gets to write. It currently does
-// so as the table owner, which bypasses RLS, but pinning that would turn T10's
-// hardening into a red test that reads like a regression. TestUpsertUser already
-// proves writes work, by outcome, under whatever role is configured.
+// This asserts the switch is on, not the policy behaviour behind it. The gateway
+// connects as gateway_app -- a non-owner role, so RLS applies -- and sets
+// holster.user_id per request; TestGatewayRoleEnforcesUserIsolation covers that
+// path. TestUpsertUser runs as the TEST_DATABASE_URL superuser, which bypasses
+// RLS, so it exercises upsert semantics only.
 func TestRLSEnabledOnUsers(t *testing.T) {
 	pool := testPool(t)
 
@@ -140,4 +144,192 @@ func TestRLSEnabledOnUsers(t *testing.T) {
 	if !enabled {
 		t.Error("row level security is not enabled on users")
 	}
+}
+
+// asRole runs fn inside a rolled-back transaction with the session role dropped
+// to role. The suite connects as the migration/superuser role, which bypasses
+// RLS and every grant; SET ROLE is what makes the T10 policies and grants under
+// test actually apply. Nothing is committed.
+func asRole(t *testing.T, pool *pgxpool.Pool, role string, fn func(context.Context, pgx.Tx)) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// role is a test constant, never user input.
+	if _, err := tx.Exec(ctx, "set role "+role); err != nil {
+		t.Fatalf("set role %s: %v", role, err)
+	}
+	fn(ctx, tx)
+}
+
+// denied reports whether err is a permission-denied error (SQLSTATE 42501).
+func denied(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42501"
+}
+
+// probe runs one statement against a savepoint and rolls it back, so a
+// permission failure does not abort the surrounding transaction and the next
+// probe still runs.
+func probe(t *testing.T, ctx context.Context, tx pgx.Tx, sql string) error {
+	t.Helper()
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		t.Fatalf("savepoint: %v", err)
+	}
+	_, execErr := sp.Exec(ctx, sql)
+	_ = sp.Rollback(ctx)
+	return execErr
+}
+
+// T10's core invariant: agent_ro has no write path to any table. It also has no
+// read grants yet -- those are added by the task that needs each one -- but
+// "never writes" is the property that must not regress, so that is what this
+// pins.
+func TestAgentRoleIsReadOnly(t *testing.T) {
+	pool := testPool(t)
+
+	writes := map[string]string{
+		"insert users":        `insert into users (id, email) values ('agent_probe', 'x@example.com')`,
+		"update users":        `update users set email = 'y@example.com' where id = 'nobody'`,
+		"delete users":        `delete from users where id = 'nobody'`,
+		"insert subscription": `insert into streaming_subscriptions (user_id, tmdb_provider_id) values ('agent_probe', 8)`,
+		"delete subscription": `delete from streaming_subscriptions where user_id = 'nobody'`,
+		"insert provider":     `insert into streaming_providers (country, providers) values ('ZZ', '[]'::jsonb)`,
+		"update provider":     `update streaming_providers set fetched_at = now() where country = 'ZZ'`,
+	}
+	asRole(t, pool, "agent_ro", func(ctx context.Context, tx pgx.Tx) {
+		for name, sql := range writes {
+			if err := probe(t, ctx, tx, sql); !denied(err) {
+				t.Errorf("%s: err = %v, want SQLSTATE 42501", name, err)
+			}
+		}
+	})
+}
+
+// T10's first half: under gateway_app, holster.user_id fences every user-scoped
+// table -- a user sees only their rows and cannot write rows tagged with another
+// user's id.
+func TestGatewayRoleEnforcesUserIsolation(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const uA, uB = "rls_test_a", "rls_test_b"
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(c, `delete from users where id = any($1)`, []string{uA, uB}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+	// Seed as the owner, which bypasses RLS.
+	for _, u := range []string{uA, uB} {
+		if _, err := pool.Exec(ctx,
+			`insert into users (id, email) values ($1, $2) on conflict (id) do nothing`,
+			u, u+"@example.com"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ($1, 8)
+			 on conflict do nothing`, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	asRole(t, pool, "gateway_app", func(ctx context.Context, tx pgx.Tx) {
+		if _, err := tx.Exec(ctx, `select set_config('holster.user_id', $1, true)`, uA); err != nil {
+			t.Fatalf("set_config: %v", err)
+		}
+
+		var users []string
+		rows, err := tx.Query(ctx, `select id from users where id = any($1) order by id`,
+			[]string{uA, uB})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			users = append(users, id)
+		}
+		rows.Close()
+		if len(users) != 1 || users[0] != uA {
+			t.Errorf("as %s, visible users = %v, want [%s]", uA, users, uA)
+		}
+
+		var subs int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from streaming_subscriptions where user_id = any($1)`,
+			[]string{uA, uB}).Scan(&subs); err != nil {
+			t.Fatal(err)
+		}
+		if subs != 1 {
+			t.Errorf("as %s, visible subscriptions = %d, want 1", uA, subs)
+		}
+
+		// A write for the acting user passes WITH CHECK...
+		if err := probe(t, ctx, tx,
+			`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ('`+uA+`', 99)`); err != nil {
+			t.Errorf("as %s, writing its own subscription: %v", uA, err)
+		}
+		// ...including the on-conflict upsert path upsertUser runs.
+		if err := probe(t, ctx, tx, `
+			insert into users (id, email) values ('`+uA+`', 'updated@example.com')
+			on conflict (id) do update set email = excluded.email
+			where users.email is distinct from excluded.email`); err != nil {
+			t.Errorf("as %s, upserting its own users row: %v", uA, err)
+		}
+		// ...but a write for another user is rejected by WITH CHECK.
+		if err := probe(t, ctx, tx,
+			`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ('`+uB+`', 9)`); !denied(err) {
+			t.Errorf("writing a row for %s while acting as %s: err = %v, want SQLSTATE 42501", uB, uA, err)
+		}
+	})
+}
+
+// The fail-closed half: gateway_app with holster.user_id unset sees no rows and
+// can write none. A handler that forgets withUser's set_config gets an empty
+// result or a permission error -- never another user's data. This is what the
+// empty-string guard on current_setting in the policies buys.
+func TestGatewayRoleDeniesWithoutUserContext(t *testing.T) {
+	pool := testPool(t)
+
+	// A row must exist for "sees no rows" to mean anything.
+	ctx := context.Background()
+	const seed = "rls_no_context_seed"
+	if _, err := pool.Exec(ctx,
+		`insert into users (id, email) values ($1, $2) on conflict (id) do nothing`,
+		seed, seed+"@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(c, `delete from users where id = $1`, seed); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	asRole(t, pool, "gateway_app", func(ctx context.Context, tx pgx.Tx) {
+		var n int
+		if err := tx.QueryRow(ctx, `select count(*) from users`).Scan(&n); err != nil {
+			t.Fatalf("select users: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("with no holster.user_id, visible users = %d, want 0", n)
+		}
+
+		if err := probe(t, ctx, tx,
+			`insert into users (id, email) values ('rls_no_context', 'x@example.com')`); !denied(err) {
+			t.Errorf("insert with no holster.user_id: err = %v, want SQLSTATE 42501", err)
+		}
+	})
 }

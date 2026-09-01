@@ -27,7 +27,7 @@ directly, export them first:
 
 ```sh
 set -a; source ../../.env; set +a
-DATABASE_URL=postgresql://postgres:password@localhost:5432/holster go run .
+DATABASE_URL=postgresql://gateway_app:password@localhost:5432/holster go run .
 ```
 
 `DATABASE_URL` is passed on the command line rather than kept in `.env` because the
@@ -63,7 +63,9 @@ TEST_DATABASE_URL=postgresql://postgres:password@localhost:5432/holster go test 
 
 Database tests skip unless `TEST_DATABASE_URL` is set. It is deliberately not
 `DATABASE_URL`, so running the suite cannot write to a configured production
-database.
+database. Point it at a superuser/owner connection — the RLS tests use `SET ROLE`
+to drop into `gateway_app` and `agent_ro`; the local compose `postgres` role
+works.
 
 ## User provisioning
 
@@ -78,9 +80,18 @@ and `upsertUser`.
 A provisioning failure returns 503 rather than letting the request through, bounded
 by a 2s deadline so an unresponsive database cannot hold the request open.
 
-The gateway connects as the table owner, which bypasses the row-level security
-enabled in the initial migration. T10 replaces that with a restricted role and
-real policies.
+The gateway connects as `gateway_app` — a non-owner role with `select`, `insert`,
+`update` and `delete` on the app tables and nothing else (no `drop`, no object
+creation, no `pg_authid`). It is subject to row-level security: every user-scoped
+operation runs through `withUser`, which opens a transaction, sets
+`holster.user_id` to the caller's Clerk ID, and hands the handler a `pgx.Tx` the
+policies pin to that ID. That is defence in depth behind each handler's own
+`where user_id = $1` — the browser never reaches the database directly.
+
+`agent_ro`, created in the same migration, has no write grant anywhere and no
+read grants yet — each read is added by the task that needs it. Both roles are
+`nologin` in the migration; a local login and password come from
+`db/local-roles.sql`, and Supabase sets them in the dashboard.
 
 ## Logs
 

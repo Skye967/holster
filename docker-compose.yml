@@ -25,15 +25,18 @@ services:
       CLERK_ISSUER: ${CLERK_ISSUER}
       CLERK_AUTHORIZED_PARTIES: ${CLERK_AUTHORIZED_PARTIES}
       CLERK_AUDIENCE: ${CLERK_AUDIENCE}
-      # Defaults to the compose-network Postgres. `localhost` in DATABASE_URL
+      # Defaults to the compose-network Postgres, as gateway_app — the
+      # least-privilege role RLS applies to (T10). `localhost` in DATABASE_URL
       # means the gateway's own container, not the database — set the host to
       # `postgres`, or leave it unset to take this default.
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:password@postgres:5432/holster}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://gateway_app:password@postgres:5432/holster}
       GATEWAY_PORT: ${GATEWAY_PORT:-8080}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
-      postgres:
-        condition: service_healthy
+      # db-init, not postgres: gateway_app is created NOLOGIN by the migration and
+      # only gets a local login once db-init runs. Starting sooner just fails fast.
+      db-init:
+        condition: service_completed_successfully
 
   # --- Agent: LangChain orchestration, read-only, not exposed ---------------
   # agent:
@@ -43,6 +46,32 @@ services:
   #     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
   #     TMDB_API_KEY: ${TMDB_API_KEY}
   #     DATABASE_URL: ${DATABASE_URL_AGENT_READONLY}
+  #   depends_on:
+  #     db-init:
+  #       condition: service_completed_successfully
+
+  # --- One-shot: give the T10 roles a local login --------------------------
+  # gateway_app and agent_ro are created NOLOGIN by the migration (a committed
+  # migration carries no password). This grants them the throwaway compose
+  # password once Postgres is up; Supabase sets these in the dashboard instead.
+  # Idempotent — ALTER ROLE is safe to re-run on every `up`.
+  db-init:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: password
+    volumes:
+      - ./db/local-roles.sql:/local-roles.sql:ro
+    entrypoint:
+      - psql
+      - --host=postgres
+      - --username=postgres
+      - --dbname=holster
+      - --set=ON_ERROR_STOP=1
+      - --file=/local-roles.sql
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   # --- Local Postgres -------------------------------------------------------
   # Supabase hosts the real database; this is a local stand-in so the stack runs
