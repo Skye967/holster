@@ -328,6 +328,15 @@ class TMDBClient:
             logger.warning("tmdb name unresolved, constraint dropped (%s)", kind)
         return resolved
 
+    def is_keyword_resolved(self, name: str) -> bool:
+        """True if `name` resolved to a real TMDB keyword — i.e. a query
+        using it actually filtered on something. Never triggers a lookup:
+        the cache it reads is only populated by discover() calls, so only
+        call this for a name the current request has already passed through
+        discover(). Calling it before that conflates "not yet looked up"
+        with "failed to resolve" — both read as False."""
+        return self._keyword_ids.get(name.strip().lower()) is not None
+
     async def _resolve_into(
         self,
         params: dict[str, Any],

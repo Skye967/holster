@@ -65,6 +65,9 @@ class FakeTMDB:
             f"no request to {path}: {[r.url.path for r in self.requests]}"
         )
 
+    def all_params_for(self, path: str) -> list[dict[str, str]]:
+        return [dict(r.url.params) for r in self.requests if r.url.path == "/3" + path]
+
 
 MOVIE_A = {
     "id": 101,
@@ -345,5 +348,157 @@ def test_search_short_circuits_on_empty_watch_providers() -> None:
 
     assert result.intent is None
     assert result.picks == []
+    assert result.relaxed == []
     assert not called
     assert fake_tmdb.requests == []
+
+
+# --- relaxation ladder -----------------------------------------------------
+
+
+async def _rank_first(message: str, candidates: list[Title]) -> RankResult:
+    return RankResult(picks=[RankedPick(tmdb_id=candidates[0]["tmdb_id"], blurb="ok")])
+
+
+def test_search_relaxes_runtime_when_the_first_query_is_empty() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": []})  # first pass: nothing
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # runtime dropped: hit
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return _intent(max_runtime_minutes=90)
+
+    result = run(
+        search(
+            "something short",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=_rank_first,
+        )
+    )
+
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    assert len(calls) == 2
+    assert calls[0]["with_runtime.lte"] == "90"
+    assert "with_runtime.lte" not in calls[1]
+    assert result.relaxed == ["runtime"]
+    assert [title["title"] for title, _ in result.picks] == ["Fake Heist"]
+
+
+def test_search_skips_a_rung_with_nothing_to_drop() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/keyword", {"results": [{"id": 42, "name": "cozy"}]})
+    fake_tmdb.ok("/discover/movie", {"results": []})  # first pass
+    fake_tmdb.ok("/discover/movie", {"results": []})  # runtime dropped
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # keywords dropped
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return _intent(max_runtime_minutes=90, keywords=["cozy"])
+
+    result = run(
+        search(
+            "something cozy and short",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=_rank_first,
+        )
+    )
+
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    assert len(calls) == 3  # first, -runtime, -keywords; the year rung is skipped
+    assert "with_runtime.lte" in calls[0] and "with_keywords" in calls[0]
+    assert "with_runtime.lte" not in calls[1] and "with_keywords" in calls[1]
+    assert "with_keywords" not in calls[2]
+    assert result.relaxed == ["runtime", "keywords"]
+
+
+def test_search_skips_keywords_rung_when_nothing_resolved() -> None:
+    """A keyword the model invented (no TMDB match) never reaches the query,
+    so dropping it can't change anything — the rung must not fire a wasted,
+    identical retry or falsely report a constraint that was never applied."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/keyword", {"results": []})  # "cozy" never resolves
+    fake_tmdb.ok("/discover/movie", {"results": []})  # the only call made
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return _intent(keywords=["cozy"])  # nothing else set to relax
+
+    result = run(
+        search(
+            "something cozy",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=_rank_must_not_run,
+        )
+    )
+
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    assert len(calls) == 1
+    assert result.relaxed == []
+    assert result.picks == []
+
+
+def test_search_never_relaxes_services_region_or_exclusions() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/keyword", {"results": [{"id": 42, "name": "cozy"}]})
+    # every /discover/movie falls through to the fake's default empty result
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return _intent(
+            max_runtime_minutes=90,
+            release_year_gte=2015,
+            keywords=["cozy"],
+            without_genres=["horror"],
+        )
+
+    result = run(
+        search(
+            "something",
+            client=fake_tmdb.client(),
+            watch_region="GB",
+            watch_providers=[8, 9],
+            interpret_model=fake_interpret,
+            rank_model=_rank_must_not_run,  # rank() short-circuits on no candidates
+        )
+    )
+
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    assert len(calls) == 4  # first + three rungs, then the ladder is exhausted
+    assert result.relaxed == ["runtime", "year", "keywords"]
+    assert result.picks == []
+    for params in calls:
+        assert params["watch_region"] == "GB"
+        assert params["with_watch_providers"] == "8|9"
+        assert params["with_watch_monetization_types"] == "flatrate"
+        assert params["vote_count.gte"] == str(tmdb.MIN_VOTE_COUNT)
+        assert params["without_genres"] == "27"  # horror, from the frozen table
+
+
+def test_search_does_not_relax_when_the_first_query_returns_results() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return _intent(max_runtime_minutes=90)
+
+    result = run(
+        search(
+            "something",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=_rank_first,
+        )
+    )
+
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    assert len(calls) == 1
+    assert calls[0]["with_runtime.lte"] == "90"  # kept — nothing was relaxed
+    assert result.relaxed == []

@@ -144,6 +144,20 @@ def test_resolution_is_cached_across_calls() -> None:
     assert fake.count("/search/person") == 1
 
 
+def test_is_keyword_resolved_reflects_the_cache() -> None:
+    fake = FakeTMDB()
+    fake.ok("/search/keyword", KEYWORD)
+
+    client = fake.client()
+    assert client.is_keyword_resolved("heist") is False  # not looked up yet
+
+    run(client.discover(media_type="movie", watch_region="US", keywords=["heist"]))
+
+    assert client.is_keyword_resolved("heist") is True
+    assert client.is_keyword_resolved("HEIST") is True  # normalized like the cache key
+    assert client.is_keyword_resolved("nonexistent") is False
+
+
 def test_year_range_becomes_date_bounds() -> None:
     fake = FakeTMDB()
     run(

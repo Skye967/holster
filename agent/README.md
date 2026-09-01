@@ -88,6 +88,11 @@ those parameters plus the caller's real region and providers, and `rank()` has t
 model pick and explain up to `intent.limit` of the *real* candidates that came back —
 its output schema carries no title metadata, only a selected id and a blurb, so a
 manipulated overview can win a bad blurb at worst, never assert a fake title.
+When the first query returns nothing, `search()` retries with soft constraints
+dropped in a fixed order — runtime, then year, then mood keywords — never the
+user's services, region, or exclusions, and records what it dropped in
+`CatalogResult.relaxed` for the chat layer to explain ("nothing under 90 minutes
+— here are the closest").
 LangChain is confined to `anthropic_interpreter()`/`anthropic_ranker()`; everything
 else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`.
 
