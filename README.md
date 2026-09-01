@@ -65,8 +65,8 @@ The design assumes the agent will eventually be manipulated and makes that survi
 - **The agent is not reachable from the internet.** Only the gateway is exposed.
 - **Tools are a fixed, declared list.** The agent picks operations from a menu and
   fills in permitted parameters. It cannot compose a request or name an endpoint.
-- **The agent holds one secret**, the TMDB key, which is app-level and opens nobody's
-  account.
+- **The agent holds only app-level secrets** — the TMDB key, the LLM provider key —
+  neither of which opens any user's account.
 - **Holster never sees your password.** Sign-in is handled by Clerk on its own domain.
 
 Secrets come from the environment. See `.env.example` — it lists every variable and

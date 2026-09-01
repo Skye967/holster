@@ -42,8 +42,9 @@ survivable rather than trying to prevent it:
 - **The agent cannot write anything.** Every mutation — subscriptions, ratings,
   messages — goes through the gateway. The model has no path to a write.
 - **The agent is not reachable from the internet.** Only the gateway is.
-- **The agent holds one secret**, the TMDB key, which is app-level and opens nobody's
-  account. Losing it costs a key rotation, not a user.
+- **The agent holds only app-level secrets** — the TMDB key, the LLM provider key —
+  neither of which opens any user's account. Losing one costs a key rotation, not a
+  user.
 - **Tools are a fixed menu, not an open door.** The agent picks from a declared list of
   catalog operations. It cannot compose an arbitrary request or reach an endpoint that
   is not on the list.
@@ -60,7 +61,7 @@ once, at the edge, and passes it inward. It owns every write to the database.
 
 **`agent` is least trusted**, so it gets the narrowest surface: read-only database
 access scoped to catalog and conversation tables, no internet exposure, no write path,
-and one app-level key.
+and only app-level keys.
 
 **Database roles enforce this, not convention.** The agent connects as a role with no
 `insert`, `update` or `delete` grant. A bug or an injected instruction hits a
@@ -68,8 +69,8 @@ permission error rather than a modified row.
 
 ## Two classes of tool
 
-**Catalog tools** — TMDB. One app-level key held by the agent. No user connection, no
-per-user secret. They work for every user on first load.
+**Catalog tools** — TMDB. One app-level key, no user connection, no per-user secret.
+They work for every user on first load.
 
 There is no second class. Connected tools requiring per-user OAuth were considered at
 length and cut; the reasoning is in [DECISIONS.md](../DECISIONS.md).

@@ -36,8 +36,10 @@ survivable.
 - **Agent tools are a fixed, declared list.** Never add a tool that takes a URL, an
   endpoint, or a raw query from the model. Parameters may be filled in from a declared
   set; the destination may not.
-- **The agent holds exactly one secret** — the TMDB key, which is app-level. If a
-  change would give it a second, that change is wrong.
+- **The agent holds no credential belonging to a user or a third-party account.** It
+  may hold app-level API keys — TMDB, the LLM provider — whose compromise costs a key
+  rotation, not a user. If a change would give it a credential that reaches a user's
+  account anywhere, that change is wrong.
 - **Row-level security on every user-scoped table**, keyed on the Clerk user ID.
 - **Every catalog query carries `watch_region`.** Availability is country-specific.
 - **No table holds a credential.** Holster stores no secret belonging to any other

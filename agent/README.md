@@ -34,8 +34,8 @@ prevent it. See `../CLAUDE.md` for the invariants; the ones that bind this servi
   not the world.
 - **Its tools are a fixed, declared list.** No tool takes a URL, an endpoint, or a raw
   query from the model.
-- **It holds exactly one secret** — the TMDB key, which is app-level and opens nobody's
-  account.
+- **It holds only app-level secrets** — the TMDB key, the LLM provider key — neither of
+  which opens any user's account.
 - **Its database reads are scoped** to the catalog and conversation tables, nothing
   user-scoped beyond what the gateway hands it.
 
@@ -55,8 +55,13 @@ CLI above is the same thing with reload for local work.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `TMDB_API_KEY` | yes | — | The v4 Read Access Token, sent as `Authorization: Bearer`. The one secret this service holds. Read when the catalog tool is constructed. |
+| `TMDB_API_KEY` | yes | — | The v4 Read Access Token, sent as `Authorization: Bearer`. Read when the TMDB client is constructed. |
+| `ANTHROPIC_API_KEY` | yes | — | Read when the catalog tool's model is constructed. |
+| `ANTHROPIC_MODEL` | no | `claude-haiku-4-5-20251001` | Powers both catalog_tool steps — interpreting a message and ranking candidates. |
 | `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
+
+Both keys are app-level: neither opens any user's account, so losing one costs a
+rotation, not a user. See `CLAUDE.md`.
 
 Logs are structured JSON to stdout, nothing else — routing and retention belong to
 whatever runs the container. Each line carries the `X-Correlation-ID` the gateway
@@ -73,6 +78,19 @@ results is an empty list; only TMDB being unreachable or 429/5xx raises
 `TMDBUnavailable`. It takes no URL or raw query from its caller, and reads no
 environment — the token is passed to `TMDBClient(...)`.
 
+## Catalog tool
+
+`catalog_tool.py` puts a model in front of `tmdb.py`: two calls, not an agent loop.
+`interpret()` turns a message into `DiscoverIntent` — `tmdb.discover()`'s creative
+parameters, with no `watch_region`/`watch_providers` field, so the model can never
+choose which streaming services results come from. `search()` calls `discover()` with
+those parameters plus the caller's real region and providers, and `rank()` has the
+model pick and explain up to `intent.limit` of the *real* candidates that came back —
+its output schema carries no title metadata, only a selected id and a blurb, so a
+manipulated overview can win a bad blurb at worst, never assert a fake title.
+LangChain is confined to `anthropic_interpreter()`/`anthropic_ranker()`; everything
+else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`.
+
 ## Tests
 
 ```sh
@@ -80,6 +98,7 @@ uv run pytest
 uv run ruff check . && uv run ruff format --check . && uv run mypy .
 ```
 
-`test_tmdb.py` runs offline against a mock transport. `test_tmdb_live.py` makes real
-calls and skips unless `TMDB_API_KEY` is set — the same pattern as the gateway's
-`TEST_DATABASE_URL` tests.
+`test_tmdb.py` and `test_catalog_tool.py` run offline, against a mock transport and
+fake models respectively. `test_tmdb_live.py` and `test_catalog_tool_live.py` make
+real calls and skip unless `TMDB_API_KEY`/`ANTHROPIC_API_KEY` is set — the same
+pattern as the gateway's `TEST_DATABASE_URL` tests.

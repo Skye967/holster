@@ -386,7 +386,11 @@ class TMDBClient:
 
         Names for cast, crew and keywords are resolved to IDs; an unresolvable
         name is dropped with a warning rather than failing the call. Genres are
-        matched against the frozen table for ``media_type``.
+        matched against the frozen table for ``media_type``. ``watch_providers``
+        follows the same "omit for none" convention as the other optional
+        filters: pass ``None`` (the default) to skip provider filtering
+        entirely; an explicit empty list raises ``ValueError`` rather than
+        being silently treated the same as ``None``.
         """
         _validate_media_type(media_type)
         _validate_region(watch_region)
@@ -401,7 +405,15 @@ class TMDBClient:
             "vote_count.gte": MIN_VOTE_COUNT,
         }
 
-        if watch_providers:
+        if watch_providers is not None:
+            if not watch_providers:
+                # Omit the parameter for "no filter" — an explicit empty list
+                # is a caller bug, not a request for every provider. Silently
+                # treating [] like None would undo "results only include
+                # services the user ticked" for a zero-subscription caller.
+                raise ValueError(
+                    "watch_providers must not be empty; omit it (None) for no filter"
+                )
             ids_str = "|".join(str(int(p)) for p in watch_providers)
             params["with_watch_providers"] = ids_str
             # Subscription means included, not rentable — TASKS.md T12.
