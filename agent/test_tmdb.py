@@ -14,50 +14,12 @@ import httpx2
 import pytest
 
 import tmdb
-from tmdb import MIN_VOTE_COUNT, TMDBClient, TMDBError, TMDBUnavailable
+from testutil import FakeTMDB
+from tmdb import MIN_VOTE_COUNT, TMDBError, TMDBUnavailable
 
 
 def run(coro: Any) -> Any:
     return asyncio.run(coro)
-
-
-class FakeTMDB:
-    """Records every outgoing request and replays queued responses by path.
-
-    A path with a queue pops one response per call (so a 429 then a 200 tests a
-    retry); a path with none gets an empty result set.
-    """
-
-    def __init__(self) -> None:
-        self.requests: list[httpx2.Request] = []
-        self._queues: dict[str, list[httpx2.Response]] = {}
-
-    def queue(self, path: str, *responses: httpx2.Response) -> None:
-        self._queues.setdefault("/3" + path, []).extend(responses)
-
-    def ok(self, path: str, payload: dict[str, Any]) -> None:
-        self.queue(path, httpx2.Response(200, json=payload))
-
-    def _handler(self, request: httpx2.Request) -> httpx2.Response:
-        self.requests.append(request)
-        queue = self._queues.get(request.url.path)
-        if queue:
-            return queue.pop(0)
-        return httpx2.Response(200, json={"results": []})
-
-    def client(self) -> TMDBClient:
-        return TMDBClient("test-token", transport=httpx2.MockTransport(self._handler))
-
-    def params_for(self, path: str) -> dict[str, str]:
-        for request in self.requests:
-            if request.url.path == "/3" + path:
-                return dict(request.url.params)
-        raise AssertionError(
-            f"no request to {path}: {[r.url.path for r in self.requests]}"
-        )
-
-    def count(self, path: str) -> int:
-        return sum(1 for r in self.requests if r.url.path == "/3" + path)
 
 
 PERSON = {"results": [{"id": 3063, "name": "Tilda Swinton"}]}

@@ -17,7 +17,7 @@ between turns and holds no conversation state — see `../DECISIONS.md`.
 | Method | Path | Does |
 |---|---|---|
 | `GET` | `/health` | liveness |
-| `POST` | `/chat` | *(planned)* run the turn, stream the answer back to the gateway |
+| `POST` | `/chat` | run the turn, stream the answer back to the gateway as NDJSON |
 
 ## Trust
 
@@ -95,6 +95,29 @@ user's services, region, or exclusions, and records what it dropped in
 — here are the closest").
 LangChain is confined to `anthropic_interpreter()`/`anthropic_ranker()`; everything
 else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`.
+
+## Chat pipeline
+
+`chat.py`'s `stream_chat()` wraps `catalog_tool.search()` for `POST /chat`: a plain
+chunked HTTP response (`application/x-ndjson`), not a second WebSocket — the browser's
+socket belongs to the gateway alone (`../DECISIONS.md`). Each line is one event:
+`intent` (as soon as `interpret()` resolves — well before the full pipeline finishes,
+via `search()`'s `on_intent` hook), `results` or `message` (candidates, or a plain reply
+when there are none — no subscriptions, or nothing survived the relaxation ladder),
+`error` (one of a fixed, closed set of reason codes — never raw exception text), and
+`done`. `error` is terminal on its own; a turn ends with exactly one of `done` or
+`error`, never both.
+
+This is the agent-internal protocol, not the browser-facing one — the gateway owns the
+public event vocabulary (`interpreting`/`results`/`token`/`done`/`error`) and templates
+it from these. Cancellation is plain `asyncio` cancellation: the gateway aborting its
+HTTP call closes the response body, which stops `stream_chat()` iterating, which cancels
+the background `search()` call — nothing bespoke on this side.
+
+`history` in the request body is the last few exchanges only, held in memory on the
+gateway's WebSocket connection — there is no persisted conversation yet (`TASKS.md`
+T20). It is folded into the text handed to `interpret()`/`rank()` rather than changing
+`catalog_tool.py`'s `message: str` contract.
 
 ## Tests
 

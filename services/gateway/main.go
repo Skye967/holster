@@ -109,12 +109,27 @@ type Handler struct {
 	// Injected so the auth path is testable without a database. Production
 	// wiring is upsertUser; the SQL itself is covered by its own test.
 	ensureUser func(ctx context.Context, id, email string) error
+
+	// The chat socket — see chat.go. loadChatCtx and callAgent follow
+	// ensureUser's own injection shape so both are fakeable in tests without a
+	// real database or agent process. rootCtx is the process's own
+	// SIGINT/SIGTERM-cancelled context (not any single request's), used to tie
+	// every open WebSocket's lifetime to server shutdown.
+	loadChatCtx    func(ctx context.Context, userID string) (chatContext, error)
+	callAgent      agentCaller
+	tickets        *chatTicketStore
+	originPatterns []string
+	rootCtx        context.Context
 }
 
 // newHandler guards the keyfunc and rejects an empty origin allowlist, which
 // would 401 every request — a startup error rather than a runtime surprise.
 func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]struct{},
-	ensureUser func(ctx context.Context, id, email string) error) (*Handler, error) {
+	ensureUser func(ctx context.Context, id, email string) error,
+	loadChatCtx func(ctx context.Context, userID string) (chatContext, error),
+	callAgent agentCaller,
+	rootCtx context.Context,
+) (*Handler, error) {
 
 	if len(parties) == 0 {
 		return nil, errors.New("no authorized parties configured")
@@ -125,12 +140,32 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	if ensureUser == nil {
 		return nil, errors.New("no user provisioner configured")
 	}
+	if loadChatCtx == nil {
+		return nil, errors.New("no chat context loader configured")
+	}
+	if callAgent == nil {
+		return nil, errors.New("no agent caller configured")
+	}
+	if rootCtx == nil {
+		return nil, errors.New("no root context configured")
+	}
+
+	origins := make([]string, 0, len(parties))
+	for p := range parties {
+		origins = append(origins, p)
+	}
+
 	return &Handler{
-		keyfunc:    requireKID(kf),
-		issuer:     issuer,
-		audience:   audience,
-		parties:    parties,
-		ensureUser: ensureUser,
+		keyfunc:        requireKID(kf),
+		issuer:         issuer,
+		audience:       audience,
+		parties:        parties,
+		ensureUser:     ensureUser,
+		loadChatCtx:    loadChatCtx,
+		callAgent:      callAgent,
+		tickets:        newChatTicketStore(),
+		originPatterns: origins,
+		rootCtx:        rootCtx,
 	}, nil
 }
 
@@ -321,12 +356,21 @@ func (h *Handler) example(w http.ResponseWriter, r *http.Request) {
 // routes wraps auth around the whole /api/ prefix rather than around individual
 // routes, so a handler registered on the api mux cannot be reachable without it.
 // Public routes go on root.
+//
+// /ws/chat is the one deliberate exception: it authenticates via a ticket
+// (chat.go), not a Bearer header, so it cannot sit on the authMiddleware-wrapped
+// api mux — putting it under /api/ would silently break the "everything under
+// /api/ requires the Bearer path" invariant this comment states. Its own ticket
+// mint endpoint, POST /api/chat/ticket, is an ordinary Bearer-authenticated
+// route and does live on api.
 func (h *Handler) routes() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/example", h.example)
+	api.HandleFunc("POST /api/chat/ticket", h.chatTicket)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /health", h.health)
+	root.HandleFunc("GET /ws/chat", h.chatWS)
 	root.Handle("/api/", h.authMiddleware(api))
 
 	return correlationID(root)
@@ -374,6 +418,7 @@ func main() {
 	audience := mustEnv("CLERK_AUDIENCE")
 	parties := authorizedParties(mustEnv("CLERK_AUTHORIZED_PARTIES"))
 	databaseURL := mustEnv("DATABASE_URL")
+	agentURL := mustEnv("AGENT_SERVICE_URL")
 
 	port := os.Getenv("GATEWAY_PORT")
 	if port == "" {
@@ -439,7 +484,13 @@ func main() {
 			"local stack, or apply migrations to your configured database (see db/README.md)")
 	}
 
-	h, err := newHandler(jwks.Keyfunc, issuer, audience, parties, upsertUser(db))
+	// No client-level Timeout: a chat turn's own bound is turnDeadline (chat.go),
+	// applied via the request context, not a fixed transport timeout that would
+	// also cap how long the streamed NDJSON body may legitimately stay open.
+	agentClient := &http.Client{}
+
+	h, err := newHandler(jwks.Keyfunc, issuer, audience, parties, upsertUser(db),
+		loadChatContext(db), newAgentCaller(agentClient, agentURL), ctx)
 	if err != nil {
 		log.Fatalf("handler: %v", err)
 	}

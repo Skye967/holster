@@ -240,10 +240,17 @@ async def search(
     watch_providers: list[int],
     interpret_model: Interpreter,
     rank_model: Ranker,
+    on_intent: Callable[[DiscoverIntent], Awaitable[None]] | None = None,
 ) -> CatalogResult:
     """The full two-step pipeline. ``watch_region``/``watch_providers`` come
     only from the caller — the real user's subscriptions and country — and
     are passed to discover() regardless of anything in ``intent``.
+
+    ``on_intent``, if given, is awaited once interpret() resolves and before
+    discover()/rank() run — the hook a caller needs to stream an "interpreting"
+    line to the user within ~2s, well before the full pipeline (which can take
+    several TMDB round trips plus rank()) finishes. Optional and additive so
+    every existing caller and test is unaffected.
 
     When the first discover() call returns nothing, soft constraints are
     dropped one rung at a time — runtime, then year, then mood keywords — and
@@ -271,6 +278,8 @@ async def search(
         return CatalogResult(intent=None, picks=[], relaxed=[])
 
     intent = await interpret(message, model=interpret_model)
+    if on_intent is not None:
+        await on_intent(intent)
 
     # Mutable locals for the soft constraints, cleared one at a time below.
     # The three ints are copied by value; `keywords` aliases intent.keywords —

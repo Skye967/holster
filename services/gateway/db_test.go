@@ -188,6 +188,66 @@ func probe(t *testing.T, ctx context.Context, tx pgx.Tx, sql string) error {
 	return execErr
 }
 
+// loadChatContext (chat.go) reads what T14's "gateway loads subscriptions,
+// country and recent verdicts" actually has available today: subscriptions
+// and country are real tables; the provider-name lookup must degrade to an
+// empty list, not an error, when streaming_providers has no row yet for the
+// country (T15 owns keeping that cache fresh — see chat.go's loadChatContext).
+func TestLoadChatContext(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	load := loadChatContext(pool)
+
+	const id = "chat_ctx_test"
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool.Exec(c, `delete from users where id = $1`, id)
+		pool.Exec(c, `delete from streaming_providers where country = 'ZZ'`)
+	})
+
+	if _, err := pool.Exec(ctx,
+		`insert into users (id, email, country) values ($1, $2, 'ZZ')
+		 on conflict (id) do update set country = excluded.country`,
+		id, id+"@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ($1, 8)
+		 on conflict do nothing`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	// No streaming_providers row for 'ZZ' yet: names must come back empty,
+	// not an error.
+	cc, err := load(ctx, id)
+	if err != nil {
+		t.Fatalf("load with no provider cache: %v", err)
+	}
+	if cc.Region != "ZZ" || len(cc.Providers) != 1 || cc.Providers[0] != 8 {
+		t.Errorf("cc = %+v, want Region=ZZ Providers=[8]", cc)
+	}
+	if len(cc.ProviderNames) != 0 {
+		t.Errorf("ProviderNames = %v, want empty with no cache row", cc.ProviderNames)
+	}
+
+	// Now seed the cache and confirm the name resolves.
+	if _, err := pool.Exec(ctx,
+		`insert into streaming_providers (country, providers) values ('ZZ', $1)
+		 on conflict (country) do update set providers = excluded.providers`,
+		`[{"provider_id": 8, "provider_name": "Netflix"}]`); err != nil {
+		t.Fatal(err)
+	}
+
+	cc, err = load(ctx, id)
+	if err != nil {
+		t.Fatalf("load with provider cache: %v", err)
+	}
+	if len(cc.ProviderNames) != 1 || cc.ProviderNames[0] != "Netflix" {
+		t.Errorf("ProviderNames = %v, want [Netflix]", cc.ProviderNames)
+	}
+}
+
 // T10's core invariant: agent_ro has no write path to any table. It also has no
 // read grants yet -- those are added by the task that needs each one -- but
 // "never writes" is the property that must not regress, so that is what this

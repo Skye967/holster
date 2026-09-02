@@ -26,6 +26,11 @@ package = false
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+# FastAPI's Depends(...) as a parameter default is the framework's own
+# idiom, not the mutable-default footgun B008 exists to catch.
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends"]
+
 [tool.mypy]
 strict = true
 

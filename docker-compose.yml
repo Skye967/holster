@@ -32,11 +32,16 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://gateway_app:password@postgres:5432/holster}
       GATEWAY_PORT: ${GATEWAY_PORT:-8080}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Container-network address — see agent's own block below. Not published
+      # on the host: the gateway is the only thing that ever calls it.
+      AGENT_SERVICE_URL: ${AGENT_SERVICE_URL:-http://agent:8000}
     depends_on:
       # db-init, not postgres: gateway_app is created NOLOGIN by the migration and
       # only gets a local login once db-init runs. Starting sooner just fails fast.
       db-init:
         condition: service_completed_successfully
+      agent:
+        condition: service_healthy
 
   # --- Agent: LangChain orchestration, read-only, not exposed ---------------
   # No published port: reachable from other compose services, never from the host
@@ -46,10 +51,11 @@ services:
     build: ./agent
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      # The one secret the agent holds — app-level, opens nobody's account.
-      # Passed through plainly; the service fails fast if it's missing when the
-      # catalog tool is constructed, the same way the gateway checks its env.
+      # App-level keys — opens nobody's account. Passed through plainly; the
+      # service fails fast on startup if either is missing (see agent/main.py's
+      # lifespan), the same way the gateway checks its own required env.
       TMDB_API_KEY: ${TMDB_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
       interval: 10s
