@@ -110,6 +110,51 @@ def test_chat_requires_a_message() -> None:
     assert resp.status_code == 422
 
 
+# --- /providers ----------------------------------------------------------
+#
+# Feeds the gateway's streaming_providers cache refresh (TASKS.md T15). No
+# LangChain/model dependency here, just the TMDB client seam.
+
+
+def test_providers_merges_movie_and_tv() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok(
+        "/watch/providers/movie",
+        {
+            "results": [
+                {
+                    "provider_id": 8,
+                    "provider_name": "Netflix",
+                    "logo_path": "/n.jpg",
+                    "display_priorities": {"US": 1},
+                }
+            ]
+        },
+    )
+    fake_tmdb.ok("/watch/providers/tv", {"results": []})
+    app.dependency_overrides[get_tmdb_client] = fake_tmdb.client
+
+    resp = client.get("/providers", params={"region": "US"})
+
+    assert resp.status_code == 200
+    assert resp.json() == [
+        {
+            "provider_id": 8,
+            "provider_name": "Netflix",
+            "logo_url": "https://image.tmdb.org/t/p/w92/n.jpg",
+            "display_priority": 1,
+        }
+    ]
+
+
+def test_providers_requires_region() -> None:
+    app.dependency_overrides[get_tmdb_client] = FakeTMDB().client
+
+    resp = client.get("/providers")
+
+    assert resp.status_code == 422
+
+
 async def _must_not_be_called(*_args: Any, **_kwargs: Any) -> Any:
     raise AssertionError("should not run — body validation must reject first")
 

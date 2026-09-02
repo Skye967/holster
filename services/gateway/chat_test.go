@@ -289,6 +289,7 @@ func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chat
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
 		loadCtx, callAgent, t.Context(),
+		noopLoadProviders, noopSaveSubscription,
 	)
 	if err != nil {
 		t.Fatal(err)

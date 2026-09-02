@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -120,6 +121,12 @@ type Handler struct {
 	tickets        *chatTicketStore
 	originPatterns []string
 	rootCtx        context.Context
+
+	// providers.go (T15): the region catalog cache and the per-user
+	// subscription write, injected the same way as ensureUser/loadChatCtx
+	// above so both are fakeable in tests without a real database or agent.
+	loadProviders    func(ctx context.Context, country string) ([]Provider, error)
+	saveSubscription func(ctx context.Context, userID string, providerID int, subscribed bool) error
 }
 
 // newHandler guards the keyfunc and rejects an empty origin allowlist, which
@@ -129,6 +136,8 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	loadChatCtx func(ctx context.Context, userID string) (chatContext, error),
 	callAgent agentCaller,
 	rootCtx context.Context,
+	loadProviders func(ctx context.Context, country string) ([]Provider, error),
+	saveSubscription func(ctx context.Context, userID string, providerID int, subscribed bool) error,
 ) (*Handler, error) {
 
 	if len(parties) == 0 {
@@ -149,6 +158,12 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	if rootCtx == nil {
 		return nil, errors.New("no root context configured")
 	}
+	if loadProviders == nil {
+		return nil, errors.New("no provider loader configured")
+	}
+	if saveSubscription == nil {
+		return nil, errors.New("no subscription writer configured")
+	}
 
 	origins := make([]string, 0, len(parties))
 	for p := range parties {
@@ -156,16 +171,18 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	}
 
 	return &Handler{
-		keyfunc:        requireKID(kf),
-		issuer:         issuer,
-		audience:       audience,
-		parties:        parties,
-		ensureUser:     ensureUser,
-		loadChatCtx:    loadChatCtx,
-		callAgent:      callAgent,
-		tickets:        newChatTicketStore(),
-		originPatterns: origins,
-		rootCtx:        rootCtx,
+		keyfunc:          requireKID(kf),
+		issuer:           issuer,
+		audience:         audience,
+		parties:          parties,
+		ensureUser:       ensureUser,
+		loadChatCtx:      loadChatCtx,
+		callAgent:        callAgent,
+		tickets:          newChatTicketStore(),
+		originPatterns:   origins,
+		rootCtx:          rootCtx,
+		loadProviders:    loadProviders,
+		saveSubscription: saveSubscription,
 	}, nil
 }
 
@@ -212,7 +229,7 @@ func (h *Handler) verifyToken(tokenString string) (*Claims, error) {
 	//
 	// Clerk's docs allow skipping this when azp is absent. We don't: tokens
 	// minted through the Backend API carry no azp, and those are not sessions.
-	if _, ok := h.parties[claims.Azp]; !ok {
+	if !h.originAllowed(claims.Azp) {
 		return nil, errUnauthorizedParty
 	}
 
@@ -271,6 +288,56 @@ func dbError(err error) string {
 		return pgErr.Code
 	}
 	return err.Error()
+}
+
+// originAllowed reports whether origin is one of the app's configured origins
+// (CLERK_AUTHORIZED_PARTIES). Shared by verifyToken's azp check and
+// corsMiddleware below — two different trust decisions (who may mint a
+// token, vs. who may read a response in a browser) that happen to share one
+// value today. Split them into separate allowlists only once something
+// actually needs them to diverge; today it would be two copies of the same
+// set.
+func (h *Handler) originAllowed(origin string) bool {
+	_, ok := h.parties[origin]
+	return ok
+}
+
+// corsMiddleware answers a browser's CORS preflight and stamps the same
+// headers on the real response, scoped to originAllowed — the same origin
+// allowlist azp validation and the WebSocket's own OriginPatterns already
+// trust, so there is one allowlist, not two.
+//
+// allowMethods is derived once in routes() from the routes actually
+// registered on the api mux, rather than hardcoded here — a literal list
+// would silently drift the first time a route added a verb without anyone
+// remembering a second place to update.
+//
+// Wraps only the /api/ mux: /health is never called from a browser, and
+// /ws/chat's own handshake isn't subject to fetch's CORS rules. Nothing under
+// /api/ needed this until T15 — chat's WebSocket and its ticket mint are both
+// same-origin-safe in a way a browser fetch() with an Authorization header is
+// not, so this had no reason to exist before the picker's plain GET/PUT/DELETE
+// calls.
+//
+// Runs outside authMiddleware: a preflight OPTIONS request never carries the
+// real Authorization header, so answering it inside auth would 401 every
+// preflight and the browser would never get far enough to see the headers set
+// here.
+func (h *Handler) corsMiddleware(allowMethods string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if h.originAllowed(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", allowMethods)
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func correlationID(next http.Handler) http.Handler {
@@ -365,13 +432,33 @@ func (h *Handler) example(w http.ResponseWriter, r *http.Request) {
 // route and does live on api.
 func (h *Handler) routes() http.Handler {
 	api := http.NewServeMux()
-	api.HandleFunc("GET /api/example", h.example)
-	api.HandleFunc("POST /api/chat/ticket", h.chatTicket)
+
+	// register collects the method set as a side effect of registering each
+	// route, so corsMiddleware's Access-Control-Allow-Methods is derived from
+	// what's actually on this mux instead of a separate literal that could
+	// drift from it.
+	methods := map[string]struct{}{}
+	register := func(pattern string, handler http.HandlerFunc) {
+		method, _, _ := strings.Cut(pattern, " ")
+		methods[method] = struct{}{}
+		api.HandleFunc(pattern, handler)
+	}
+	register("GET /api/example", h.example)
+	register("POST /api/chat/ticket", h.chatTicket)
+	register("GET /api/providers", h.providers)
+	register("PUT /api/subscriptions/{providerID}", h.setSubscription)
+	register("DELETE /api/subscriptions/{providerID}", h.setSubscription)
+
+	allowMethods := make([]string, 0, len(methods))
+	for m := range methods {
+		allowMethods = append(allowMethods, m)
+	}
+	sort.Strings(allowMethods) // deterministic header value
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /health", h.health)
 	root.HandleFunc("GET /ws/chat", h.chatWS)
-	root.Handle("/api/", h.authMiddleware(api))
+	root.Handle("/api/", h.corsMiddleware(strings.Join(allowMethods, ", "), h.authMiddleware(api)))
 
 	return correlationID(root)
 }
@@ -490,7 +577,8 @@ func main() {
 	agentClient := &http.Client{}
 
 	h, err := newHandler(jwks.Keyfunc, issuer, audience, parties, upsertUser(db),
-		loadChatContext(db), newAgentCaller(agentClient, agentURL), ctx)
+		loadChatContext(db), newAgentCaller(agentClient, agentURL), ctx,
+		loadProviders(db, newAgentProviderCaller(agentClient, agentURL)), saveSubscription(db))
 	if err != nil {
 		log.Fatalf("handler: %v", err)
 	}

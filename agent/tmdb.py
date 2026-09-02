@@ -130,6 +130,18 @@ class Provider(TypedDict):
     logo_url: str | None
 
 
+class RegionProvider(TypedDict):
+    """One entry in the region-wide provider list (TASKS.md T15's /connections
+    picker) — distinct from Provider because display_priority only makes sense
+    for "every provider in a region," not for a single title's flatrate/rent/buy
+    split."""
+
+    provider_id: int
+    provider_name: str
+    logo_url: str | None
+    display_priority: int
+
+
 class WatchAvailability(TypedDict):
     # flatrate is "included with the subscription"; rent/buy are paid on top and
     # must never be shown as included (TASKS.md T12). link is the JustWatch-backed
@@ -198,6 +210,21 @@ def _trim_provider(raw: dict[str, Any]) -> Provider:
         provider_id=raw["provider_id"],
         provider_name=raw.get("provider_name") or "",
         logo_url=_image_url(raw.get("logo_path"), LOGO_SIZE),
+    )
+
+
+def _trim_region_provider(raw: dict[str, Any], region: str) -> RegionProvider | None:
+    # display_priorities is keyed by every region TMDB tracks; a provider with
+    # no entry for this one is not actually available here, so it is dropped
+    # rather than given a fake priority.
+    priority = (raw.get("display_priorities") or {}).get(region)
+    if priority is None:
+        return None
+    return RegionProvider(
+        provider_id=raw["provider_id"],
+        provider_name=raw.get("provider_name") or "",
+        logo_url=_image_url(raw.get("logo_path"), LOGO_SIZE),
+        display_priority=int(priority),
     )
 
 
@@ -486,3 +513,34 @@ class TMDBClient:
             rent=[_trim_provider(p) for p in region.get("rent", [])],
             buy=[_trim_provider(p) for p in region.get("buy", [])],
         )
+
+    async def watch_provider_list(self, *, watch_region: str) -> list[RegionProvider]:
+        """Every provider available in one country, across movies and TV,
+        merged by provider_id — a user thinks "I have Netflix," not "Netflix
+        for movies," and the major platforms share one ID across media types.
+        Powers the /connections picker (TASKS.md T15); this call has no cache
+        of its own, the caller (streaming_providers, gateway-side) owns that.
+        """
+        _validate_region(watch_region)
+        movie_data, tv_data = await _gather(
+            self._get(
+                "/watch/providers/movie",
+                {"watch_region": watch_region, "language": LANGUAGE},
+            ),
+            self._get(
+                "/watch/providers/tv",
+                {"watch_region": watch_region, "language": LANGUAGE},
+            ),
+        )
+        merged: dict[int, RegionProvider] = {}
+        for data in (movie_data, tv_data):
+            for raw in data.get("results", []):
+                provider = _trim_region_provider(raw, watch_region)
+                if provider is None:
+                    continue
+                existing = merged.get(provider["provider_id"])
+                if existing is None or (
+                    provider["display_priority"] < existing["display_priority"]
+                ):
+                    merged[provider["provider_id"]] = provider
+        return sorted(merged.values(), key=lambda p: p["display_priority"])
