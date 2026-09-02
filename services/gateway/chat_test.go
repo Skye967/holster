@@ -171,6 +171,25 @@ func TestParseProviderNamesResolvesOnlyWantedIDsInOrder(t *testing.T) {
 
 // --- agent HTTP streaming client ------------------------------------------
 
+// assertPickEnrichment checks the TASKS.md T16 fields (GenreNames,
+// RuntimeMinutes, AvailableOn) shared by TestNewAgentCallerStreamsEventsInOrder
+// (real JSON decode) and TestChatTurnStreamsInterpretingResultsAndDone
+// (gateway passthrough) — one helper so a future field change can't
+// silently diverge between what the two tests check. Cast isn't included:
+// only the first of those two tests asserts on it.
+func assertPickEnrichment(t *testing.T, pick agentPick) {
+	t.Helper()
+	if len(pick.GenreNames) != 1 || pick.GenreNames[0] != "Crime" {
+		t.Errorf("GenreNames = %v, want [Crime]", pick.GenreNames)
+	}
+	if pick.RuntimeMinutes == nil || *pick.RuntimeMinutes != 102 {
+		t.Errorf("RuntimeMinutes = %v, want 102", pick.RuntimeMinutes)
+	}
+	if len(pick.AvailableOn) != 1 || pick.AvailableOn[0].ProviderName != "Netflix" {
+		t.Errorf("AvailableOn = %+v, want one entry named Netflix", pick.AvailableOn)
+	}
+}
+
 func TestNewAgentCallerStreamsEventsInOrder(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req agentChatRequest
@@ -184,7 +203,7 @@ func TestNewAgentCallerStreamsEventsInOrder(t *testing.T) {
 		flusher := w.(http.Flusher)
 		for _, line := range []string{
 			`{"type":"intent","intent":{"media_type":"movie"}}`,
-			`{"type":"results","picks":[{"tmdb_id":1,"title":"Fake Heist","blurb":"fits"}]}`,
+			`{"type":"results","picks":[{"tmdb_id":1,"title":"Fake Heist","genre_names":["Crime"],"runtime_minutes":102,"cast":["Star"],"available_on":[{"provider_id":8,"provider_name":"Netflix"}],"blurb":"fits"}]}`,
 			`{"type":"done"}`,
 		} {
 			w.Write([]byte(line + "\n"))
@@ -199,18 +218,28 @@ func TestNewAgentCallerStreamsEventsInOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var got []string
+	var all []agentEvent
 	for ev := range events {
-		got = append(got, ev.Type)
+		all = append(all, ev)
 	}
 	want := []string{"intent", "results", "done"}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
+	if len(all) != len(want) {
+		t.Fatalf("got %v events, want %v", all, want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("event[%d] = %q, want %q", i, got[i], want[i])
+		if all[i].Type != want[i] {
+			t.Errorf("event[%d].Type = %q, want %q", i, all[i].Type, want[i])
 		}
+	}
+
+	// Real json.Unmarshal, not a struct literal (see TestChatTurnStreamsInterpretingResultsAndDone,
+	// which injects Go values directly and so cannot catch a tag/key mismatch
+	// against agent/chat.py's actual dict keys) — proves the enrichment
+	// fields (TASKS.md T16) really decode from the agent's wire shape.
+	pick := all[1].Picks[0]
+	assertPickEnrichment(t, pick)
+	if len(pick.Cast) != 1 || pick.Cast[0] != "Star" {
+		t.Errorf("Cast = %v, want [Star]", pick.Cast)
 	}
 }
 
@@ -254,6 +283,33 @@ func TestNewAgentCallerStopsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("events channel never closed after cancellation")
+	}
+}
+
+// TestAgentPickAvailableOnDistinguishesNullFromEmpty pins the property
+// AvailableOn's doc comment relies on: a real json.Unmarshal, not just Go's
+// documented behavior in the abstract, since a later refactor of this
+// struct (a custom UnmarshalJSON, an intermediate map, an added omitempty)
+// could silently collapse the one distinction this whole feature exists to
+// preserve (TASKS.md T16: "couldn't check" must never read as "confirmed
+// nowhere the caller subscribes").
+func TestAgentPickAvailableOnDistinguishesNullFromEmpty(t *testing.T) {
+	var failed, confirmedEmpty agentPick
+	if err := json.Unmarshal([]byte(`{"available_on":null}`), &failed); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"available_on":[]}`), &confirmedEmpty); err != nil {
+		t.Fatal(err)
+	}
+
+	if failed.AvailableOn != nil {
+		t.Errorf("AvailableOn = %#v, want nil (the check itself failed)", failed.AvailableOn)
+	}
+	if confirmedEmpty.AvailableOn == nil {
+		t.Error("AvailableOn = nil, want a non-nil empty slice (TMDB confirmed nowhere)")
+	}
+	if len(confirmedEmpty.AvailableOn) != 0 {
+		t.Errorf("AvailableOn = %#v, want empty", confirmedEmpty.AvailableOn)
 	}
 }
 
@@ -354,9 +410,18 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US", Providers: []int{8}, ProviderNames: []string{"Netflix"}}, nil
 	}
+	runtimeMinutes := 102
 	callAgent := fakeAgentEvents(
 		agentEvent{Type: "intent", Intent: json.RawMessage(`{"media_type":"movie"}`)},
-		agentEvent{Type: "results", Picks: []agentPick{{TMDBID: 1, Title: "Fake Heist", Blurb: "fits"}}},
+		agentEvent{Type: "results", Picks: []agentPick{{
+			TMDBID:         1,
+			Title:          "Fake Heist",
+			GenreNames:     []string{"Crime"},
+			RuntimeMinutes: &runtimeMinutes,
+			Cast:           []string{"Star"},
+			AvailableOn:    []agentProvider{{ProviderID: 8, ProviderName: "Netflix"}},
+			Blurb:          "fits",
+		}}},
 		agentEvent{Type: "done"},
 	)
 	srv, token := newChatTestServer(t, loadCtx, callAgent)
@@ -391,6 +456,13 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 	if len(got[1].Picks) != 1 || got[1].Picks[0].Title != "Fake Heist" {
 		t.Errorf("results picks = %+v", got[1].Picks)
 	}
+	// Proves only the gateway -> browser leg: fakeAgentEvents injects these
+	// agentPick values directly, with no JSON decode of the agent's own wire
+	// shape involved. TestNewAgentCallerStreamsEventsInOrder is what proves
+	// the enrichment fields (TASKS.md T16) actually decode from real agent
+	// JSON with the right keys — this just confirms they still reach the
+	// browser once decoded.
+	assertPickEnrichment(t, got[1].Picks[0])
 }
 
 func TestChatErrorReasonBecomesFriendlyText(t *testing.T) {

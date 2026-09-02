@@ -11,7 +11,12 @@ lets an "intent" event reach the caller in ~1-2s while the full pipeline
 Event shapes on the wire (one JSON object per line):
 
     {"type": "intent", "intent": {...DiscoverIntent fields...}}
-    {"type": "results", "relaxed": [...], "picks": [{...Title fields, "blurb": str}]}
+    {"type": "results", "relaxed": [...], "picks": [{...Title fields, "genre_names":
+        [...], "runtime_minutes": int | None, "cast": [...], "available_on":
+        [...Provider fields] | None, "blurb": str}]}
+        -- available_on is None only when the availability check itself
+           failed, distinct from [] (confirmed available nowhere the caller
+           subscribes) — see catalog_tool.py's _safe_availability
     {"type": "message", "text": str}   -- a plain reply with no candidates
                                            (no subscriptions, or nothing found)
     {"type": "error", "reason": str}   -- one of a fixed set, see _error_reason
@@ -172,9 +177,7 @@ async def stream_chat(
                 {
                     "type": "results",
                     "relaxed": result.relaxed,
-                    "picks": [
-                        {**title, "blurb": blurb} for title, blurb in result.picks
-                    ],
+                    "picks": result.picks,
                 }
             )
         else:

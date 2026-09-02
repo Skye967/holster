@@ -183,6 +183,88 @@ def test_discover_trims_results() -> None:
     assert titles[1]["poster_url"] is None
 
 
+def test_title_details_movie_returns_runtime_and_cast() -> None:
+    fake = FakeTMDB()
+    fake.ok(
+        "/movie/101",
+        {
+            "runtime": 128,
+            "credits": {
+                "cast": [
+                    {"name": "Third Billed", "order": 2},
+                    {"name": "Star", "order": 0},
+                    {"name": "Second Billed", "order": 1},
+                    {"name": "Uncredited Extra", "order": 3},
+                ]
+            },
+        },
+    )
+
+    details = run(fake.client().title_details(media_type="movie", tmdb_id=101))
+
+    assert fake.params_for("/movie/101")["append_to_response"] == "credits"
+    assert details == {
+        "runtime_minutes": 128,
+        "cast": ["Star", "Second Billed", "Third Billed"],
+    }
+
+
+def test_title_details_tv_uses_first_episode_run_time() -> None:
+    fake = FakeTMDB()
+    fake.ok("/tv/9", {"episode_run_time": [45, 60], "credits": {"cast": []}})
+
+    details = run(fake.client().title_details(media_type="tv", tmdb_id=9))
+
+    assert details["runtime_minutes"] == 45
+
+
+def test_title_details_tv_empty_episode_run_time_is_none() -> None:
+    fake = FakeTMDB()
+    fake.ok("/tv/9", {"episode_run_time": [], "credits": {"cast": []}})
+
+    details = run(fake.client().title_details(media_type="tv", tmdb_id=9))
+
+    assert details["runtime_minutes"] is None
+
+
+def test_title_details_404_returns_none_and_is_cached() -> None:
+    fake = FakeTMDB()
+    fake.queue("/movie/1", httpx2.Response(404, json={"success": False}))
+
+    client = fake.client()
+    first = run(client.title_details(media_type="movie", tmdb_id=1))
+    second = run(client.title_details(media_type="movie", tmdb_id=1))
+
+    assert first is None
+    assert second is None
+    assert fake.count("/movie/1") == 1
+
+
+def test_title_details_is_cached_across_calls() -> None:
+    fake = FakeTMDB()
+    fake.ok("/movie/101", {"runtime": 100, "credits": {"cast": []}})
+
+    client = fake.client()
+    run(client.title_details(media_type="movie", tmdb_id=101))
+    run(client.title_details(media_type="movie", tmdb_id=101))
+
+    assert fake.count("/movie/101") == 1
+
+
+def test_title_details_bad_media_type_rejected() -> None:
+    with pytest.raises(ValueError):
+        run(FakeTMDB().client().title_details(media_type="film", tmdb_id=1))  # type: ignore[arg-type]
+
+
+def test_genre_names_resolves_movie_and_tv_ids() -> None:
+    assert tmdb.genre_names("movie", [80, 878]) == ["Crime", "Science Fiction"]
+    assert tmdb.genre_names("tv", [10759]) == ["Action & Adventure"]
+
+
+def test_genre_names_drops_unknown_ids() -> None:
+    assert tmdb.genre_names("movie", [80, 999999]) == ["Crime"]
+
+
 def test_watch_providers_splits_monetization() -> None:
     fake = FakeTMDB()
     fake.ok(

@@ -41,17 +41,31 @@ seam — so tests fake an async function, not a framework.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from tmdb import MOVIE_GENRES, TV_GENRES, DiscoverSort, MediaType, Title, TMDBClient
+from tmdb import (
+    MOVIE_GENRES,
+    TV_GENRES,
+    DiscoverSort,
+    MediaType,
+    Title,
+    TitleDetails,
+    TMDBClient,
+    TMDBError,
+    TMDBUnavailable,
+    WatchAvailability,
+    gather_all,
+    genre_names,
+)
 
 logger = logging.getLogger("holster.catalog_tool")
 
@@ -166,7 +180,12 @@ class CatalogResult:
     # None when search() short-circuits before calling interpret() at all
     # (e.g. the caller has no streaming subscriptions) — see search().
     intent: DiscoverIntent | None
-    picks: list[tuple[Title, str]]  # (the real Title, the model's blurb)
+    # Each dict is the real Title, merged with the model's blurb and TMDB
+    # enrichment (genre_names, runtime_minutes, cast, available_on) — see
+    # _enrich_pick(). Not a named type: this is TMDB-shaped data all the way
+    # down, the same "plain dict of known keys" idiom Title/Provider/
+    # WatchAvailability already use, not model output (that's RankedPick).
+    picks: list[dict[str, Any]]
     # Soft constraints search() had to drop to get any candidates, in the order
     # dropped; empty when the first query returned results. Reflects only the
     # rungs actually tried — the ladder stops at the first one that returns
@@ -230,6 +249,97 @@ async def rank(
         if len(picks) >= limit:
             break
     return picks
+
+
+async def _safe[T](coro: Awaitable[T], *, tmdb_id: int, what: str) -> T | None:
+    """Await coro, degraded to None on TMDBError — a flaky TMDB call for one
+    title's enrichment must not cost the whole turn, same "degrade, don't
+    fail" ethos as chat.go's interpretingLine dropping its provider-name
+    clause when that data isn't available. A bug (anything that isn't
+    TMDBError) still propagates.
+
+    TMDBUnavailable (transient) and a bare TMDBError (a bug in how this one
+    request was built) both degrade to the same None, but are logged at
+    different severity — same split chat.py's _error_reason already makes
+    between an expected "try later" and an internal bug worth a traceback.
+    What None means to the caller is theirs to interpret — see
+    _safe_details/_safe_availability below."""
+    try:
+        return await coro
+    except TMDBUnavailable:
+        logger.info("tmdb %s unavailable for %s, degraded", what, tmdb_id)
+        return None
+    except TMDBError:
+        logger.exception("tmdb %s failed for %s, degraded", what, tmdb_id)
+        return None
+
+
+async def _safe_details(client: TMDBClient, title: Title) -> TitleDetails | None:
+    """title_details(), degraded — missing runtime/cast just means a card
+    shows less, never a false claim, so a plain None on failure is enough."""
+    return await _safe(
+        client.title_details(media_type=title["media_type"], tmdb_id=title["tmdb_id"]),
+        tmdb_id=title["tmdb_id"],
+        what="title_details",
+    )
+
+
+async def _safe_availability(
+    client: TMDBClient, title: Title, watch_region: str
+) -> WatchAvailability | None:
+    """watch_providers(), degraded to None — not an empty result.
+    watch_providers() already returns empty arrays, not an error, for a
+    title genuinely unavailable in the region, so a failed check must stay
+    distinct from that — see _enrich_pick for why the distinction matters."""
+    return await _safe(
+        client.watch_providers(
+            media_type=title["media_type"],
+            tmdb_id=title["tmdb_id"],
+            watch_region=watch_region,
+        ),
+        tmdb_id=title["tmdb_id"],
+        what="watch_providers",
+    )
+
+
+async def _enrich_pick(
+    client: TMDBClient,
+    watch_region: str,
+    wanted: set[int],
+    title: Title,
+    blurb: str,
+) -> dict[str, Any]:
+    """One shown pick's runtime/cast/genre-names/availability, fetched
+    concurrently. available_on is filtered to `wanted` (the caller's own
+    subscriptions) here, not upstream: discover()'s own provider filter only
+    guarantees a title is on *at least one* of the caller's services,
+    watch_providers() returns every flatrate provider for the title — this
+    filter is the actual enforcement point for "never a service the user
+    doesn't have" (TASKS.md T16). available_on is None, not [], when the
+    availability check itself failed (see _safe_availability) — a TMDB
+    hiccup must never make an available title read as confirmed-unavailable.
+
+    Plain asyncio.gather, not gather_all: these two calls return different
+    types (TitleDetails | None, WatchAvailability | None) that gather_all's
+    single TypeVar can't unify; _safe already narrows both calls' exception
+    surface to TMDBError, so gather_all's sibling-task protection has little
+    left to guard here."""
+    details, availability = await asyncio.gather(
+        _safe_details(client, title),
+        _safe_availability(client, title, watch_region),
+    )
+    return {
+        **title,
+        "genre_names": genre_names(title["media_type"], title["genre_ids"]),
+        "runtime_minutes": details["runtime_minutes"] if details else None,
+        "cast": details["cast"] if details else [],
+        "available_on": (
+            [p for p in availability["flatrate"] if p["provider_id"] in wanted]
+            if availability is not None
+            else None
+        ),
+        "blurb": blurb,
+    }
 
 
 async def search(
@@ -337,7 +447,19 @@ async def search(
 
     ranked = await rank(message, candidates, limit=intent.limit, model=rank_model)
     by_id = {c["tmdb_id"]: c for c in candidates}
-    picks = [(by_id[p.tmdb_id], p.blurb) for p in ranked]
+    # Enrichment only runs for these final, already-limited picks — never for
+    # every candidate — and each pick's two TMDB calls run concurrently with
+    # every other pick's. gather_all, not plain asyncio.gather: matches this
+    # codebase's existing convention for a homogeneous concurrent fan-out
+    # (tmdb.py's own docstring on why — a bug in one pick's enrichment must
+    # not leave its siblings' tasks unretrieved).
+    wanted = set(watch_providers)
+    picks = await gather_all(
+        *(
+            _enrich_pick(client, watch_region, wanted, by_id[p.tmdb_id], p.blurb)
+            for p in ranked
+        )
+    )
     return CatalogResult(intent=intent, picks=picks, relaxed=relaxed)
 
 

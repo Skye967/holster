@@ -101,6 +101,34 @@ TV_GENRES: dict[str, int] = {
     "western": 37,
 }
 
+# The display-name counterpart to MOVIE_GENRES/TV_GENRES above: id -> TMDB's
+# real casing, for showing a genre on a title card. Derived from the two
+# tables above rather than a third hand-copied pair — those can never drift
+# apart from each other since one is computed from the other. title()-casing
+# matches TMDB's real casing for every entry except "tv movie", the one
+# override below.
+_GENRE_NAME_OVERRIDES = {10770: "TV Movie"}
+
+
+def _genre_name_table(genres: dict[str, int]) -> dict[int, str]:
+    return {
+        gid: _GENRE_NAME_OVERRIDES.get(gid, name.title())
+        for name, gid in genres.items()
+    }
+
+
+_MOVIE_GENRE_NAMES = _genre_name_table(MOVIE_GENRES)
+_TV_GENRE_NAMES = _genre_name_table(TV_GENRES)
+
+
+def genre_names(media_type: MediaType, genre_ids: list[int]) -> list[str]:
+    """Resolve a Title's genre_ids to display names, in the order given. An id
+    with no match is dropped silently rather than logged like other
+    "unresolved" idioms here — it came from TMDB's own discover() response,
+    not user or model input, so there's nothing a caller can act on."""
+    table = _MOVIE_GENRE_NAMES if media_type == "movie" else _TV_GENRE_NAMES
+    return [table[g] for g in genre_ids if g in table]
+
 
 class TMDBError(Exception):
     """TMDB returned something unexpected (e.g. a 4xx that is not 429). A bug in
@@ -150,6 +178,16 @@ class WatchAvailability(TypedDict):
     flatrate: list[Provider]
     rent: list[Provider]
     buy: list[Provider]
+
+
+# Top-billed cast shown on a title card (TASKS.md T16) — "two or three," capped
+# here rather than left to the caller.
+CAST_LIMIT = 3
+
+
+class TitleDetails(TypedDict):
+    runtime_minutes: int | None
+    cast: list[str]  # top CAST_LIMIT billed names, in billing order
 
 
 _REGION_RE = re.compile(r"^[A-Z]{2}$")
@@ -202,6 +240,34 @@ def _trim_title(raw: dict[str, Any], media_type: MediaType) -> Title:
         vote_average=float(raw.get("vote_average") or 0.0),
         vote_count=int(raw.get("vote_count") or 0),
         genre_ids=list(raw.get("genre_ids") or []),
+    )
+
+
+def _trim_details(raw: dict[str, Any], media_type: MediaType) -> TitleDetails:
+    if media_type == "movie":
+        runtime = raw.get("runtime")
+    else:
+        # TMDB's own inconsistency: TV has no single "runtime", just a list of
+        # typical episode lengths. The first is the best single number to show.
+        episode_run_time = raw.get("episode_run_time") or []
+        runtime = episode_run_time[0] if episode_run_time else None
+
+    # TMDB already returns credits.cast in billing order; sorting on `order`
+    # anyway is cheap insurance at this external boundary rather than relying
+    # on an undocumented guarantee.
+    cast_raw = sorted(
+        (raw.get("credits") or {}).get("cast") or [],
+        key=lambda c: c.get("order", 10**9),
+    )
+    return TitleDetails(
+        # runtime: 0 is TMDB's own "not yet filled in" sentinel for titles
+        # with incomplete metadata (same convention _trim_title leans on for
+        # vote_average) — deliberately treated as "no data," not a real zero.
+        runtime_minutes=int(runtime) if runtime else None,
+        # Filter for a name before slicing, not after: a nameless entry among
+        # the top CAST_LIMIT billed must not silently shrink the result below
+        # CAST_LIMIT when a later-billed entry does have a name.
+        cast=[c["name"] for c in cast_raw if c.get("name")][:CAST_LIMIT],
     )
 
 
@@ -260,7 +326,7 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
-async def _gather[T](*coros: Awaitable[T]) -> list[T]:
+async def gather_all[T](*coros: Awaitable[T]) -> list[T]:
     """Concurrent gather that raises the first failure only after every
     coroutine has finished. Plain ``asyncio.gather`` leaves siblings of a
     failed task running in the background with no one to retrieve their
@@ -292,6 +358,10 @@ class TMDBClient:
         # are cached too so a typo is not looked up twice. None means "no match".
         self._person_ids: dict[str, int | None] = {}
         self._keyword_ids: dict[str, int | None] = {}
+        # Same rationale, same shape: a title's runtime and billing never
+        # change once released. None means "no page for this id" and is
+        # cached too — see title_details().
+        self._title_details: dict[tuple[MediaType, int], TitleDetails | None] = {}
 
     async def __aenter__(self) -> TMDBClient:
         return self
@@ -376,7 +446,7 @@ class TMDBClient:
         resolve, the parameter is omitted entirely."""
         if not names:
             return
-        resolved = await _gather(*(self._resolve_name(kind, n) for n in names))
+        resolved = await gather_all(*(self._resolve_name(kind, n) for n in names))
         ids = [i for i in resolved if i is not None]
         if ids:
             params[key] = ",".join(map(str, ids))
@@ -456,7 +526,7 @@ class TMDBClient:
             params["with_watch_monetization_types"] = "flatrate"
 
         # Each field is an independent TMDB round trip; run them concurrently.
-        await _gather(
+        await gather_all(
             self._resolve_into(params, "with_cast", cast, "person"),
             self._resolve_into(params, "with_crew", crew, "person"),
             self._resolve_into(params, "with_keywords", keywords, "keyword"),
@@ -496,6 +566,34 @@ class TMDBClient:
         )
         return [_trim_title(r, media_type) for r in data.get("results", [])]
 
+    async def title_details(
+        self, *, media_type: MediaType, tmdb_id: int
+    ) -> TitleDetails | None:
+        """Runtime and top-billed cast for one title, via
+        append_to_response=credits — one HTTP call for both. Cached for the
+        life of the process, same rationale as _person_ids/_keyword_ids: a
+        title's runtime and billing never change once released.
+
+        Returns None, also cached, when TMDB has no page for this id. Raises
+        TMDBError/TMDBUnavailable on request failure like every other method
+        here — this does not self-degrade; a caller that wants "missing data,
+        don't fail the turn" makes that choice itself (see
+        catalog_tool.py's _safe_details). The cache is only written on the
+        success path, so a transient failure is never cached as permanent
+        "no data"."""
+        _validate_media_type(media_type)
+        key = (media_type, int(tmdb_id))
+        if key in self._title_details:
+            return self._title_details[key]
+        data = await self._get(
+            f"/{media_type}/{int(tmdb_id)}",
+            {"language": LANGUAGE, "append_to_response": "credits"},
+            allow_404=True,
+        )
+        details = _trim_details(data, media_type) if data else None
+        self._title_details[key] = details
+        return details
+
     async def watch_providers(
         self, *, media_type: MediaType, tmdb_id: int, watch_region: str
     ) -> WatchAvailability:
@@ -522,7 +620,7 @@ class TMDBClient:
         of its own, the caller (streaming_providers, gateway-side) owns that.
         """
         _validate_region(watch_region)
-        movie_data, tv_data = await _gather(
+        movie_data, tv_data = await gather_all(
             self._get(
                 "/watch/providers/movie",
                 {"watch_region": watch_region, "language": LANGUAGE},
