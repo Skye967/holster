@@ -1,7 +1,25 @@
+import asyncio
+import json
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from main import CORRELATION_ID_HEADER, CorrelationIdMiddleware, asgi_app
+from catalog_tool import DiscoverIntent, RankedPick, RankResult
+from main import (
+    CORRELATION_ID_HEADER,
+    CorrelationIdMiddleware,
+    app,
+    asgi_app,
+    get_interpret_model,
+    get_rank_model,
+    get_tmdb_client,
+    lifespan,
+)
+from testutil import MOVIE_A, FakeTMDB
+from tmdb import Title
 
 client = TestClient(asgi_app)
 
@@ -35,3 +53,81 @@ def test_correlation_id_survives_server_error() -> None:
     resp = err_client.get("/boom", headers={CORRELATION_ID_HEADER: "trace-me"})
     assert resp.status_code == 500
     assert resp.headers[CORRELATION_ID_HEADER] == "trace-me"
+
+
+# --- /chat -------------------------------------------------------------
+#
+# Real TMDBClient/model construction happens in lifespan(), which needs live
+# keys (see the live-suite pattern in test_catalog_tool_live.py). These tests
+# never trigger it: they override the Depends() seams directly, the same way
+# TMDBClient's transport= and catalog_tool's Interpreter/Ranker do for
+# everything else in this codebase.
+
+
+@pytest.fixture(autouse=True)
+def _clear_overrides() -> Iterator[None]:
+    yield
+    app.dependency_overrides.clear()
+
+
+def test_chat_streams_ndjson_events() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return DiscoverIntent(media_type="movie", keywords=["heist"])
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        pick = RankedPick(tmdb_id=candidates[0]["tmdb_id"], blurb="fits")
+        return RankResult(picks=[pick])
+
+    app.dependency_overrides[get_tmdb_client] = fake_tmdb.client
+    app.dependency_overrides[get_interpret_model] = lambda: fake_interpret
+    app.dependency_overrides[get_rank_model] = lambda: fake_rank
+
+    resp = client.post(
+        "/chat",
+        json={"message": "a heist movie", "watch_region": "US", "watch_providers": [8]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/x-ndjson"
+    lines = [json.loads(line) for line in resp.text.splitlines() if line]
+    assert [e["type"] for e in lines] == ["intent", "results", "done"]
+
+
+def test_chat_requires_a_message() -> None:
+    # FastAPI resolves Depends() alongside body validation rather than only
+    # after it succeeds, so the route's dependencies still need a value even
+    # on a request this test expects to fail on the body — see main.py's
+    # get_tmdb_client/get_interpret_model/get_rank_model.
+    app.dependency_overrides[get_tmdb_client] = FakeTMDB().client
+    app.dependency_overrides[get_interpret_model] = lambda: _must_not_be_called
+    app.dependency_overrides[get_rank_model] = lambda: _must_not_be_called
+
+    resp = client.post("/chat", json={"watch_region": "US", "watch_providers": [8]})
+
+    assert resp.status_code == 422
+
+
+async def _must_not_be_called(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError("should not run — body validation must reject first")
+
+
+async def _run_lifespan(test_app: FastAPI) -> None:
+    async with lifespan(test_app):
+        pass
+
+
+def test_lifespan_requires_anthropic_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("TMDB_API_KEY", "t")
+    with pytest.raises(SystemExit, match="ANTHROPIC_API_KEY"):
+        asyncio.run(_run_lifespan(FastAPI(lifespan=lifespan)))
+
+
+def test_lifespan_requires_tmdb_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+    monkeypatch.delenv("TMDB_API_KEY", raising=False)
+    with pytest.raises(SystemExit, match="TMDB_API_KEY"):
+        asyncio.run(_run_lifespan(FastAPI(lifespan=lifespan)))

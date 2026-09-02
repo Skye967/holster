@@ -26,58 +26,12 @@ from catalog_tool import (
     rank,
     search,
 )
-from tmdb import Title, TMDBClient, TMDBUnavailable
+from testutil import MOVIE_A, FakeTMDB, make_intent, ok_interpret
+from tmdb import Title, TMDBUnavailable
 
 
 def run(coro: Any) -> Any:
     return asyncio.run(coro)
-
-
-class FakeTMDB:
-    """Records every outgoing request and replays queued responses by path —
-    identical shape to test_tmdb.py's fake, trimmed to what these tests need."""
-
-    def __init__(self) -> None:
-        self.requests: list[httpx2.Request] = []
-        self._queues: dict[str, list[httpx2.Response]] = {}
-
-    def queue(self, path: str, *responses: httpx2.Response) -> None:
-        self._queues.setdefault("/3" + path, []).extend(responses)
-
-    def ok(self, path: str, payload: dict[str, Any]) -> None:
-        self.queue(path, httpx2.Response(200, json=payload))
-
-    def _handler(self, request: httpx2.Request) -> httpx2.Response:
-        self.requests.append(request)
-        queue = self._queues.get(request.url.path)
-        if queue:
-            return queue.pop(0)
-        return httpx2.Response(200, json={"results": []})
-
-    def client(self) -> TMDBClient:
-        return TMDBClient("test-token", transport=httpx2.MockTransport(self._handler))
-
-    def params_for(self, path: str) -> dict[str, str]:
-        for request in self.requests:
-            if request.url.path == "/3" + path:
-                return dict(request.url.params)
-        raise AssertionError(
-            f"no request to {path}: {[r.url.path for r in self.requests]}"
-        )
-
-    def all_params_for(self, path: str) -> list[dict[str, str]]:
-        return [dict(r.url.params) for r in self.requests if r.url.path == "/3" + path]
-
-
-MOVIE_A = {
-    "id": 101,
-    "title": "Fake Heist",
-    "release_date": "2020-01-01",
-    "overview": "A heist movie.",
-    "vote_average": 7.5,
-    "vote_count": 500,
-    "genre_ids": [80],
-}
 
 
 def _title(tmdb_id: int, media_type: tmdb.MediaType = "movie") -> Title:
@@ -94,20 +48,12 @@ def _title(tmdb_id: int, media_type: tmdb.MediaType = "movie") -> Title:
     )
 
 
-def _intent(**overrides: Any) -> DiscoverIntent:
-    return DiscoverIntent(media_type="movie", **overrides)
-
-
-async def _ok_interpret(message: str) -> DiscoverIntent:
-    return _intent()
-
-
 async def _rank_must_not_run(message: str, candidates: list[Title]) -> RankResult:
     raise AssertionError("rank must not run once discover() has failed")
 
 
 def test_interpret_calls_model_and_returns_its_intent() -> None:
-    intent = _intent(keywords=["heist"])
+    intent = make_intent(keywords=["heist"])
 
     async def fake(message: str) -> DiscoverIntent:
         assert message == "something like Heat"
@@ -165,7 +111,7 @@ def test_search_uses_callers_region_and_providers_never_the_models() -> None:
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
 
     async def fake_interpret(message: str) -> DiscoverIntent:
-        return _intent(keywords=["heist"])
+        return make_intent(keywords=["heist"])
 
     async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
         return RankResult(picks=[])
@@ -210,7 +156,7 @@ def test_search_joins_blurb_with_the_real_title_not_model_metadata() -> None:
             client=fake_tmdb.client(),
             watch_region="US",
             watch_providers=[8],
-            interpret_model=_ok_interpret,
+            interpret_model=ok_interpret,
             rank_model=fake_rank,
         )
     )
@@ -256,7 +202,7 @@ def test_search_wraps_rank_failure_as_catalog_tool_error() -> None:
                 client=fake_tmdb.client(),
                 watch_region="US",
                 watch_providers=[8],
-                interpret_model=_ok_interpret,
+                interpret_model=ok_interpret,
                 rank_model=fake_rank,
             )
         )
@@ -275,7 +221,7 @@ def test_search_lets_a_bad_watch_region_propagate_as_a_plain_value_error() -> No
                 client=fake_tmdb.client(),
                 watch_region="usa",
                 watch_providers=[8],
-                interpret_model=_ok_interpret,
+                interpret_model=ok_interpret,
                 rank_model=_rank_must_not_run,
             )
         )
@@ -296,7 +242,7 @@ def test_search_lets_tmdb_unavailable_propagate_unwrapped(
                 client=fake_tmdb.client(),
                 watch_region="US",
                 watch_providers=[8],
-                interpret_model=_ok_interpret,
+                interpret_model=ok_interpret,
                 rank_model=_rank_must_not_run,
             )
         )
@@ -316,7 +262,7 @@ def test_search_lets_tmdb_error_propagate_unwrapped() -> None:
                 client=fake_tmdb.client(),
                 watch_region="US",
                 watch_providers=[8],
-                interpret_model=_ok_interpret,
+                interpret_model=ok_interpret,
                 rank_model=_rank_must_not_run,
             )
         )
@@ -330,7 +276,7 @@ def test_search_short_circuits_on_empty_watch_providers() -> None:
     async def fake_interpret(message: str) -> DiscoverIntent:
         nonlocal called
         called = True
-        return _intent()
+        return make_intent()
 
     async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
         raise AssertionError("rank must not run")
@@ -366,7 +312,7 @@ def test_search_relaxes_runtime_when_the_first_query_is_empty() -> None:
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # runtime dropped: hit
 
     async def fake_interpret(message: str) -> DiscoverIntent:
-        return _intent(max_runtime_minutes=90)
+        return make_intent(max_runtime_minutes=90)
 
     result = run(
         search(
@@ -395,7 +341,7 @@ def test_search_skips_a_rung_with_nothing_to_drop() -> None:
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # keywords dropped
 
     async def fake_interpret(message: str) -> DiscoverIntent:
-        return _intent(max_runtime_minutes=90, keywords=["cozy"])
+        return make_intent(max_runtime_minutes=90, keywords=["cozy"])
 
     result = run(
         search(
@@ -425,7 +371,7 @@ def test_search_skips_keywords_rung_when_nothing_resolved() -> None:
     fake_tmdb.ok("/discover/movie", {"results": []})  # the only call made
 
     async def fake_interpret(message: str) -> DiscoverIntent:
-        return _intent(keywords=["cozy"])  # nothing else set to relax
+        return make_intent(keywords=["cozy"])  # nothing else set to relax
 
     result = run(
         search(
@@ -450,7 +396,7 @@ def test_search_never_relaxes_services_region_or_exclusions() -> None:
     # every /discover/movie falls through to the fake's default empty result
 
     async def fake_interpret(message: str) -> DiscoverIntent:
-        return _intent(
+        return make_intent(
             max_runtime_minutes=90,
             release_year_gte=2015,
             keywords=["cozy"],
@@ -485,7 +431,7 @@ def test_search_does_not_relax_when_the_first_query_returns_results() -> None:
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
 
     async def fake_interpret(message: str) -> DiscoverIntent:
-        return _intent(max_runtime_minutes=90)
+        return make_intent(max_runtime_minutes=90)
 
     result = run(
         search(

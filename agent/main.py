@@ -13,12 +13,26 @@ import logging
 import os
 import sys
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import StreamingResponse
+from langchain_anthropic import ChatAnthropic
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from catalog_tool import (
+    DEFAULT_MODEL,
+    Interpreter,
+    Ranker,
+    anthropic_interpreter,
+    anthropic_ranker,
+)
+from chat import ChatRequest, stream_chat
+from tmdb import TMDBClient
 
 # Header the gateway mints at the edge and forwards inward — see
 # services/gateway and ARCHITECTURE.md. Lower-case per the ASGI/HTTP2 norm;
@@ -118,13 +132,84 @@ class CorrelationIdMiddleware:
             _correlation_id.reset(token)
 
 
-app = FastAPI(title="holster-agent")
+def _require_env(key: str) -> str:
+    """Fail startup on a missing app-level key, same as the gateway's mustEnv —
+    a bad deploy should not surface as the first chat request's error."""
+    value = os.environ.get(key, "").strip()
+    if not value:
+        sys.exit(f"{key} not set")
+    return value
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # ANTHROPIC_API_KEY is read by ChatAnthropic itself, not passed explicitly —
+    # checked here anyway so a missing key stops startup rather than the first
+    # /chat request. See TASKS.md T13's note on "app-level keys."
+    _require_env("ANTHROPIC_API_KEY")
+    app.state.tmdb_client = TMDBClient(_require_env("TMDB_API_KEY"))
+    model = ChatAnthropic(
+        model_name=DEFAULT_MODEL, timeout=15.0, max_retries=2, stop=None
+    )
+    app.state.interpret_model = anthropic_interpreter(model)
+    app.state.rank_model = anthropic_ranker(model)
+    try:
+        yield
+    finally:
+        await app.state.tmdb_client.aclose()
+
+
+app = FastAPI(title="holster-agent", lifespan=lifespan)
 asgi_app = CorrelationIdMiddleware(app)
+
+
+# Plain functions, not a class: request.app.state is the one instance-per-process
+# TMDBClient/model pair built in lifespan() above. Depends() (rather than reading
+# request.app.state directly in the route) is what lets tests swap in fakes via
+# app.dependency_overrides, the same seam TMDBClient's transport= and
+# catalog_tool's Interpreter/Ranker callables already use.
+def get_tmdb_client(request: Request) -> TMDBClient:
+    return cast(TMDBClient, request.app.state.tmdb_client)
+
+
+def get_interpret_model(request: Request) -> Interpreter:
+    return cast(Interpreter, request.app.state.interpret_model)
+
+
+def get_rank_model(request: Request) -> Ranker:
+    return cast(Ranker, request.app.state.rank_model)
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/chat")
+async def chat(
+    req: ChatRequest,
+    tmdb_client: TMDBClient = Depends(get_tmdb_client),
+    interpret_model: Interpreter = Depends(get_interpret_model),
+    rank_model: Ranker = Depends(get_rank_model),
+) -> StreamingResponse:
+    """Streams chat.stream_chat()'s events as newline-delimited JSON. A plain
+    chunked HTTP response, not a second WebSocket — the browser's socket is the
+    gateway's alone (../DECISIONS.md); this is the "plain HTTP call" that
+    decision describes, just with a body streamed as it becomes available
+    rather than buffered, which is what lets the gateway forward an
+    "interpreting" line before the full pipeline finishes.
+    """
+
+    async def events() -> AsyncIterator[bytes]:
+        async for event in stream_chat(
+            req,
+            client=tmdb_client,
+            interpret_model=interpret_model,
+            rank_model=rank_model,
+        ):
+            yield json.dumps(event, default=str).encode() + b"\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 if __name__ == "__main__":

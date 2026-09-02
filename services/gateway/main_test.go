@@ -79,11 +79,21 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 	}
 	// Provisioning is a no-op here; the SQL has its own test.
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
-		func(context.Context, string, string) error { return nil })
+		func(context.Context, string, string) error { return nil },
+		noopChatCtx, noopAgentCaller, t.Context(),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return h
+}
+
+// Chat's own dependencies, for the many tests below that exercise auth/
+// provisioning only and never reach a chat endpoint — chat_test.go covers
+// loadChatCtx/callAgent for real.
+func noopChatCtx(context.Context, string) (chatContext, error) { return chatContext{}, nil }
+func noopAgentCaller(context.Context, agentChatRequest) (<-chan agentEvent, error) {
+	return nil, nil
 }
 
 func TestVerifyTokenAcceptsValidToken(t *testing.T) {
@@ -272,7 +282,8 @@ func TestProvisioningReceivesTokenIdentity(t *testing.T) {
 			calls++
 			gotID, gotEmail = id, email
 			return nil
-		})
+		},
+		noopChatCtx, noopAgentCaller, t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +327,8 @@ func TestProvisioningFailureBlocksRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
-		func(context.Context, string, string) error { return errors.New("connection refused") })
+		func(context.Context, string, string) error { return errors.New("connection refused") },
+		noopChatCtx, noopAgentCaller, t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +363,8 @@ func TestClientDisconnectIsNotAProvisioningFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
-		func(ctx context.Context, _, _ string) error { return ctx.Err() })
+		func(ctx context.Context, _, _ string) error { return ctx.Err() },
+		noopChatCtx, noopAgentCaller, t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +416,8 @@ func TestProvisioningDeadlineReturns503(t *testing.T) {
 		func(ctx context.Context, _, _ string) error {
 			<-ctx.Done()
 			return ctx.Err()
-		})
+		},
+		noopChatCtx, noopAgentCaller, t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +448,9 @@ func TestProvisioningDeadlineReturns503(t *testing.T) {
 func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 	kf := func(*jwt.Token) (any, error) { return nil, nil }
 	noop := func(context.Context, string, string) error { return nil }
-	if _, err := newHandler(kf, testIssuer, testAudience, map[string]struct{}{}, noop); err == nil {
+	_, err := newHandler(kf, testIssuer, testAudience, map[string]struct{}{}, noop,
+		noopChatCtx, noopAgentCaller, t.Context())
+	if err == nil {
 		t.Error("built a Handler with no authorized parties, which would reject every request")
 	}
 }
@@ -722,7 +738,8 @@ func TestKeyRotationSelfHeals(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
-		func(context.Context, string, string) error { return nil })
+		func(context.Context, string, string) error { return nil },
+		noopChatCtx, noopAgentCaller, t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -752,7 +769,8 @@ func TestUnknownKidDoesNotAmplify(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
-		func(context.Context, string, string) error { return nil })
+		func(context.Context, string, string) error { return nil },
+		noopChatCtx, noopAgentCaller, t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
