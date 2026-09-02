@@ -66,6 +66,17 @@ def test_successful_search_emits_intent_then_results_then_done() -> None:
     assert pick["title"] == "Fake Heist"
     assert pick["blurb"] == "great fit"
     assert events[1]["relaxed"] == []
+    # Enrichment (TASKS.md T16) reaches the wire event: genre_names is a pure
+    # local lookup from MOVIE_A's genre_ids ([80] -> Crime), no TMDB call
+    # needed; the other three fields come back empty because this test's
+    # FakeTMDB has no /movie/101* endpoints queued, so title_details()/
+    # watch_providers() succeed with a benign empty response — not the
+    # None-on-failure degrade path, which test_catalog_tool.py covers
+    # separately. This just confirms the fields reach the wire.
+    assert pick["genre_names"] == ["Crime"]
+    assert pick["runtime_minutes"] is None
+    assert pick["cast"] == []
+    assert pick["available_on"] == []
 
 
 def test_intent_event_arrives_before_rank_is_called() -> None:

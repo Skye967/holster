@@ -663,19 +663,46 @@ type agentIntent struct {
 }
 
 // agentPick mirrors one entry of chat.py's "results" event: a tmdb.Title
-// merged with rank()'s blurb. Forwarded to the browser close to verbatim —
-// the title-card rendering is TASKS.md T16's job, not this one's.
+// merged with per-title runtime/cast (tmdb.TitleDetails), resolved genre
+// names, availability filtered to the caller's own subscriptions, and
+// rank()'s blurb. Forwarded to the browser close to verbatim — the
+// title-card rendering is TASKS.md T16.5's job, not this one's.
 type agentPick struct {
-	TMDBID      int     `json:"tmdb_id"`
-	MediaType   string  `json:"media_type"`
-	Title       string  `json:"title"`
-	Year        *int    `json:"year"`
-	Overview    string  `json:"overview"`
-	PosterURL   *string `json:"poster_url"`
-	VoteAverage float64 `json:"vote_average"`
-	VoteCount   int     `json:"vote_count"`
-	GenreIDs    []int   `json:"genre_ids"`
-	Blurb       string  `json:"blurb"`
+	TMDBID         int      `json:"tmdb_id"`
+	MediaType      string   `json:"media_type"`
+	Title          string   `json:"title"`
+	Year           *int     `json:"year"`
+	Overview       string   `json:"overview"`
+	PosterURL      *string  `json:"poster_url"`
+	VoteAverage    float64  `json:"vote_average"`
+	VoteCount      int      `json:"vote_count"`
+	GenreIDs       []int    `json:"genre_ids"`
+	GenreNames     []string `json:"genre_names"`
+	RuntimeMinutes *int     `json:"runtime_minutes"`
+	Cast           []string `json:"cast"`
+	// nil (JSON null) when the agent's availability check itself failed —
+	// distinct from a non-nil empty slice, which means TMDB confirms this
+	// title streams on none of the caller's services. No `omitempty`: both
+	// states must reach the browser distinguishably, and Go's JSON codec
+	// already round-trips null<->nil and []<->non-nil-empty correctly for a
+	// plain slice, so no extra type (e.g. a pointer) is needed here.
+	AvailableOn []agentProvider `json:"available_on"`
+	Blurb       string          `json:"blurb"`
+}
+
+// agentProvider mirrors one entry of tmdb.py's Provider TypedDict, as used in
+// agentPick.AvailableOn — a minimal, independent decode, same pattern this
+// file already uses twice for overlapping TMDB provider shapes (providers.go's
+// Provider and this file's own cachedProvider each note the other in their
+// doc comments rather than sharing a type). Not providers.go's Provider: that
+// one also carries DisplayPriority with no `omitempty`, which has no meaning
+// for one title's availability and would leak a bogus "display_priority": 0
+// into every entry sent to the browser. Not cachedProvider either: that one
+// has no LogoURL, and a card plausibly wants to show one.
+type agentProvider struct {
+	ProviderID   int     `json:"provider_id"`
+	ProviderName string  `json:"provider_name"`
+	LogoURL      *string `json:"logo_url"`
 }
 
 // agentEvent is one NDJSON line from POST /chat on the agent — see

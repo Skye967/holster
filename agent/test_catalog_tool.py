@@ -161,9 +161,9 @@ def test_search_joins_blurb_with_the_real_title_not_model_metadata() -> None:
         )
     )
 
-    [(title, blurb)] = result.picks
-    assert title["title"] == "Fake Heist"
-    assert blurb == "great fit"
+    [pick] = result.picks
+    assert pick["title"] == "Fake Heist"
+    assert pick["blurb"] == "great fit"
 
 
 def test_search_wraps_interpret_failure_as_catalog_tool_error() -> None:
@@ -330,7 +330,7 @@ def test_search_relaxes_runtime_when_the_first_query_is_empty() -> None:
     assert calls[0]["with_runtime.lte"] == "90"
     assert "with_runtime.lte" not in calls[1]
     assert result.relaxed == ["runtime"]
-    assert [title["title"] for title, _ in result.picks] == ["Fake Heist"]
+    assert [p["title"] for p in result.picks] == ["Fake Heist"]
 
 
 def test_search_skips_a_rung_with_nothing_to_drop() -> None:
@@ -448,3 +448,158 @@ def test_search_does_not_relax_when_the_first_query_returns_results() -> None:
     assert len(calls) == 1
     assert calls[0]["with_runtime.lte"] == "90"  # kept — nothing was relaxed
     assert result.relaxed == []
+
+
+# --- Enrichment (TASKS.md T16: runtime, cast, genre names, availability) ---
+
+
+def test_search_enriches_picks_with_runtime_cast_genres_availability() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    fake_tmdb.ok(
+        "/movie/101",
+        {"runtime": 128, "credits": {"cast": [{"name": "Star", "order": 0}]}},
+    )
+    fake_tmdb.ok(
+        "/movie/101/watch/providers",
+        {
+            "results": {
+                "US": {
+                    "flatrate": [
+                        {
+                            "provider_id": 8,
+                            "provider_name": "Netflix",
+                            "logo_path": "/n.jpg",
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    result = run(
+        search(
+            "mood",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=ok_interpret,
+            rank_model=_rank_first,
+        )
+    )
+
+    [pick] = result.picks
+    assert pick["genre_names"] == ["Crime"]  # MOVIE_A's genre_ids: [80]
+    assert pick["runtime_minutes"] == 128
+    assert pick["cast"] == ["Star"]
+    assert pick["available_on"] == [
+        {
+            "provider_id": 8,
+            "provider_name": "Netflix",
+            "logo_url": "https://image.tmdb.org/t/p/w92/n.jpg",
+        }
+    ]
+
+
+def test_search_available_on_excludes_providers_the_user_does_not_have() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    fake_tmdb.ok(
+        "/movie/101/watch/providers",
+        {
+            "results": {
+                "US": {
+                    "flatrate": [
+                        {
+                            "provider_id": 8,
+                            "provider_name": "Netflix",
+                            "logo_path": None,
+                        },
+                        {
+                            "provider_id": 9,
+                            "provider_name": "Amazon",
+                            "logo_path": None,
+                        },
+                    ]
+                }
+            }
+        },
+    )
+
+    result = run(
+        search(
+            "mood",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],  # not 9 — Amazon must not appear
+            interpret_model=ok_interpret,
+            rank_model=_rank_first,
+        )
+    )
+
+    [pick] = result.picks
+    assert [p["provider_id"] for p in pick["available_on"]] == [8]
+
+
+def test_search_enrichment_only_runs_for_final_ranked_picks() -> None:
+    movie_b = {**MOVIE_A, "id": 202, "title": "Second Movie"}
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A, movie_b]})
+
+    result = run(
+        search(
+            "mood",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=ok_interpret,
+            rank_model=_rank_first,  # picks only candidates[0] (101)
+        )
+    )
+
+    assert [p["tmdb_id"] for p in result.picks] == [101]
+    assert fake_tmdb.count("/movie/101") == 1
+    assert fake_tmdb.count("/movie/202") == 0
+
+
+async def _rank_both(message: str, candidates: list[Title]) -> RankResult:
+    return RankResult(
+        picks=[RankedPick(tmdb_id=c["tmdb_id"], blurb="ok") for c in candidates]
+    )
+
+
+def test_search_enrichment_failure_for_one_title_degrades_not_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tmdb, "_sleep", AsyncMock())
+    movie_b = {**MOVIE_A, "id": 202, "title": "Second Movie"}
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A, movie_b]})
+    fake_tmdb.queue("/movie/101", *[httpx2.Response(503) for _ in range(3)])
+    fake_tmdb.queue(
+        "/movie/101/watch/providers", *[httpx2.Response(503) for _ in range(3)]
+    )
+    fake_tmdb.ok(
+        "/movie/202",
+        {"runtime": 90, "credits": {"cast": [{"name": "Someone", "order": 0}]}},
+    )
+
+    result = run(
+        search(
+            "mood",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=ok_interpret,
+            rank_model=_rank_both,
+        )
+    )
+
+    by_id = {p["tmdb_id"]: p for p in result.picks}
+    assert set(by_id) == {101, 202}
+    assert by_id[101]["runtime_minutes"] is None
+    assert by_id[101]["cast"] == []
+    # None, not [] — a failed availability check must stay distinguishable
+    # from TMDB confirming this title streams nowhere the caller subscribes.
+    assert by_id[101]["available_on"] is None
+    assert by_id[202]["runtime_minutes"] == 90
