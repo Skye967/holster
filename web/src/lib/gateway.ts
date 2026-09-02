@@ -5,10 +5,25 @@
 
 export class GatewaySessionExpiredError extends Error {}
 
-type GetToken = (opts: {
+export type GetToken = (opts: {
   template: string
   skipCache?: boolean
 }) => Promise<string | null>
+
+// Bounds an arbitrary promise, not just a fetch() — needed because getToken()
+// (Clerk's SDK) has no cancellation option of its own, so an AbortSignal passed
+// to gatewayFetch only cancels the fetch() half. A caller that also wants its
+// fetch actually torn down on timeout should pass its own AbortSignal.timeout as
+// gatewayFetch's init.signal — this wrapper is what bounds the getToken() half
+// that a signal can't reach. clearTimeout on the losing side so a fast response
+// doesn't leave a no-op timer running for the rest of the window.
+export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("gateway call timed out")), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
 
 export async function gatewayFetch(
   path: string,

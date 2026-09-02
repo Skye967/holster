@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/MicahParks/keyfunc/v3"
@@ -117,6 +119,60 @@ func TestGetProvidersDegradesOnContextFailure(t *testing.T) {
 	}
 }
 
+// --- GET /api/subscriptions --------------------------------------------------
+
+func TestGetSubscriptionsReturnsIDs(t *testing.T) {
+	loadChatCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8, 15}}, nil
+	}
+	srv, token := newProvidersTestServer(t, loadChatCtx, noopLoadProviders, noopSaveSubscription)
+
+	resp := doJSON(t, srv, token, http.MethodGet, "/api/subscriptions")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var got []int
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != 8 || got[1] != 15 {
+		t.Errorf("got %v, want [8 15]", got)
+	}
+}
+
+// TestGetSubscriptionsReturnsEmptyArray guards against cc.Providers' nil
+// zero-value marshaling to JSON `null` — the frontend's needsOnboarding()
+// checks ids.length, which throws on null.
+func TestGetSubscriptionsReturnsEmptyArray(t *testing.T) {
+	srv, token := newProvidersTestServer(t, noopChatCtx, noopLoadProviders, noopSaveSubscription)
+
+	resp := doJSON(t, srv, token, http.MethodGet, "/api/subscriptions")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(body)); got != "[]" {
+		t.Errorf("body = %q, want %q", got, "[]")
+	}
+}
+
+func TestGetSubscriptionsDegradesOnContextFailure(t *testing.T) {
+	loadChatCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{}, errUnauthorizedParty // any non-nil error
+	}
+	srv, token := newProvidersTestServer(t, loadChatCtx, noopLoadProviders, noopSaveSubscription)
+
+	resp := doJSON(t, srv, token, http.MethodGet, "/api/subscriptions")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
 // --- PUT/DELETE /api/subscriptions/{providerID} -----------------------------
 
 func TestSetSubscriptionInsertsAndDeletes(t *testing.T) {
@@ -207,6 +263,7 @@ func TestProviderRoutesRequireAuth(t *testing.T) {
 
 	for _, p := range []struct{ method, path string }{
 		{http.MethodGet, "/api/providers"},
+		{http.MethodGet, "/api/subscriptions"},
 		{http.MethodPut, "/api/subscriptions/8"},
 		{http.MethodDelete, "/api/subscriptions/8"},
 	} {
