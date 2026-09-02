@@ -212,6 +212,18 @@ func TestLoadChatContext(t *testing.T) {
 		id, id+"@example.com"); err != nil {
 		t.Fatal(err)
 	}
+
+	// Zero subscriptions: Providers must come back as [], not nil — the
+	// subscriptions handler (providers.go) marshals this slice directly to
+	// JSON, and nil marshals to `null`.
+	cc, err := load(ctx, id)
+	if err != nil {
+		t.Fatalf("load with no subscriptions: %v", err)
+	}
+	if cc.Providers == nil || len(cc.Providers) != 0 {
+		t.Errorf("Providers = %#v, want non-nil empty slice", cc.Providers)
+	}
+
 	if _, err := pool.Exec(ctx,
 		`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ($1, 8)
 		 on conflict do nothing`, id); err != nil {
@@ -220,7 +232,7 @@ func TestLoadChatContext(t *testing.T) {
 
 	// No streaming_providers row for 'ZZ' yet: names must come back empty,
 	// not an error.
-	cc, err := load(ctx, id)
+	cc, err = load(ctx, id)
 	if err != nil {
 		t.Fatalf("load with no provider cache: %v", err)
 	}

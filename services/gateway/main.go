@@ -446,6 +446,7 @@ func (h *Handler) routes() http.Handler {
 	register("GET /api/example", h.example)
 	register("POST /api/chat/ticket", h.chatTicket)
 	register("GET /api/providers", h.providers)
+	register("GET /api/subscriptions", h.subscriptions)
 	register("PUT /api/subscriptions/{providerID}", h.setSubscription)
 	register("DELETE /api/subscriptions/{providerID}", h.setSubscription)
 

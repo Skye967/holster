@@ -92,7 +92,9 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 // Chat's own dependencies, for the many tests below that exercise auth/
 // provisioning only and never reach a chat endpoint — chat_test.go covers
 // loadChatCtx/callAgent for real.
-func noopChatCtx(context.Context, string) (chatContext, error) { return chatContext{}, nil }
+func noopChatCtx(context.Context, string) (chatContext, error) {
+	return newChatContext(), nil
+}
 func noopAgentCaller(context.Context, agentChatRequest) (<-chan agentEvent, error) {
 	return nil, nil
 }

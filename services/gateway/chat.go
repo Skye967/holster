@@ -540,6 +540,15 @@ type chatContext struct {
 	ProviderNames []string // the caller's own Providers, resolved to names where cached
 }
 
+// newChatContext returns a chatContext with both slice fields non-nil, for any
+// construction site that needs the "[] not null" guarantee providers.go's
+// subscriptions handler (and any future direct JSON consumer) depends on — not
+// every chatContext{} literal in this package uses it; a few test fixtures set
+// only the fields they read and skip it safely.
+func newChatContext() chatContext {
+	return chatContext{Providers: []int{}, ProviderNames: []string{}}
+}
+
 // A minimal, independent decode of streaming_providers.providers — see
 // providers.go's Provider, which decodes the same jsonb column for the
 // /api/providers picker response. If a field name here changes, check there
@@ -552,7 +561,7 @@ type cachedProvider struct {
 func parseProviderNames(raw []byte, wanted []int) []string {
 	var all []cachedProvider
 	if err := json.Unmarshal(raw, &all); err != nil {
-		return nil
+		return []string{}
 	}
 	byID := make(map[int]string, len(all))
 	for _, p := range all {
@@ -574,7 +583,7 @@ func parseProviderNames(raw []byte, wanted []int) []string {
 // transaction is just convenient, not a privilege requirement.
 func loadChatContext(db *pgxpool.Pool) func(ctx context.Context, userID string) (chatContext, error) {
 	return func(ctx context.Context, userID string) (chatContext, error) {
-		var cc chatContext
+		cc := newChatContext()
 		err := withUser(ctx, db, userID, func(tx pgx.Tx) error {
 			if err := tx.QueryRow(ctx, `select country from users where id = $1`, userID).
 				Scan(&cc.Region); err != nil {

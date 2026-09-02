@@ -394,7 +394,11 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 }
 
 func TestChatErrorReasonBecomesFriendlyText(t *testing.T) {
-	loadCtx := func(context.Context, string) (chatContext, error) { return chatContext{Region: "US"}, nil }
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		cc := newChatContext()
+		cc.Region = "US"
+		return cc, nil
+	}
 	callAgent := fakeAgentEvents(agentEvent{Type: "error", Reason: "tmdb_unavailable"})
 	srv, token := newChatTestServer(t, loadCtx, callAgent)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))

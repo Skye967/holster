@@ -215,6 +215,25 @@ func (h *Handler) providers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entries)
 }
 
+// subscriptions is GET /api/subscriptions — the caller's subscribed provider IDs
+// alone, no catalog merge. Reuses loadChatCtx (DB-only, no TMDB dependency)
+// instead of loadProviders, so callers that only need to know *whether* the user
+// subscribes to anything don't pay for the picker's TMDB-refresh path. loadChatCtx
+// also runs two queries this handler doesn't use — accepted; not worth a 6th
+// constructor dependency to save two indexed single-row lookups.
+func (h *Handler) subscriptions(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(ctxUserID).(string)
+
+	cc, err := h.loadChatCtx(r.Context(), userID)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "subscription context load failed", "error", dbError(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "temporarily unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, cc.Providers)
+}
+
 // setSubscription is PUT/DELETE /api/subscriptions/{providerID} — one
 // service, toggled immediately, no request body (TASKS.md T15: "toggles save
 // on flip"). PUT is the idempotent "make it subscribed" (on conflict do
