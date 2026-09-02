@@ -39,6 +39,17 @@ def test_name_resolution_and_discover() -> None:
     asyncio.run(go())
 
 
+def test_watch_provider_list_finds_netflix_in_us() -> None:
+    async def go() -> None:
+        async with TMDBClient(TOKEN) as client:
+            providers = await client.watch_provider_list(watch_region="US")
+            assert providers, "expected some providers for US"
+            assert any(p["provider_name"] == "Netflix" for p in providers)
+            assert all(p["display_priority"] >= 0 for p in providers)
+
+    asyncio.run(go())
+
+
 def test_title_lookup_returns_streaming_services() -> None:
     async def go() -> None:
         async with TMDBClient(TOKEN) as client:

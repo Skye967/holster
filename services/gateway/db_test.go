@@ -248,6 +248,170 @@ func TestLoadChatContext(t *testing.T) {
 	}
 }
 
+// loadProviders (providers.go, T15): no cache refreshes and caches; a fresh
+// cache is served without another refresh; a stale cache refreshes and
+// overwrites; a failing refresh degrades to whatever is cached.
+func TestLoadProviders(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const country = "YY"
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool.Exec(c, `delete from streaming_providers where country = $1`, country)
+	})
+	if _, err := pool.Exec(ctx, `delete from streaming_providers where country = $1`, country); err != nil {
+		t.Fatal(err)
+	}
+
+	var refreshCalls int
+	fresh := []Provider{{ProviderID: 8, ProviderName: "Netflix", DisplayPriority: 1}}
+	load := loadProviders(pool, func(context.Context, string) ([]Provider, error) {
+		refreshCalls++
+		return fresh, nil
+	})
+
+	got, err := load(ctx, country)
+	if err != nil {
+		t.Fatalf("load with no cache: %v", err)
+	}
+	if len(got) != 1 || got[0].ProviderID != 8 {
+		t.Errorf("got = %+v, want the refreshed list", got)
+	}
+	if refreshCalls != 1 {
+		t.Errorf("refreshCalls = %d, want 1", refreshCalls)
+	}
+
+	got, err = load(ctx, country)
+	if err != nil {
+		t.Fatalf("load with fresh cache: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("got = %+v, want the cached list", got)
+	}
+	if refreshCalls != 1 {
+		t.Errorf("refreshCalls = %d after a fresh read, want still 1", refreshCalls)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`update streaming_providers set fetched_at = now() - interval '25 hours' where country = $1`,
+		country); err != nil {
+		t.Fatal(err)
+	}
+	stale := []Provider{{ProviderID: 337, ProviderName: "Disney Plus", DisplayPriority: 1}}
+	load = loadProviders(pool, func(context.Context, string) ([]Provider, error) {
+		refreshCalls++
+		return stale, nil
+	})
+	got, err = load(ctx, country)
+	if err != nil {
+		t.Fatalf("load with stale cache: %v", err)
+	}
+	if len(got) != 1 || got[0].ProviderID != 337 {
+		t.Errorf("got = %+v, want the newly-refreshed list", got)
+	}
+	if refreshCalls != 2 {
+		t.Errorf("refreshCalls = %d, want 2 after a stale read", refreshCalls)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`update streaming_providers set fetched_at = now() - interval '25 hours' where country = $1`,
+		country); err != nil {
+		t.Fatal(err)
+	}
+	failing := loadProviders(pool, func(context.Context, string) ([]Provider, error) {
+		return nil, errors.New("agent unreachable")
+	})
+	got, err = failing(ctx, country)
+	if err != nil {
+		t.Fatalf("load with a failing refresh: %v", err)
+	}
+	if len(got) != 1 || got[0].ProviderID != 337 {
+		t.Errorf("got = %+v, want the stale cached list on refresh failure", got)
+	}
+}
+
+// A country with neither a cache row nor a working agent gets an empty list,
+// not an error — the picker renders nothing to toggle rather than failing the
+// page.
+func TestLoadProvidersDegradesToEmptyWithNoCacheAndFailingRefresh(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const country = "XX"
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool.Exec(c, `delete from streaming_providers where country = $1`, country)
+	})
+	if _, err := pool.Exec(ctx, `delete from streaming_providers where country = $1`, country); err != nil {
+		t.Fatal(err)
+	}
+
+	load := loadProviders(pool, func(context.Context, string) ([]Provider, error) {
+		return nil, errors.New("agent unreachable")
+	})
+	got, err := load(ctx, country)
+	if err != nil {
+		t.Fatalf("load with no cache and a failing refresh: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %+v, want empty", got)
+	}
+}
+
+// saveSubscription (providers.go, T15): subscribing inserts, unsubscribing
+// deletes, and repeating either is a no-op rather than an error — matches
+// the picker's "flip a switch" semantics, not a form submit.
+func TestSaveSubscription(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveSubscription(pool)
+
+	const id = "sub_write_test"
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool.Exec(c, `delete from users where id = $1`, id)
+	})
+	if _, err := pool.Exec(ctx,
+		`insert into users (id, email) values ($1, $2) on conflict (id) do nothing`,
+		id, id+"@example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	exists := func() bool {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`select count(*) from streaming_subscriptions where user_id = $1 and tmdb_provider_id = 8`,
+			id).Scan(&n); err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		return n == 1
+	}
+
+	if err := save(ctx, id, 8, true); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if !exists() {
+		t.Error("subscribing did not insert a row")
+	}
+	if err := save(ctx, id, 8, true); err != nil {
+		t.Fatalf("subscribing an already-ticked provider: %v", err)
+	}
+
+	if err := save(ctx, id, 8, false); err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
+	if exists() {
+		t.Error("unsubscribing did not delete the row")
+	}
+	if err := save(ctx, id, 8, false); err != nil {
+		t.Fatalf("unsubscribing an already-absent provider: %v", err)
+	}
+}
+
 // T10's core invariant: agent_ro has no write path to any table. It also has no
 // read grants yet -- those are added by the task that needs each one -- but
 // "never writes" is the property that must not regress, so that is what this

@@ -32,7 +32,7 @@ from catalog_tool import (
     anthropic_ranker,
 )
 from chat import ChatRequest, stream_chat
-from tmdb import TMDBClient
+from tmdb import RegionProvider, TMDBClient
 
 # Header the gateway mints at the edge and forwards inward — see
 # services/gateway and ARCHITECTURE.md. Lower-case per the ASGI/HTTP2 norm;
@@ -210,6 +210,19 @@ async def chat(
             yield json.dumps(event, default=str).encode() + b"\n"
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
+@app.get("/providers")
+async def providers(
+    region: str, tmdb_client: TMDBClient = Depends(get_tmdb_client)
+) -> list[RegionProvider]:
+    """Every provider available in one country, across movies and TV. Feeds
+    the gateway's streaming_providers cache (TASKS.md T15) — internal only,
+    like /chat; the gateway decides staleness and owns the write. A bad
+    region or an unreachable TMDB surfaces as a plain 500, which is exactly
+    what the gateway's refresh treats as "agent call failed, serve stale."
+    """
+    return await tmdb_client.watch_provider_list(watch_region=region)
 
 
 if __name__ == "__main__":

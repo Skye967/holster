@@ -250,6 +250,73 @@ def test_watch_providers_404_is_empty() -> None:
     assert avail["flatrate"] == []
 
 
+def test_watch_provider_list_merges_movie_and_tv() -> None:
+    fake = FakeTMDB()
+    fake.ok(
+        "/watch/providers/movie",
+        {
+            "results": [
+                {
+                    "provider_id": 8,
+                    "provider_name": "Netflix",
+                    "logo_path": "/n.jpg",
+                    "display_priorities": {"US": 2},
+                },
+                {
+                    "provider_id": 337,
+                    "provider_name": "Disney Plus",
+                    "logo_path": "/d.jpg",
+                    "display_priorities": {"US": 5},
+                },
+            ]
+        },
+    )
+    fake.ok(
+        "/watch/providers/tv",
+        {
+            "results": [
+                # Same provider_id as movie's Netflix, worse priority here —
+                # the merge must keep the better (lower) one.
+                {
+                    "provider_id": 8,
+                    "provider_name": "Netflix",
+                    "logo_path": "/n.jpg",
+                    "display_priorities": {"US": 4},
+                },
+                {
+                    "provider_id": 15,
+                    "provider_name": "Hulu",
+                    "logo_path": None,
+                    "display_priorities": {"US": 3},
+                },
+                # No US entry at all -- not available in this region, dropped.
+                {
+                    "provider_id": 99,
+                    "provider_name": "Region-locked",
+                    "logo_path": "/r.jpg",
+                    "display_priorities": {"GB": 1},
+                },
+            ]
+        },
+    )
+
+    providers = run(fake.client().watch_provider_list(watch_region="US"))
+
+    assert [p["provider_id"] for p in providers] == [8, 15, 337]
+    assert providers[0] == {
+        "provider_id": 8,
+        "provider_name": "Netflix",
+        "logo_url": "https://image.tmdb.org/t/p/w92/n.jpg",
+        "display_priority": 2,
+    }
+    assert providers[1]["logo_url"] is None
+
+
+def test_watch_provider_list_bad_region_rejected() -> None:
+    with pytest.raises(ValueError):
+        run(FakeTMDB().client().watch_provider_list(watch_region="usa"))
+
+
 def test_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tmdb, "_sleep", AsyncMock())
     fake = FakeTMDB()

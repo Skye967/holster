@@ -540,6 +540,10 @@ type chatContext struct {
 	ProviderNames []string // the caller's own Providers, resolved to names where cached
 }
 
+// A minimal, independent decode of streaming_providers.providers — see
+// providers.go's Provider, which decodes the same jsonb column for the
+// /api/providers picker response. If a field name here changes, check there
+// too.
 type cachedProvider struct {
 	ProviderID   int    `json:"provider_id"`
 	ProviderName string `json:"provider_name"`

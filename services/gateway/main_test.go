@@ -81,6 +81,7 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
 		noopChatCtx, noopAgentCaller, t.Context(),
+		noopLoadProviders, noopSaveSubscription,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -95,6 +96,11 @@ func noopChatCtx(context.Context, string) (chatContext, error) { return chatCont
 func noopAgentCaller(context.Context, agentChatRequest) (<-chan agentEvent, error) {
 	return nil, nil
 }
+
+// providers.go's own dependencies, for the same reason — providers_test.go
+// covers loadProviders/saveSubscription for real.
+func noopLoadProviders(context.Context, string) ([]Provider, error) { return nil, nil }
+func noopSaveSubscription(context.Context, string, int, bool) error { return nil }
 
 func TestVerifyTokenAcceptsValidToken(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -283,7 +289,7 @@ func TestProvisioningReceivesTokenIdentity(t *testing.T) {
 			gotID, gotEmail = id, email
 			return nil
 		},
-		noopChatCtx, noopAgentCaller, t.Context())
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +334,7 @@ func TestProvisioningFailureBlocksRequest(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return errors.New("connection refused") },
-		noopChatCtx, noopAgentCaller, t.Context())
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +370,7 @@ func TestClientDisconnectIsNotAProvisioningFailure(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(ctx context.Context, _, _ string) error { return ctx.Err() },
-		noopChatCtx, noopAgentCaller, t.Context())
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +423,7 @@ func TestProvisioningDeadlineReturns503(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		},
-		noopChatCtx, noopAgentCaller, t.Context())
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +455,7 @@ func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 	kf := func(*jwt.Token) (any, error) { return nil, nil }
 	noop := func(context.Context, string, string) error { return nil }
 	_, err := newHandler(kf, testIssuer, testAudience, map[string]struct{}{}, noop,
-		noopChatCtx, noopAgentCaller, t.Context())
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
 	if err == nil {
 		t.Error("built a Handler with no authorized parties, which would reject every request")
 	}
@@ -645,11 +651,13 @@ func TestRoutesRequireAuthOnEveryMethod(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	h := newTestHandler(t, key, "kid_A")
 
-	// Register future-shaped write routes to prove they inherit auth.
+	// Register a future-shaped write route to prove it inherits auth. (The
+	// real PUT/DELETE /api/subscriptions/{providerID} now exists — see
+	// providers.go and providers_test.go — so it is no longer a placeholder
+	// here; this one stands in for any route not yet built.)
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/example", h.example)
 	api.HandleFunc("POST /api/chat", h.example)
-	api.HandleFunc("PUT /api/subscriptions", h.example)
 	root := http.NewServeMux()
 	root.HandleFunc("GET /health", h.health)
 	root.Handle("/api/", h.authMiddleware(api))
@@ -658,7 +666,6 @@ func TestRoutesRequireAuthOnEveryMethod(t *testing.T) {
 	protected := []struct{ method, path string }{
 		{"GET", "/api/example"},
 		{"POST", "/api/chat"},
-		{"PUT", "/api/subscriptions"},
 		{"DELETE", "/api/not-registered"},
 	}
 	for _, p := range protected {
@@ -697,6 +704,72 @@ func TestRoutesRequireAuthOnEveryMethod(t *testing.T) {
 	}
 	if rec.Header().Get("X-Correlation-ID") == "" {
 		t.Error("X-Correlation-ID header missing")
+	}
+}
+
+// T15: the picker is the first caller to hit /api/ with a plain browser
+// fetch() rather than a WebSocket upgrade or a server-side request, so this
+// is the first test that actually exercises corsMiddleware.
+func TestCORSPreflightFromAllowedOrigin(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	h := newTestHandler(t, key, "kid_A")
+	srv := h.routes()
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/providers", nil)
+	req.Header.Set("Origin", testOrigin)
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Headers", "authorization")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("preflight status = %d, want 204", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != testOrigin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, testOrigin)
+	}
+	if rec.Header().Get("Access-Control-Allow-Headers") == "" {
+		t.Error("Access-Control-Allow-Headers missing")
+	}
+}
+
+func TestCORSOmittedForUnknownOrigin(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	h := newTestHandler(t, key, "kid_A")
+	srv := h.routes()
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/providers", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	// Still answers the preflight (so it never hangs waiting on a real
+	// server), but with no Allow-Origin — the browser enforces the block, the
+	// same way an unrecognised azp fails token verification rather than the
+	// gateway refusing to respond at all.
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin = %q for an unknown origin, want empty", got)
+	}
+}
+
+func TestCORSHeadersPresentOnRealResponse(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	h := newTestHandler(t, key, "kid_A")
+	srv := h.routes()
+
+	// Deliberately no Authorization header: proves CORS headers land even on
+	// the 401 an unauthenticated request gets, which is what lets the browser
+	// surface that 401 to application code instead of an opaque CORS error.
+	req := httptest.NewRequest(http.MethodGet, "/api/providers", nil)
+	req.Header.Set("Origin", testOrigin)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != testOrigin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, testOrigin)
 	}
 }
 
@@ -739,7 +812,7 @@ func TestKeyRotationSelfHeals(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context())
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -770,7 +843,7 @@ func TestUnknownKidDoesNotAmplify(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context())
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
 	if err != nil {
 		t.Fatal(err)
 	}
