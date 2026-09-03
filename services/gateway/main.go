@@ -127,6 +127,11 @@ type Handler struct {
 	// above so both are fakeable in tests without a real database or agent.
 	loadProviders    func(ctx context.Context, country string) ([]Provider, error)
 	saveSubscription func(ctx context.Context, userID string, providerID int, subscribed bool) error
+
+	// verdicts.go (T18): the caller's verdict set and the per-title write,
+	// injected the same way as loadProviders/saveSubscription above.
+	loadVerdicts func(ctx context.Context, userID string) ([]Verdict, error)
+	saveVerdict  func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error
 }
 
 // newHandler guards the keyfunc and rejects an empty origin allowlist, which
@@ -138,6 +143,8 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	rootCtx context.Context,
 	loadProviders func(ctx context.Context, country string) ([]Provider, error),
 	saveSubscription func(ctx context.Context, userID string, providerID int, subscribed bool) error,
+	loadVerdicts func(ctx context.Context, userID string) ([]Verdict, error),
+	saveVerdict func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error,
 ) (*Handler, error) {
 
 	if len(parties) == 0 {
@@ -164,6 +171,12 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	if saveSubscription == nil {
 		return nil, errors.New("no subscription writer configured")
 	}
+	if loadVerdicts == nil {
+		return nil, errors.New("no verdict loader configured")
+	}
+	if saveVerdict == nil {
+		return nil, errors.New("no verdict writer configured")
+	}
 
 	origins := make([]string, 0, len(parties))
 	for p := range parties {
@@ -183,6 +196,8 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 		rootCtx:          rootCtx,
 		loadProviders:    loadProviders,
 		saveSubscription: saveSubscription,
+		loadVerdicts:     loadVerdicts,
+		saveVerdict:      saveVerdict,
 	}, nil
 }
 
@@ -449,6 +464,9 @@ func (h *Handler) routes() http.Handler {
 	register("GET /api/subscriptions", h.subscriptions)
 	register("PUT /api/subscriptions/{providerID}", h.setSubscription)
 	register("DELETE /api/subscriptions/{providerID}", h.setSubscription)
+	register("GET /api/verdicts", h.verdicts)
+	register("PUT /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
+	register("DELETE /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
 
 	allowMethods := make([]string, 0, len(methods))
 	for m := range methods {
@@ -579,7 +597,8 @@ func main() {
 
 	h, err := newHandler(jwks.Keyfunc, issuer, audience, parties, upsertUser(db),
 		loadChatContext(db), newAgentCaller(agentClient, agentURL), ctx,
-		loadProviders(db, newAgentProviderCaller(agentClient, agentURL)), saveSubscription(db))
+		loadProviders(db, newAgentProviderCaller(agentClient, agentURL)), saveSubscription(db),
+		loadVerdicts(db), saveVerdict(db))
 	if err != nil {
 		log.Fatalf("handler: %v", err)
 	}
