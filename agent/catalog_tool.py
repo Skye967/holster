@@ -298,32 +298,36 @@ async def _safe_details(client: TMDBClient, title: Title) -> TitleDetails | None
 
 
 async def _safe_availability(
-    client: TMDBClient, title: Title, watch_region: str
+    client: TMDBClient, media_type: MediaType, tmdb_id: int, watch_region: str
 ) -> WatchAvailability | None:
     """watch_providers(), degraded to None — not an empty result.
     watch_providers() already returns empty arrays, not an error, for a
     title genuinely unavailable in the region, so a failed check must stay
-    distinct from that — see _enrich_pick for why the distinction matters."""
+    distinct from that — see _enrich_pick for why the distinction matters.
+
+    Takes media_type/tmdb_id directly, not a Title, so a caller that hasn't
+    resolved a Title yet (enrich_known_title, T18.5) can still run this
+    concurrently with the lookup that would produce one."""
     return await _safe(
         client.watch_providers(
-            media_type=title["media_type"],
-            tmdb_id=title["tmdb_id"],
-            watch_region=watch_region,
+            media_type=media_type, tmdb_id=tmdb_id, watch_region=watch_region
         ),
-        tmdb_id=title["tmdb_id"],
+        tmdb_id=tmdb_id,
         what="watch_providers",
     )
 
 
-async def _enrich_pick(
-    client: TMDBClient,
-    watch_region: str,
-    wanted: set[int],
+def _merge_enrichment(
     title: Title,
+    details: TitleDetails | None,
+    availability: WatchAvailability | None,
+    wanted: set[int],
     blurb: str,
 ) -> dict[str, Any]:
-    """One shown pick's runtime/cast/genre-names/availability, fetched
-    concurrently. available_on is filtered to `wanted` (the caller's own
+    """The dict-merge step shared by _enrich_pick (discover()'s picks) and
+    enrich_known_title (a watchlist's already-known ids, T18.5) — same
+    fields, same availability-filtered-to-`wanted` and None-vs-[] rules
+    either way. available_on is filtered to `wanted` (the caller's own
     subscriptions) here, not upstream: discover()'s own provider filter only
     guarantees a title is on *at least one* of the caller's services,
     watch_providers() returns every flatrate provider for the title — this
@@ -331,16 +335,7 @@ async def _enrich_pick(
     doesn't have" (TASKS.md T16). available_on is None, not [], when the
     availability check itself failed (see _safe_availability) — a TMDB
     hiccup must never make an available title read as confirmed-unavailable.
-
-    Plain asyncio.gather, not gather_all: these two calls return different
-    types (TitleDetails | None, WatchAvailability | None) that gather_all's
-    single TypeVar can't unify; _safe already narrows both calls' exception
-    surface to TMDBError, so gather_all's sibling-task protection has little
-    left to guard here."""
-    details, availability = await asyncio.gather(
-        _safe_details(client, title),
-        _safe_availability(client, title, watch_region),
-    )
+    """
     return {
         **title,
         "genre_names": genre_names(title["media_type"], title["genre_ids"]),
@@ -353,6 +348,150 @@ async def _enrich_pick(
         ),
         "blurb": blurb,
     }
+
+
+async def _enrich_pick(
+    client: TMDBClient,
+    watch_region: str,
+    wanted: set[int],
+    title: Title,
+    blurb: str,
+) -> dict[str, Any]:
+    """One shown pick's runtime/cast/genre-names/availability, fetched
+    concurrently, then merged by _merge_enrichment.
+
+    Plain asyncio.gather, not gather_all: these two calls return different
+    types (TitleDetails | None, WatchAvailability | None) that gather_all's
+    single TypeVar can't unify; _safe already narrows both calls' exception
+    surface to TMDBError, so gather_all's sibling-task protection has little
+    left to guard here."""
+    details, availability = await asyncio.gather(
+        _safe_details(client, title),
+        _safe_availability(client, title["media_type"], title["tmdb_id"], watch_region),
+    )
+    return _merge_enrichment(title, details, availability, wanted, blurb)
+
+
+async def _safe_title_with_details(
+    client: TMDBClient, media_type: MediaType, tmdb_id: int
+) -> tuple[Title, TitleDetails] | None:
+    """title_with_details(), degraded to None on TMDBError — same _safe
+    ethos as _safe_details/_safe_availability. A clean 404
+    (title_with_details() returning None because TMDB has no page for this
+    id) and a transient TMDBError/TMDBUnavailable both collapse to this same
+    None: the caller (enrich_known_title) can't tell "gone" from "TMDB is
+    down" from this alone, and per TASKS.md's "degrade rather than fail
+    wherever there is stored data," doesn't need to — either way the saved
+    title still has to show up with a way to remove it, not vanish."""
+    return await _safe(
+        client.title_with_details(media_type=media_type, tmdb_id=tmdb_id),
+        tmdb_id=tmdb_id,
+        what="title_with_details",
+    )
+
+
+# enrich_known_title's placeholder for a title whose base lookup failed or
+# no longer resolves — every key a resolved pick has (empty/null values),
+# so the caller (and its tests) has one shared source of truth rather than
+# a second hand-typed copy of the enriched-pick shape. See that function's
+# docstring for why the key set must match exactly.
+_UNAVAILABLE_PLACEHOLDER: dict[str, Any] = {
+    "title": "",
+    "year": None,
+    "overview": "",
+    "poster_url": None,
+    "vote_average": 0.0,
+    "vote_count": 0,
+    "genre_ids": [],
+    "genre_names": [],
+    "runtime_minutes": None,
+    "cast": [],
+    "available_on": None,
+    "blurb": "",
+    "unavailable": True,
+}
+
+
+async def enrich_known_title(
+    client: TMDBClient,
+    watch_region: str,
+    wanted: set[int],
+    media_type: MediaType,
+    tmdb_id: int,
+) -> dict[str, Any]:
+    """The by-id counterpart to _enrich_pick, for a title_verdicts row
+    (TASKS.md T18.5) rather than a discover()/rank() candidate — no
+    interpret_model/rank_model, no LLM call, just TMDB lookups run fresh
+    every time.
+
+    Never raises and never returns None: title_verdicts is stored data, so
+    a saved title always appears in the result (TASKS.md's cross-cutting
+    "degrade rather than fail wherever there is stored data" rule) — when
+    the base lookup fails or the id no longer resolves on TMDB, the result
+    still carries every key a resolved pick does (_UNAVAILABLE_PLACEHOLDER),
+    enough for the caller to render a minimal row with a working remove
+    action instead of losing the row silently. Same key set either way, on
+    purpose: services/gateway/chat.go's agentPick and web/lib/chat-socket.ts's
+    AgentPick declare genre_ids/genre_names/cast as plain (non-nullable)
+    arrays — a sparse dict missing those keys would decode as Go nil slices
+    and re-marshal as JSON null, breaking that contract for a case nothing
+    downstream is built to expect."""
+    result, availability = await asyncio.gather(
+        _safe_title_with_details(client, media_type, tmdb_id),
+        _safe_availability(client, media_type, tmdb_id, watch_region),
+    )
+    if result is None:
+        return {
+            "tmdb_id": tmdb_id,
+            "media_type": media_type,
+            **_UNAVAILABLE_PLACEHOLDER,
+        }
+    title, details = result
+    return {
+        **_merge_enrichment(title, details, availability, wanted, blurb=""),
+        "unavailable": False,
+    }
+
+
+class TitleRef(BaseModel):
+    """One title_verdicts row's identity — the /titles request's per-item
+    shape (TASKS.md T18.5)."""
+
+    tmdb_id: int
+    media_type: MediaType
+
+
+class TitlesRequest(BaseModel):
+    """POST /titles' request body — a caller-supplied list of already-known
+    ids to enrich, plus the real user context every catalog call needs
+    (CLAUDE.md: "every catalog query carries watch_region")."""
+
+    watch_region: str
+    watch_providers: list[int] = Field(default_factory=list)
+    items: list[TitleRef]
+
+
+async def enrich_watchlist(
+    client: TMDBClient,
+    *,
+    watch_region: str,
+    watch_providers: list[int],
+    items: list[TitleRef],
+) -> list[dict[str, Any]]:
+    """Batched enrich_known_title, one item per gather_all task — same
+    concurrent fan-out idiom search() uses per pick (TASKS.md T18.5's read
+    path). Unlike search(), never short-circuits on empty watch_providers: a
+    saved title with no ticked services still needs "Not on your services"
+    to render as live truth, which is different information than "nothing
+    to search for." enrich_known_title never raises, so a single item's
+    TMDB trouble can't take the whole batch down through gather_all."""
+    wanted = set(watch_providers)
+    return await gather_all(
+        *(
+            enrich_known_title(client, watch_region, wanted, i.media_type, i.tmdb_id)
+            for i in items
+        )
+    )
 
 
 async def search(

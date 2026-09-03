@@ -217,7 +217,7 @@ export function TitleCard({
             {cast.join(", ")}
           </p>
         )}
-        <p className="text-sm">{pick.blurb}</p>
+        {pick.blurb && <p className="text-sm">{pick.blurb}</p>}
         <Availability availableOn={pick.available_on} />
         {error && <p className="text-xs text-destructive">{error}</p>}
       </CardContent>

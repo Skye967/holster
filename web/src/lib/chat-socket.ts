@@ -41,6 +41,10 @@ export interface AgentPick {
   // Must render differently: null means "unknown," not "not here."
   available_on: AgentProvider[] | null
   blurb: string
+  // True only for a watchlist row (TASKS.md T18.5) whose TMDB lookup failed
+  // or the id no longer resolves — every other field is then a zero value,
+  // not real data. Absent (falsy) on every /chat pick.
+  unavailable?: boolean
 }
 
 // The gateway's curated event vocabulary (outboundEvent in chat.go) — every

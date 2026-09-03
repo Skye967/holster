@@ -39,6 +39,7 @@ func newProvidersTestServer(t *testing.T,
 		loadChatCtx, noopAgentCaller, t.Context(),
 		loadProviders, saveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
+		noopLoadWatchlistItems, noopCallAgentTitles,
 	)
 	if err != nil {
 		t.Fatal(err)

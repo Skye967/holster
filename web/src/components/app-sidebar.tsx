@@ -1,6 +1,6 @@
 "use client"
 
-import { MessageSquare, Plug } from "lucide-react"
+import { Bookmark, MessageSquare, Plug } from "lucide-react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 
@@ -18,6 +18,7 @@ import {
 
 const nav = [
   { title: "Chat", href: "/chat", icon: MessageSquare },
+  { title: "Watchlist", href: "/watchlist", icon: Bookmark },
   { title: "Connections", href: "/connections", icon: Plug },
 ]
 

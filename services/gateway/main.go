@@ -132,6 +132,12 @@ type Handler struct {
 	// injected the same way as loadProviders/saveSubscription above.
 	loadVerdicts func(ctx context.Context, userID string) ([]Verdict, error)
 	saveVerdict  func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error
+
+	// watchlist.go (T18.5): the caller's want_to_watch rows and the agent
+	// call that enriches them, injected the same way as loadVerdicts/
+	// callAgent above.
+	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error)
+	callAgentTitles    agentTitlesCaller
 }
 
 // newHandler guards the keyfunc and rejects an empty origin allowlist, which
@@ -145,6 +151,8 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	saveSubscription func(ctx context.Context, userID string, providerID int, subscribed bool) error,
 	loadVerdicts func(ctx context.Context, userID string) ([]Verdict, error),
 	saveVerdict func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error,
+	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error),
+	callAgentTitles agentTitlesCaller,
 ) (*Handler, error) {
 
 	if len(parties) == 0 {
@@ -177,6 +185,12 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	if saveVerdict == nil {
 		return nil, errors.New("no verdict writer configured")
 	}
+	if loadWatchlistItems == nil {
+		return nil, errors.New("no watchlist loader configured")
+	}
+	if callAgentTitles == nil {
+		return nil, errors.New("no watchlist agent caller configured")
+	}
 
 	origins := make([]string, 0, len(parties))
 	for p := range parties {
@@ -184,20 +198,22 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	}
 
 	return &Handler{
-		keyfunc:          requireKID(kf),
-		issuer:           issuer,
-		audience:         audience,
-		parties:          parties,
-		ensureUser:       ensureUser,
-		loadChatCtx:      loadChatCtx,
-		callAgent:        callAgent,
-		tickets:          newChatTicketStore(),
-		originPatterns:   origins,
-		rootCtx:          rootCtx,
-		loadProviders:    loadProviders,
-		saveSubscription: saveSubscription,
-		loadVerdicts:     loadVerdicts,
-		saveVerdict:      saveVerdict,
+		keyfunc:            requireKID(kf),
+		issuer:             issuer,
+		audience:           audience,
+		parties:            parties,
+		ensureUser:         ensureUser,
+		loadChatCtx:        loadChatCtx,
+		callAgent:          callAgent,
+		tickets:            newChatTicketStore(),
+		originPatterns:     origins,
+		rootCtx:            rootCtx,
+		loadProviders:      loadProviders,
+		saveSubscription:   saveSubscription,
+		loadVerdicts:       loadVerdicts,
+		saveVerdict:        saveVerdict,
+		loadWatchlistItems: loadWatchlistItems,
+		callAgentTitles:    callAgentTitles,
 	}, nil
 }
 
@@ -467,6 +483,7 @@ func (h *Handler) routes() http.Handler {
 	register("GET /api/verdicts", h.verdicts)
 	register("PUT /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
 	register("DELETE /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
+	register("GET /api/watchlist", h.watchlist)
 
 	allowMethods := make([]string, 0, len(methods))
 	for m := range methods {
@@ -598,7 +615,8 @@ func main() {
 	h, err := newHandler(jwks.Keyfunc, issuer, audience, parties, upsertUser(db),
 		loadChatContext(db), newAgentCaller(agentClient, agentURL), ctx,
 		loadProviders(db, newAgentProviderCaller(agentClient, agentURL)), saveSubscription(db),
-		loadVerdicts(db), saveVerdict(db))
+		loadVerdicts(db), saveVerdict(db),
+		loadWatchlistItems(db), newAgentTitlesCaller(agentClient, agentURL))
 	if err != nil {
 		log.Fatalf("handler: %v", err)
 	}

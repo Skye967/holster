@@ -28,8 +28,10 @@ from catalog_tool import (
     DEFAULT_MODEL,
     Interpreter,
     Ranker,
+    TitlesRequest,
     anthropic_interpreter,
     anthropic_ranker,
+    enrich_watchlist,
 )
 from chat import ChatRequest, stream_chat
 from tmdb import RegionProvider, TMDBClient
@@ -223,6 +225,23 @@ async def providers(
     what the gateway's refresh treats as "agent call failed, serve stale."
     """
     return await tmdb_client.watch_provider_list(watch_region=region)
+
+
+@app.post("/titles")
+async def titles(
+    req: TitlesRequest, tmdb_client: TMDBClient = Depends(get_tmdb_client)
+) -> list[dict[str, Any]]:
+    """Batched enrichment for already-known tmdb_ids — the watchlist's read
+    path (TASKS.md T18.5). No LLM call: the ids are already known, so
+    there's nothing to interpret or rank, only TMDB lookups re-run fresh on
+    every call. Internal only, like /chat and /providers.
+    """
+    return await enrich_watchlist(
+        tmdb_client,
+        watch_region=req.watch_region,
+        watch_providers=req.watch_providers,
+        items=req.items,
+    )
 
 
 if __name__ == "__main__":

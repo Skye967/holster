@@ -256,6 +256,92 @@ def test_title_details_bad_media_type_rejected() -> None:
         run(FakeTMDB().client().title_details(media_type="film", tmdb_id=1))  # type: ignore[arg-type]
 
 
+def test_title_with_details_one_call_returns_title_and_details() -> None:
+    fake = FakeTMDB()
+    fake.ok(
+        "/movie/101",
+        {
+            "id": 101,
+            "title": "Fake Heist",
+            "release_date": "2020-01-01",
+            "overview": "A heist movie.",
+            "poster_path": "/poster.jpg",
+            "vote_average": 7.5,
+            "vote_count": 500,
+            "genres": [{"id": 80, "name": "Crime"}, {"id": 28, "name": "Action"}],
+            "runtime": 128,
+            "credits": {"cast": [{"name": "Star", "order": 0}]},
+        },
+    )
+
+    result = run(fake.client().title_with_details(media_type="movie", tmdb_id=101))
+
+    assert result is not None
+    title, details = result
+    assert title == {
+        "tmdb_id": 101,
+        "media_type": "movie",
+        "title": "Fake Heist",
+        "year": 2020,
+        "overview": "A heist movie.",
+        "poster_url": "https://image.tmdb.org/t/p/w342/poster.jpg",
+        "vote_average": 7.5,
+        "vote_count": 500,
+        "genre_ids": [80, 28],
+    }
+    assert details == {"runtime_minutes": 128, "cast": ["Star"]}
+    assert fake.count("/movie/101") == 1
+
+
+def test_title_with_details_writes_title_details_cache() -> None:
+    fake = FakeTMDB()
+    fake.ok(
+        "/movie/101",
+        {"id": 101, "release_date": "2020-01-01", "runtime": 128, "credits": {}},
+    )
+
+    client = fake.client()
+    run(client.title_with_details(media_type="movie", tmdb_id=101))
+    details = run(client.title_details(media_type="movie", tmdb_id=101))
+
+    assert details == {"runtime_minutes": 128, "cast": []}
+    # title_with_details already fetched and cached this id's details; the
+    # later title_details() call must be a cache hit, not a second request.
+    assert fake.count("/movie/101") == 1
+
+
+def test_title_with_details_404_returns_none() -> None:
+    fake = FakeTMDB()
+    fake.queue("/movie/1", httpx2.Response(404, json={"success": False}))
+
+    result = run(fake.client().title_with_details(media_type="movie", tmdb_id=1))
+
+    assert result is None
+
+
+def test_title_with_details_never_caches_the_title_half() -> None:
+    # Base title fields (vote_average etc.) are live TMDB data, unlike
+    # runtime/cast — a second call must hit the network again, not reuse a
+    # stale rating.
+    fake = FakeTMDB()
+    fake.ok(
+        "/movie/101",
+        {"id": 101, "release_date": "2020-01-01", "vote_average": 7.0, "credits": {}},
+    )
+    fake.ok(
+        "/movie/101",
+        {"id": 101, "release_date": "2020-01-01", "vote_average": 9.0, "credits": {}},
+    )
+
+    client = fake.client()
+    first = run(client.title_with_details(media_type="movie", tmdb_id=101))
+    second = run(client.title_with_details(media_type="movie", tmdb_id=101))
+
+    assert first is not None and first[0]["vote_average"] == 7.0
+    assert second is not None and second[0]["vote_average"] == 9.0
+    assert fake.count("/movie/101") == 2
+
+
 def test_genre_names_resolves_movie_and_tv_ids() -> None:
     assert tmdb.genre_names("movie", [80, 878]) == ["Crime", "Science Fiction"]
     assert tmdb.genre_names("tv", [10759]) == ["Action & Adventure"]
