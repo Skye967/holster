@@ -69,6 +69,15 @@ streaming_providers      cache of TMDB's watch-provider list, one row per countr
                                             --   logo_path, display_priority}]
   fetched_at             timestamptz        -- lazy-refreshed past 24h (T15)
 
+title_verdicts           one row per user per title
+  user_id                text references users(id) on delete cascade
+  tmdb_id                integer            -- unique only within a media_type
+  media_type             text               -- 'movie' | 'tv'
+  verdict                text               -- liked | disliked | seen |
+                                            -- not_interested | want_to_watch
+  created_at             timestamptz
+  primary key (user_id, tmdb_id, media_type)
+
 conversations
   id                     uuid primary key
   user_id                text references users(id) on delete cascade
