@@ -694,6 +694,11 @@ type agentPick struct {
 	// plain slice, so no extra type (e.g. a pointer) is needed here.
 	AvailableOn []agentProvider `json:"available_on"`
 	Blurb       string          `json:"blurb"`
+	// True only for a watchlist row (TASKS.md T18.5) whose TMDB lookup
+	// failed or the id no longer resolves — every other field on such a
+	// row is then a Go zero value, not real data. Absent (false) on every
+	// /chat pick.
+	Unavailable bool `json:"unavailable,omitempty"`
 }
 
 // agentProvider mirrors one entry of tmdb.py's Provider TypedDict, as used in

@@ -348,6 +348,7 @@ func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chat
 		loadCtx, callAgent, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
+		noopLoadWatchlistItems, noopCallAgentTitles,
 	)
 	if err != nil {
 		t.Fatal(err)

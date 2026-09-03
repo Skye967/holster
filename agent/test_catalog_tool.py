@@ -18,10 +18,14 @@ import pytest
 
 import tmdb
 from catalog_tool import (
+    _UNAVAILABLE_PLACEHOLDER,
     CatalogToolError,
     DiscoverIntent,
     RankedPick,
     RankResult,
+    TitleRef,
+    enrich_known_title,
+    enrich_watchlist,
     interpret,
     rank,
     search,
@@ -638,3 +642,139 @@ def test_search_enrichment_failure_for_one_title_degrades_not_fails(
     # from TMDB confirming this title streams nowhere the caller subscribes.
     assert by_id[101]["available_on"] is None
     assert by_id[202]["runtime_minutes"] == 90
+
+
+def test_enrich_known_title_returns_full_row_with_no_blurb() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok(
+        "/movie/101",
+        {
+            "id": 101,
+            "title": "Fake Heist",
+            "release_date": "2020-01-01",
+            "overview": "A heist movie.",
+            "vote_average": 7.5,
+            "vote_count": 500,
+            "genres": [{"id": 80, "name": "Crime"}],
+            "runtime": 128,
+            "credits": {"cast": [{"name": "Star", "order": 0}]},
+        },
+    )
+    fake_tmdb.ok(
+        "/movie/101/watch/providers",
+        {
+            "results": {
+                "US": {
+                    "flatrate": [
+                        {
+                            "provider_id": 8,
+                            "provider_name": "Netflix",
+                            "logo_path": None,
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    pick = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+
+    assert pick["tmdb_id"] == 101
+    assert pick["title"] == "Fake Heist"
+    assert pick["genre_names"] == ["Crime"]
+    assert pick["runtime_minutes"] == 128
+    assert pick["cast"] == ["Star"]
+    assert pick["available_on"] == [
+        {"provider_id": 8, "provider_name": "Netflix", "logo_url": None}
+    ]
+    assert pick["blurb"] == ""
+    assert pick["unavailable"] is False
+
+
+def test_enrich_known_title_degrades_to_unavailable_on_tmdb_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tmdb, "_sleep", AsyncMock())
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.queue("/movie/101", *[httpx2.Response(503) for _ in range(3)])
+    fake_tmdb.queue(
+        "/movie/101/watch/providers", *[httpx2.Response(503) for _ in range(3)]
+    )
+
+    pick = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+
+    assert pick == {
+        "tmdb_id": 101,
+        "media_type": "movie",
+        **_UNAVAILABLE_PLACEHOLDER,
+    }
+
+
+def test_enrich_known_title_gone_from_tmdb_is_also_unavailable() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.queue("/movie/101", httpx2.Response(404, json={"success": False}))
+
+    pick = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+
+    assert pick == {
+        "tmdb_id": 101,
+        "media_type": "movie",
+        **_UNAVAILABLE_PLACEHOLDER,
+    }
+
+
+def test_enrich_watchlist_one_items_failure_does_not_drop_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tmdb, "_sleep", AsyncMock())
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.queue("/movie/101", *[httpx2.Response(503) for _ in range(3)])
+    fake_tmdb.queue(
+        "/movie/101/watch/providers", *[httpx2.Response(503) for _ in range(3)]
+    )
+    fake_tmdb.ok(
+        "/movie/202",
+        {"id": 202, "release_date": "2019-01-01", "runtime": 90, "credits": {}},
+    )
+
+    picks = run(
+        enrich_watchlist(
+            fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            items=[
+                TitleRef(tmdb_id=101, media_type="movie"),
+                TitleRef(tmdb_id=202, media_type="movie"),
+            ],
+        )
+    )
+
+    by_id = {p["tmdb_id"]: p for p in picks}
+    assert by_id[101]["unavailable"] is True
+    assert by_id[202]["unavailable"] is False
+    assert by_id[202]["runtime_minutes"] == 90
+
+
+def test_enrich_watchlist_does_not_short_circuit_on_empty_providers() -> None:
+    # Unlike search(), a saved title with no ticked services must still be
+    # enriched — "Not on your services" is live truth here, not a reason to
+    # skip the lookup.
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok(
+        "/movie/101",
+        {"id": 101, "release_date": "2020-01-01", "runtime": 100, "credits": {}},
+    )
+    fake_tmdb.ok("/movie/101/watch/providers", {"results": {}})
+
+    picks = run(
+        enrich_watchlist(
+            fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[],
+            items=[TitleRef(tmdb_id=101, media_type="movie")],
+        )
+    )
+
+    [pick] = picks
+    assert pick["unavailable"] is False
+    assert pick["available_on"] == []

@@ -8,16 +8,20 @@ import {
 // Mirrors services/gateway/verdicts.go's Verdict — field names must match its
 // JSON tags exactly.
 export type Verdict =
-  | "liked"
-  | "disliked"
-  | "seen"
-  | "not_interested"
-  | "want_to_watch"
+  "liked" | "disliked" | "seen" | "not_interested" | "want_to_watch"
 
 export interface VerdictEntry {
   tmdb_id: number
   media_type: "movie" | "tv"
   verdict: Verdict
+}
+
+// One verdict map entry per title, not per media type + id pair as two
+// separate keys — matches title_verdicts' composite primary key, and lets a
+// title repeated across turns (e.g. "show me more" re-showing a result), or
+// shown on both chat and the watchlist, share the same entry.
+export function verdictKey(tmdbId: number, mediaType: "movie" | "tv"): string {
+  return `${mediaType}:${tmdbId}`
 }
 
 // Thrown when the gateway 409s a verdict write (verdicts.go's errVerdictLocked
@@ -29,7 +33,9 @@ export class VerdictLockedError extends Error {}
 
 // One round trip for the caller's whole verdict set, so chat-panel.tsx can
 // hydrate every title card's saved/judged state without a request per card.
-export async function fetchVerdicts(getToken: GetToken): Promise<VerdictEntry[]> {
+export async function fetchVerdicts(
+  getToken: GetToken,
+): Promise<VerdictEntry[]> {
   const res = await withTimeout(
     gatewayFetch(
       "/api/verdicts",

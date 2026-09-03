@@ -243,6 +243,25 @@ def _trim_title(raw: dict[str, Any], media_type: MediaType) -> Title:
     )
 
 
+def _trim_title_from_full(raw: dict[str, Any], media_type: MediaType) -> Title:
+    """Same shape as _trim_title, for the single-title endpoint's raw
+    response rather than discover()/search_titles()'s list shape -- genres
+    arrive as [{"id","name"}] objects here, not a flat genre_ids list."""
+    date_key = "release_date" if media_type == "movie" else "first_air_date"
+    date = raw.get(date_key)
+    return Title(
+        tmdb_id=raw["id"],
+        media_type=media_type,
+        title=raw.get("title") or raw.get("name") or "",
+        year=_year(date),
+        overview=raw.get("overview") or "",
+        poster_url=_image_url(raw.get("poster_path"), POSTER_SIZE),
+        vote_average=float(raw.get("vote_average") or 0.0),
+        vote_count=int(raw.get("vote_count") or 0),
+        genre_ids=[g["id"] for g in raw.get("genres") or []],
+    )
+
+
 def _trim_details(raw: dict[str, Any], media_type: MediaType) -> TitleDetails:
     if media_type == "movie":
         runtime = raw.get("runtime")
@@ -593,6 +612,39 @@ class TMDBClient:
         details = _trim_details(data, media_type) if data else None
         self._title_details[key] = details
         return details
+
+    async def title_with_details(
+        self, *, media_type: MediaType, tmdb_id: int
+    ) -> tuple[Title, TitleDetails] | None:
+        """Base title fields plus runtime/cast for an already-known id, via
+        the same append_to_response=credits call title_details() makes --
+        one HTTP request for both, not two. Unlike title_details(), always
+        hits the network: title/year/vote_average/overview are live TMDB
+        fields, not immutable metadata like runtime/cast, so caching them
+        here would serve a stale rating as current -- the same class of bug
+        "re-check availability at read time" (TASKS.md T18.5) exists to
+        prevent, just applied to a rating instead of a service list. The
+        runtime/cast half is still written into title_details()'s own
+        cache, so a later title_details() call for this id is a cache hit,
+        same as if discover() had produced this title first.
+
+        Returns None when TMDB has no page for this id (the title was
+        removed). Raises TMDBError/TMDBUnavailable like every other method
+        here -- this does not self-degrade; see catalog_tool.py's _safe
+        wrapper for the caller that wants "missing data, don't fail" instead.
+        """
+        _validate_media_type(media_type)
+        data = await self._get(
+            f"/{media_type}/{int(tmdb_id)}",
+            {"language": LANGUAGE, "append_to_response": "credits"},
+            allow_404=True,
+        )
+        if not data:
+            return None
+        title = _trim_title_from_full(data, media_type)
+        details = _trim_details(data, media_type)
+        self._title_details[(media_type, int(tmdb_id))] = details
+        return title, details
 
     async def watch_providers(
         self, *, media_type: MediaType, tmdb_id: int, watch_region: str

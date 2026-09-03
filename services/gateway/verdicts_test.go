@@ -38,6 +38,7 @@ func newVerdictsTestServer(t *testing.T,
 		noopChatCtx, noopAgentCaller, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
 		loadVerdicts, saveVerdict,
+		noopLoadWatchlistItems, noopCallAgentTitles,
 	)
 	if err != nil {
 		t.Fatal(err)

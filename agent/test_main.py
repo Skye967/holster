@@ -159,6 +159,46 @@ async def _must_not_be_called(*_args: Any, **_kwargs: Any) -> Any:
     raise AssertionError("should not run — body validation must reject first")
 
 
+# --- /titles ---------------------------------------------------------------
+#
+# The watchlist's read path (TASKS.md T18.5). No LLM dependency — same seam
+# shape as /providers, just POST with a body of already-known ids.
+
+
+def test_titles_enriches_known_ids() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok(
+        "/movie/101",
+        {"id": 101, "title": "Fake Heist", "release_date": "2020-01-01", "credits": {}},
+    )
+    fake_tmdb.ok("/movie/101/watch/providers", {"results": {}})
+    app.dependency_overrides[get_tmdb_client] = fake_tmdb.client
+
+    resp = client.post(
+        "/titles",
+        json={
+            "watch_region": "US",
+            "watch_providers": [8],
+            "items": [{"tmdb_id": 101, "media_type": "movie"}],
+        },
+    )
+
+    assert resp.status_code == 200
+    [pick] = resp.json()
+    assert pick["tmdb_id"] == 101
+    assert pick["title"] == "Fake Heist"
+    assert pick["blurb"] == ""
+    assert pick["unavailable"] is False
+
+
+def test_titles_requires_items() -> None:
+    app.dependency_overrides[get_tmdb_client] = FakeTMDB().client
+
+    resp = client.post("/titles", json={"watch_region": "US"})
+
+    assert resp.status_code == 422
+
+
 async def _run_lifespan(test_app: FastAPI) -> None:
     async with lifespan(test_app):
         pass

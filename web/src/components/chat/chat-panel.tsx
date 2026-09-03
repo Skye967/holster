@@ -22,6 +22,7 @@ import {
 import {
   VerdictLockedError,
   fetchVerdicts,
+  verdictKey,
   type Verdict,
 } from "@/lib/verdicts"
 
@@ -32,14 +33,6 @@ interface Turn {
   picks?: AgentPick[]
   tokenText?: string
   error?: string
-}
-
-// One verdict map entry per title, not per media type + id pair as two
-// separate keys — matches title_verdicts' composite primary key, and lets a
-// title repeated across turns (e.g. "show me more" re-showing a result)
-// share the same entry (see title-card.tsx's own comment on this).
-function verdictKey(tmdbId: number, mediaType: "movie" | "tv"): string {
-  return `${mediaType}:${tmdbId}`
 }
 
 interface VerdictRowStatus {
