@@ -299,6 +299,41 @@ def test_search_short_circuits_on_empty_watch_providers() -> None:
     assert fake_tmdb.requests == []
 
 
+def test_search_short_circuits_on_capability_question() -> None:
+    fake_tmdb = FakeTMDB()
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(is_capability_question=True)
+
+    async def rank_must_not_run(message: str, candidates: list[Title]) -> RankResult:
+        raise AssertionError("rank must not run on a capability question")
+
+    on_intent_calls: list[DiscoverIntent] = []
+
+    async def on_intent(intent: DiscoverIntent) -> None:
+        on_intent_calls.append(intent)
+
+    result = run(
+        search(
+            "what can you do?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run,
+            on_intent=on_intent,
+        )
+    )
+
+    assert result.intent is not None
+    assert result.intent.is_capability_question
+    assert result.picks == []
+    assert result.relaxed == []
+    # No "interpreting" line for a question that isn't a search.
+    assert on_intent_calls == []
+    assert fake_tmdb.requests == []
+
+
 # --- relaxation ladder -----------------------------------------------------
 
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -463,6 +464,37 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 	// JSON with the right keys — this just confirms they still reach the
 	// browser once decoded.
 	assertPickEnrichment(t, got[1].Picks[0])
+}
+
+// TestChatTurnSendsProviderNamesToTheAgent proves runTurn forwards
+// chatContext.ProviderNames on to the agent (TASKS.md T16.5) — the same
+// values TestChatTurnStreamsInterpretingResultsAndDone above already proves
+// reach interpretingLine, reused rather than re-resolved so a
+// capability-question answer can name the caller's services.
+func TestChatTurnSendsProviderNamesToTheAgent(t *testing.T) {
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8}, ProviderNames: []string{"Netflix", "Hulu"}}, nil
+	}
+	var got agentChatRequest
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		got = req
+		events := make(chan agentEvent, 1)
+		events <- agentEvent{Type: "done"}
+		close(events)
+		return events, nil
+	}
+	srv, token := newChatTestServer(t, loadCtx, callAgent)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "what can you do?"})
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if want := []string{"Netflix", "Hulu"}; !slices.Equal(got.WatchProviderNames, want) {
+		t.Errorf("WatchProviderNames = %v, want %v", got.WatchProviderNames, want)
+	}
 }
 
 func TestChatErrorReasonBecomesFriendlyText(t *testing.T) {

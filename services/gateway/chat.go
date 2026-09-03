@@ -392,10 +392,11 @@ func (h *Handler) runTurn(
 	}
 
 	events, err := h.callAgent(turnCtx, agentChatRequest{
-		Message:        text,
-		WatchRegion:    chatCtx.Region,
-		WatchProviders: chatCtx.Providers,
-		History:        windowHistory(history),
+		Message:            text,
+		WatchRegion:        chatCtx.Region,
+		WatchProviders:     chatCtx.Providers,
+		WatchProviderNames: chatCtx.ProviderNames,
+		History:            windowHistory(history),
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -629,14 +630,19 @@ func loadChatContext(db *pgxpool.Pool) func(ctx context.Context, userID string) 
 // --- Calling the agent -------------------------------------------------------
 
 // agentChatRequest is agent/chat.py's ChatRequest — field names must match
-// its JSON aliases exactly. omitempty on the two slices matters: Pydantic's
+// its JSON aliases exactly. omitempty on the slices matters: Pydantic's
 // list fields default via default_factory=list and reject an explicit null,
 // so an empty slice must be an absent key, not `null`.
 type agentChatRequest struct {
-	Message        string        `json:"message"`
-	WatchRegion    string        `json:"watch_region"`
-	WatchProviders []int         `json:"watch_providers,omitempty"`
-	History        []historyTurn `json:"history,omitempty"`
+	Message        string `json:"message"`
+	WatchRegion    string `json:"watch_region"`
+	WatchProviders []int  `json:"watch_providers,omitempty"`
+	// Same values as chatContext.ProviderNames, already resolved for
+	// interpretingLine below — reused here so a capability-question answer
+	// (TASKS.md T16.5) can name the caller's services without the agent
+	// needing its own TMDB lookup.
+	WatchProviderNames []string      `json:"watch_provider_names,omitempty"`
+	History            []historyTurn `json:"history,omitempty"`
 }
 
 // agentIntent mirrors DiscoverIntent.model_dump(exclude_none=True) — see

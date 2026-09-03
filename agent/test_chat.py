@@ -46,6 +46,65 @@ def test_no_providers_short_circuits_with_a_message() -> None:
     assert fake_tmdb.requests == []
 
 
+def test_capability_question_short_circuits_with_a_message() -> None:
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="what can you do?",
+        watch_region="US",
+        watch_providers=[8],
+        watch_provider_names=["Netflix", "Hulu"],
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(is_capability_question=True)
+
+    async def rank_must_not_run(message: str, candidates: list[Title]) -> RankResult:
+        raise AssertionError("rank must not run on a capability question")
+
+    events = asyncio.run(
+        _collect(req, fake_tmdb.client(), fake_interpret, rank_must_not_run)
+    )
+
+    # No "intent" event either — on_intent never fires for a capability
+    # question (catalog_tool.py's search()), so there is nothing to
+    # translate into an interpreting line.
+    assert [e["type"] for e in events] == ["message", "done"]
+    # "Netflix and Hulu", not "Netflix, Hulu" — matches services/gateway/
+    # chat.go's humanJoin, used for the same provider list elsewhere in the
+    # same conversation (the interpreting line).
+    assert "Netflix and Hulu" in events[0]["text"]
+    assert fake_tmdb.requests == []
+
+
+def test_capability_question_degrades_gracefully_with_uncached_provider_names() -> (
+    None
+):
+    """watch_providers non-empty but watch_provider_names empty is a real,
+    reachable state (loadChatContext's per-country name cache hasn't warmed
+    up yet — see chat.go) — must not be misread as "no services picked"."""
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="what can you do?",
+        watch_region="US",
+        watch_providers=[8],
+        watch_provider_names=[],
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(is_capability_question=True)
+
+    async def rank_must_not_run(message: str, candidates: list[Title]) -> RankResult:
+        raise AssertionError("rank must not run on a capability question")
+
+    events = asyncio.run(
+        _collect(req, fake_tmdb.client(), fake_interpret, rank_must_not_run)
+    )
+
+    assert [e["type"] for e in events] == ["message", "done"]
+    assert "Connections" not in events[0]["text"]
+    assert "haven't picked" not in events[0]["text"]
+
+
 def test_successful_search_emits_intent_then_results_then_done() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
@@ -118,8 +177,9 @@ def test_no_candidates_after_ladder_emits_a_message_naming_what_was_relaxed() ->
     )
 
     assert [e["type"] for e in events] == ["intent", "message", "done"]
-    assert "how long" in events[1]["text"]
-    assert "the mood" in events[1]["text"]
+    # "how long and the mood", not "how long, the mood" — _human_join, same
+    # as the capability answer's provider-name grammar.
+    assert "how long and the mood" in events[1]["text"]
 
 
 def test_tmdb_unavailable_maps_to_a_closed_reason(
