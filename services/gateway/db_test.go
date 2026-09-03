@@ -601,3 +601,96 @@ func TestGatewayRoleDeniesWithoutUserContext(t *testing.T) {
 		}
 	})
 }
+
+// saveVerdict (verdicts.go, T18): want_to_watch is fully mutable and the only
+// value a judgment may still be set from; once one of the four judgments is
+// set, the row is locked — title_verdicts' migration comment
+// (20260903002450_verdicts.sql) states those "never change." A fake-backed
+// unit test (verdicts_test.go) covers the HTTP layer; only a real database
+// proves the WHERE-guarded upsert's SQL and its RowsAffected-based lock
+// detection actually work, the same reason TestSaveSubscription and
+// TestUpsertUser run against testPool rather than a fake.
+func TestSaveVerdictLocksJudgments(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveVerdict(pool)
+
+	const id = "verdict_write_test"
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool.Exec(c, `delete from users where id = $1`, id)
+	})
+	if _, err := pool.Exec(ctx,
+		`insert into users (id, email) values ($1, $2) on conflict (id) do nothing`,
+		id, id+"@example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	current := func() (string, bool) {
+		var v string
+		err := pool.QueryRow(ctx,
+			`select verdict from title_verdicts where user_id = $1 and tmdb_id = 550 and media_type = 'movie'`,
+			id).Scan(&v)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false
+		}
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		return v, true
+	}
+	strPtr := func(s string) *string { return &s }
+
+	// want_to_watch is freely settable from nothing, and the expected
+	// transition into a judgment succeeds (T17: "expected to become seen
+	// later").
+	if err := save(ctx, id, 550, "movie", strPtr("want_to_watch")); err != nil {
+		t.Fatalf("set want_to_watch: %v", err)
+	}
+	if v, ok := current(); !ok || v != "want_to_watch" {
+		t.Fatalf("current = %q, %v; want want_to_watch", v, ok)
+	}
+	if err := save(ctx, id, 550, "movie", strPtr("seen")); err != nil {
+		t.Fatalf("want_to_watch -> seen: %v", err)
+	}
+	if v, ok := current(); !ok || v != "seen" {
+		t.Fatalf("current = %q, %v; want seen", v, ok)
+	}
+
+	// Once "seen" (a judgment), re-setting the same value is an idempotent
+	// no-op, but changing to a different judgment or back to want_to_watch is
+	// rejected.
+	if err := save(ctx, id, 550, "movie", strPtr("seen")); err != nil {
+		t.Errorf("idempotent re-set of the same judgment: %v", err)
+	}
+	if err := save(ctx, id, 550, "movie", strPtr("liked")); !errors.Is(err, errVerdictLocked) {
+		t.Errorf("seen -> liked: err = %v, want errVerdictLocked", err)
+	}
+	if err := save(ctx, id, 550, "movie", strPtr("want_to_watch")); !errors.Is(err, errVerdictLocked) {
+		t.Errorf("seen -> want_to_watch: err = %v, want errVerdictLocked", err)
+	}
+	if v, ok := current(); !ok || v != "seen" {
+		t.Errorf("current = %q, %v after rejected writes; want unchanged seen", v, ok)
+	}
+
+	// A locked judgment isn't deletable either — the clear (nil verdict) is a
+	// no-op, not an error, matching setSubscription's idempotent DELETE.
+	if err := save(ctx, id, 550, "movie", nil); err != nil {
+		t.Errorf("clear on a locked judgment: %v", err)
+	}
+	if v, ok := current(); !ok || v != "seen" {
+		t.Errorf("current = %q, %v after clear on a locked judgment; want unchanged seen", v, ok)
+	}
+
+	// A fresh title (no row yet) can be judged directly, no want_to_watch
+	// detour required.
+	if err := save(ctx, id, 551, "movie", strPtr("disliked")); err != nil {
+		t.Fatalf("fresh judgment: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`select verdict from title_verdicts where user_id = $1 and tmdb_id = 551 and media_type = 'movie'`,
+		id).Scan(new(string)); err != nil {
+		t.Errorf("fresh judgment row missing: %v", err)
+	}
+}

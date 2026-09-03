@@ -1,5 +1,6 @@
 "use client"
 
+import { useAuth } from "@clerk/nextjs"
 import { Send } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 
@@ -11,6 +12,18 @@ import {
   type ChatEvent,
   useChatSocket,
 } from "@/lib/chat-socket"
+import {
+  GATEWAY_CALL_TIMEOUT_MS,
+  GatewaySessionExpiredError,
+  SESSION_EXPIRED_TEXT,
+  gatewayFetch,
+  withTimeout,
+} from "@/lib/gateway"
+import {
+  VerdictLockedError,
+  fetchVerdicts,
+  type Verdict,
+} from "@/lib/verdicts"
 
 interface Turn {
   id: string
@@ -18,6 +31,19 @@ interface Turn {
   interpreting?: string
   picks?: AgentPick[]
   tokenText?: string
+  error?: string
+}
+
+// One verdict map entry per title, not per media type + id pair as two
+// separate keys — matches title_verdicts' composite primary key, and lets a
+// title repeated across turns (e.g. "show me more" re-showing a result)
+// share the same entry (see title-card.tsx's own comment on this).
+function verdictKey(tmdbId: number, mediaType: "movie" | "tv"): string {
+  return `${mediaType}:${tmdbId}`
+}
+
+interface VerdictRowStatus {
+  pending: boolean
   error?: string
 }
 
@@ -83,7 +109,25 @@ function ChatInput({
   )
 }
 
-function TurnView({ turn, onRetry }: { turn: Turn; onRetry: () => void }) {
+function TurnView({
+  turn,
+  onRetry,
+  verdicts,
+  verdictStatus,
+  onSetVerdict,
+  onClearVerdict,
+}: {
+  turn: Turn
+  onRetry: () => void
+  verdicts: Record<string, Verdict>
+  verdictStatus: Record<string, VerdictRowStatus>
+  onSetVerdict: (
+    tmdbId: number,
+    mediaType: "movie" | "tv",
+    verdict: Verdict,
+  ) => void
+  onClearVerdict: (tmdbId: number, mediaType: "movie" | "tv") => void
+}) {
   // No field has arrived yet — "Thinking…" rather than a blank screen.
   // Update alongside applyEvent if Turn gains a new optional field.
   const pending =
@@ -105,9 +149,20 @@ function TurnView({ turn, onRetry }: { turn: Turn; onRetry: () => void }) {
       {pending && <p className="text-xs text-muted-foreground">Thinking…</p>}
       {turn.picks && turn.picks.length > 0 && (
         <div className="-mx-4 flex snap-x gap-3 overflow-x-auto px-4 pb-2">
-          {turn.picks.map((pick) => (
-            <TitleCard key={pick.tmdb_id} pick={pick} />
-          ))}
+          {turn.picks.map((pick) => {
+            const key = verdictKey(pick.tmdb_id, pick.media_type)
+            return (
+              <TitleCard
+                key={key}
+                pick={pick}
+                verdict={verdicts[key]}
+                pending={verdictStatus[key]?.pending}
+                error={verdictStatus[key]?.error}
+                onSetVerdict={onSetVerdict}
+                onClearVerdict={onClearVerdict}
+              />
+            )
+          })}
         </div>
       )}
       {turn.tokenText && <p className="text-sm">{turn.tokenText}</p>}
@@ -124,6 +179,7 @@ function TurnView({ turn, onRetry }: { turn: Turn; onRetry: () => void }) {
 }
 
 export function ChatPanel() {
+  const { getToken, isLoaded } = useAuth()
   const [turns, setTurns] = useState<Turn[]>([])
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null)
   const [inputValue, setInputValue] = useState("")
@@ -134,6 +190,141 @@ export function ChatPanel() {
   // and that's never stale — a ref, not a closure over state. Every write
   // to activeTurnId has a paired write here.
   const activeTurnIdRef = useRef<string | null>(null)
+
+  // Every verdict the caller has set, hydrated once so a title's saved/judged
+  // state is correct on first render rather than only after it's touched
+  // this session — e.g. a title marked in an earlier conversation that
+  // resurfaces here. One GET, not one request per card (TASKS.md T18).
+  const [verdicts, setVerdicts] = useState<Record<string, Verdict>>({})
+  // One entry per title, not per control: the bookmark button and the
+  // judgment menu both write the same title_verdicts row, so both must
+  // disable on the same pending flag or a double-click across the two
+  // controls could race.
+  const [verdictStatus, setVerdictStatus] = useState<
+    Record<string, VerdictRowStatus>
+  >({})
+
+  // Keys writeVerdict has ever touched this session (set or cleared) — the
+  // hydration GET below must never let its (possibly stale-by-the-time-it-
+  // resolves) snapshot re-introduce a value the user already changed, in
+  // either direction. A plain merge can't express "actively cleared," only
+  // "not yet touched," so this tracks touches explicitly.
+  const touchedVerdictsRef = useRef<Set<string>>(new Set())
+
+  useEffect(() => {
+    if (!isLoaded) return
+    let cancelled = false
+    fetchVerdicts(getToken)
+      .then((entries) => {
+        if (cancelled) return
+        setVerdicts((prev) => {
+          const next = { ...prev }
+          for (const e of entries) {
+            const key = verdictKey(e.tmdb_id, e.media_type)
+            if (!touchedVerdictsRef.current.has(key)) next[key] = e.verdict
+          }
+          return next
+        })
+      })
+      .catch(() => {
+        // Best-effort hydration: cards just render unmarked if this fails,
+        // same as any other title with no verdict yet.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isLoaded, getToken])
+
+  // Shared by setVerdict/clearVerdict: optimistic update, then the write,
+  // reverting on failure — streaming-picker.tsx's toggle() pattern (TASKS.md's
+  // cross-cutting rule: "optimistic UI needs a rollback path").
+  const writeVerdict = useCallback(
+    async (
+      tmdbId: number,
+      mediaType: "movie" | "tv",
+      verdict: Verdict | undefined,
+    ) => {
+      const key = verdictKey(tmdbId, mediaType)
+      touchedVerdictsRef.current.add(key)
+      // Captured inside the functional updater rather than read from the
+      // `verdicts` closure, so this callback doesn't need `verdicts` in its
+      // dependency array — its identity (and everything downstream that
+      // takes it as a prop) would otherwise be rebuilt on every verdict
+      // change instead of only when getToken changes.
+      let previous: Verdict | undefined
+
+      setVerdictStatus((prev) => ({ ...prev, [key]: { pending: true } }))
+      setVerdicts((prev) => {
+        previous = prev[key]
+        const next = { ...prev }
+        if (verdict === undefined) delete next[key]
+        else next[key] = verdict
+        return next
+      })
+
+      try {
+        const signal = AbortSignal.timeout(GATEWAY_CALL_TIMEOUT_MS)
+        const res = await withTimeout(
+          gatewayFetch(
+            `/api/verdicts/${mediaType}/${tmdbId}`,
+            verdict === undefined
+              ? { method: "DELETE", signal }
+              : {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ verdict }),
+                  signal,
+                },
+            getToken,
+          ),
+          GATEWAY_CALL_TIMEOUT_MS,
+        )
+        // 409 means the gateway's judgment lock rejected the write (verdicts.go's
+        // errVerdictLocked) — a distinct case from a transient failure, since
+        // retrying can never succeed. DELETE never 409s (it's idempotent), so
+        // this check is only ever hit on the PUT path.
+        if (res.status === 409) throw new VerdictLockedError()
+        if (!res.ok) throw new Error(`status ${res.status}`)
+        setVerdictStatus((prev) => ({ ...prev, [key]: { pending: false } }))
+      } catch (err) {
+        // Abandon the touch on failure, not just the optimistic value: if the
+        // mount-time hydration GET is still in flight, its (correct) answer
+        // for this key must still be allowed to land once it resolves,
+        // rather than being permanently skipped for the rest of the session.
+        touchedVerdictsRef.current.delete(key)
+        setVerdicts((prev) => {
+          const next = { ...prev }
+          if (previous === undefined) delete next[key]
+          else next[key] = previous
+          return next
+        })
+        setVerdictStatus((prev) => ({
+          ...prev,
+          [key]: {
+            pending: false,
+            error:
+              err instanceof GatewaySessionExpiredError
+                ? SESSION_EXPIRED_TEXT
+                : err instanceof VerdictLockedError
+                  ? "That title's already been rated and can't be changed"
+                  : "Couldn't save that — try again",
+          },
+        }))
+      }
+    },
+    [getToken],
+  )
+
+  const handleSetVerdict = useCallback(
+    (tmdbId: number, mediaType: "movie" | "tv", verdict: Verdict) =>
+      writeVerdict(tmdbId, mediaType, verdict),
+    [writeVerdict],
+  )
+  const handleClearVerdict = useCallback(
+    (tmdbId: number, mediaType: "movie" | "tv") =>
+      writeVerdict(tmdbId, mediaType, undefined),
+    [writeVerdict],
+  )
 
   const handleEvent = useCallback((ev: ChatEvent) => {
     setTurns((prev) =>
@@ -224,6 +415,10 @@ export function ChatPanel() {
                   key={turn.id}
                   turn={turn}
                   onRetry={() => submit(turn.userText)}
+                  verdicts={verdicts}
+                  verdictStatus={verdictStatus}
+                  onSetVerdict={handleSetVerdict}
+                  onClearVerdict={handleClearVerdict}
                 />
               ))}
             </div>

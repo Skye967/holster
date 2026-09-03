@@ -82,6 +82,7 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 		func(context.Context, string, string) error { return nil },
 		noopChatCtx, noopAgentCaller, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
+		noopLoadVerdicts, noopSaveVerdict,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +104,11 @@ func noopAgentCaller(context.Context, agentChatRequest) (<-chan agentEvent, erro
 // covers loadProviders/saveSubscription for real.
 func noopLoadProviders(context.Context, string) ([]Provider, error) { return nil, nil }
 func noopSaveSubscription(context.Context, string, int, bool) error { return nil }
+
+// verdicts.go's own dependencies, for the same reason — verdicts_test.go
+// covers loadVerdicts/saveVerdict for real.
+func noopLoadVerdicts(context.Context, string) ([]Verdict, error) { return nil, nil }
+func noopSaveVerdict(context.Context, string, int, string, *string) error { return nil }
 
 func TestVerifyTokenAcceptsValidToken(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -291,7 +297,8 @@ func TestProvisioningReceivesTokenIdentity(t *testing.T) {
 			gotID, gotEmail = id, email
 			return nil
 		},
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopLoadVerdicts, noopSaveVerdict)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +343,8 @@ func TestProvisioningFailureBlocksRequest(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return errors.New("connection refused") },
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopLoadVerdicts, noopSaveVerdict)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +380,8 @@ func TestClientDisconnectIsNotAProvisioningFailure(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(ctx context.Context, _, _ string) error { return ctx.Err() },
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopLoadVerdicts, noopSaveVerdict)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +434,8 @@ func TestProvisioningDeadlineReturns503(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		},
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopLoadVerdicts, noopSaveVerdict)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +467,8 @@ func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 	kf := func(*jwt.Token) (any, error) { return nil, nil }
 	noop := func(context.Context, string, string) error { return nil }
 	_, err := newHandler(kf, testIssuer, testAudience, map[string]struct{}{}, noop,
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopLoadVerdicts, noopSaveVerdict)
 	if err == nil {
 		t.Error("built a Handler with no authorized parties, which would reject every request")
 	}
@@ -814,7 +825,8 @@ func TestKeyRotationSelfHeals(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopLoadVerdicts, noopSaveVerdict)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -845,7 +857,8 @@ func TestUnknownKidDoesNotAmplify(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription)
+		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopLoadVerdicts, noopSaveVerdict)
 	if err != nil {
 		t.Fatal(err)
 	}
