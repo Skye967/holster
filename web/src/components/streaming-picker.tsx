@@ -8,7 +8,11 @@ import { useCallback, useEffect, useState } from "react"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
-import { GatewaySessionExpiredError, gatewayFetch } from "@/lib/gateway"
+import {
+  GatewaySessionExpiredError,
+  SESSION_EXPIRED_TEXT,
+  gatewayFetch,
+} from "@/lib/gateway"
 
 // Always-visible providers, ranked by TMDB's own display_priority — everything
 // past this is reachable only through search. TASKS.md T15: "surface the
@@ -98,7 +102,7 @@ export function StreamingPicker() {
             pending: false,
             error:
               err instanceof GatewaySessionExpiredError
-                ? "Your session ended — reload the page"
+                ? SESSION_EXPIRED_TEXT
                 : "Couldn't save that — try again",
           },
         }))

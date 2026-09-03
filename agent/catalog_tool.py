@@ -71,12 +71,25 @@ logger = logging.getLogger("holster.catalog_tool")
 
 
 class DiscoverIntent(BaseModel):
-    """interpret()'s output — exactly tmdb.discover()'s creative parameters,
-    none of its identity parameters. watch_region and watch_providers are
+    """interpret()'s output — tmdb.discover()'s creative parameters, none of
+    its identity parameters, plus one field that isn't a search parameter at
+    all: is_capability_question, search()'s signal to skip discover()/rank()
+    entirely (TASKS.md T16.5). watch_region and watch_providers are
     deliberately absent: the model must never be able to choose which
     streaming services results come from (TASKS.md T13, CLAUDE.md)."""
 
     media_type: MediaType = Field(description="'movie' for films, 'tv' for series.")
+    is_capability_question: bool = Field(
+        default=False,
+        description=(
+            "True only for an explicit question about the assistant itself — "
+            "'what can you do', 'how does this work', a bare 'help' with "
+            "nothing else attached. False for anything that is still a title "
+            "request, however vague — 'what movies do you have', 'surprise "
+            "me', and 'help me find something to watch' are all searches, "
+            "not this."
+        ),
+    )
     keywords: list[str] = Field(
         default_factory=list,
         description=(
@@ -376,6 +389,13 @@ async def search(
     ticked streaming services can't get results from any, so there is
     nothing to interpret or search for.
 
+    Also returns picks-less (this time with ``intent`` set) when interpret()
+    flags the message as a capability question rather than a title request
+    (TASKS.md T16.5) — discover()/rank() never run, and ``on_intent`` never
+    fires, since there is no search to narrate an "interpreting" line for.
+    The caller (chat.py's stream_chat) is the one that turns that into a
+    reply naming what the caller can actually do.
+
     Raises CatalogToolError if interpret() or rank() fails (a network/API
     error, or a response that didn't satisfy its schema — see
     CatalogToolError's docstring for detail). tmdb.TMDBError/TMDBUnavailable
@@ -388,6 +408,11 @@ async def search(
         return CatalogResult(intent=None, picks=[], relaxed=[])
 
     intent = await interpret(message, model=interpret_model)
+    if intent.is_capability_question:
+        # Before on_intent: an "interpreting: looking for movies on Netflix"
+        # line would contradict the capability answer that's about to follow
+        # it. Nothing to search for, so discover()/rank() never run either.
+        return CatalogResult(intent=intent, picks=[], relaxed=[])
     if on_intent is not None:
         await on_intent(intent)
 
@@ -488,6 +513,12 @@ _INTERPRET_SYSTEM_PROMPT = (
     "many results to return. Never name a specific film or show yourself — "
     "you are describing what to search for, not recalling titles from "
     "memory. Leave a field empty when the message does not mention it. "
+    "Set is_capability_question only for an explicit question about you, the "
+    "assistant, itself — 'what can you do', 'how does this work', a bare "
+    "'help'. Anything that is still asking for a title, however vague — "
+    "'what movies do you have', 'surprise me', 'help me find something to "
+    "watch' — is a search, not this; leave it false and fill in the fields "
+    "above as best you can. "
     + _GENRE_VOCABULARY
 )
 

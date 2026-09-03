@@ -23,7 +23,11 @@ export default async function AppLayout({ children }: LayoutProps<"/">) {
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger />
         </header>
-        <div className="flex-1">{children}</div>
+        {/* min-h-0: without it a flex item defaults to min-height:auto (its
+            content's height), so a full-height child like ChatPanel can
+            never get a bounded height to scroll within — the whole page
+            would scroll instead, taking the pinned input with it. */}
+        <div className="min-h-0 flex-1">{children}</div>
       </SidebarInset>
     </SidebarProvider>
   )

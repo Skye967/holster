@@ -79,6 +79,11 @@ class ChatRequest(BaseModel):
     message: str
     watch_region: str
     watch_providers: list[int] = Field(default_factory=list)
+    # Names for the same ids, resolved by the gateway from its own
+    # streaming_providers cache (chat.go's chatContext.ProviderNames) —
+    # reused here rather than re-resolved, so a capability-question answer
+    # can name the caller's services without a second TMDB lookup.
+    watch_provider_names: list[str] = Field(default_factory=list)
     # The last few exchanges only — the gateway's job to window, this is not
     # a persisted conversation (no messages table exists yet; see TASKS.md
     # T20). Oldest-first, current message not included here.
@@ -99,11 +104,38 @@ def _with_history(message: str, history: list[HistoryTurn]) -> str:
     )
 
 
+def _human_join(items: Sequence[str]) -> str:
+    """"Netflix, Hulu and Max" — mirrors services/gateway/chat.go's
+    humanJoin so the same kind of list reads the same way wherever it
+    reaches the user (the interpreting line, a capability answer, here)."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
 def _nothing_found_message(relaxed: Sequence[str]) -> str:
     if not relaxed:
         return "Nothing matched that. Try loosening what you're looking for."
-    labels = ", ".join(_RELAXED_LABELS.get(r, r) for r in relaxed)
+    labels = _human_join([_RELAXED_LABELS.get(r, r) for r in relaxed])
     return f"Nothing matched, even after loosening {labels}. Try a different request."
+
+
+def _capability_message(provider_names: Sequence[str]) -> str:
+    """Capability-question answer: names the caller's own services (if
+    resolved — provider_names can be empty while the per-country name
+    cache warms up) plus example phrasing, never a feature list
+    (TASKS.md T16.5). No concrete numbers in the example: this text
+    becomes conversation history and feeds the next turn's interpret()
+    (_with_history, below).
+    """
+    where = f" on {_human_join(provider_names)}" if provider_names else ""
+    return (
+        f"I can find something to watch{where} — try something like "
+        '"something funny and short" or "a slow-burn thriller with '
+        '[actor]." Tell me what you\'re in the mood for.'
+    )
 
 
 def _error_reason(exc: Exception) -> str:
@@ -145,8 +177,16 @@ async def stream_chat(
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
     async def on_intent(intent: DiscoverIntent) -> None:
+        # is_capability_question never reaches here in practice (search()
+        # returns early for it — catalog_tool.py) but excluded on principle:
+        # not a search parameter, meaningless in the gateway's template.
         await queue.put(
-            {"type": "intent", "intent": intent.model_dump(exclude_none=True)}
+            {
+                "type": "intent",
+                "intent": intent.model_dump(
+                    exclude_none=True, exclude={"is_capability_question"}
+                ),
+            }
         )
 
     async def run() -> None:
@@ -172,7 +212,14 @@ async def stream_chat(
             await queue.put(None)
             return
 
-        if result.picks:
+        if result.intent is not None and result.intent.is_capability_question:
+            await queue.put(
+                {
+                    "type": "message",
+                    "text": _capability_message(req.watch_provider_names),
+                }
+            )
+        elif result.picks:
             await queue.put(
                 {
                     "type": "results",

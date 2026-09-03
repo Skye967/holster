@@ -49,6 +49,29 @@ def test_interpret_returns_a_valid_intent() -> None:
         assert intent.max_runtime_minutes is not None
         assert intent.max_runtime_minutes <= 90
         assert 1 <= intent.limit <= 20
+        assert not intent.is_capability_question
+
+    asyncio.run(go())
+
+
+def test_interpret_flags_a_capability_question() -> None:
+    async def go() -> None:
+        call = anthropic_interpreter(_model())
+        intent = await call("what can you do?")
+        assert intent.is_capability_question
+
+    asyncio.run(go())
+
+
+def test_interpret_does_not_flag_a_vague_search_as_a_capability_question() -> None:
+    """The false-positive risk this prompt addition creates: a request that
+    is still asking for a title, just an open-ended one, must not be
+    misread as a meta-question (TASKS.md T16.5)."""
+
+    async def go() -> None:
+        call = anthropic_interpreter(_model())
+        intent = await call("help me find something to watch")
+        assert not intent.is_capability_question
 
     asyncio.run(go())
 
