@@ -17,7 +17,7 @@ the browser.
 | `GET` | `/api/subscriptions` | available providers for the user's country, plus their picks |
 | `POST` | `/api/subscriptions/:id` | tick a service |
 | `DELETE` | `/api/subscriptions/:id` | untick a service |
-| `POST` | `/api/titles/:id/verdict` | liked, disliked, seen, not interested |
+| `POST` | `/api/titles/:id/verdict` | liked, disliked, seen, not interested, want to watch |
 
 ## Running locally
 

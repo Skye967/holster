@@ -139,7 +139,8 @@ streaming_subscriptions   user_id, tmdb_provider_id, created_at
                           primary key (user_id, tmdb_provider_id)
 
 title_verdicts            user_id, tmdb_id, media_type,
-                          verdict ('liked' | 'disliked' | 'seen' | 'not_interested'),
+                          verdict ('liked' | 'disliked' | 'seen' | 'not_interested'
+                                   | 'want_to_watch'),
                           created_at
                           primary key (user_id, tmdb_id, media_type)
 

@@ -439,6 +439,12 @@ func TestAgentRoleIsReadOnly(t *testing.T) {
 		"delete subscription": `delete from streaming_subscriptions where user_id = 'nobody'`,
 		"insert provider":     `insert into streaming_providers (country, providers) values ('ZZ', '[]'::jsonb)`,
 		"update provider":     `update streaming_providers set fetched_at = now() where country = 'ZZ'`,
+		"insert verdict": `insert into title_verdicts (user_id, tmdb_id, media_type, verdict)
+			values ('agent_probe', 550, 'movie', 'liked')`,
+		"update verdict": `update title_verdicts set verdict = 'seen'
+			where user_id = 'nobody' and tmdb_id = 550 and media_type = 'movie'`,
+		"delete verdict": `delete from title_verdicts
+			where user_id = 'nobody' and tmdb_id = 550 and media_type = 'movie'`,
 	}
 	asRole(t, pool, "agent_ro", func(ctx context.Context, tx pgx.Tx) {
 		for name, sql := range writes {
@@ -473,6 +479,11 @@ func TestGatewayRoleEnforcesUserIsolation(t *testing.T) {
 		}
 		if _, err := pool.Exec(ctx,
 			`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ($1, 8)
+			 on conflict do nothing`, u); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`insert into title_verdicts (user_id, tmdb_id, media_type, verdict) values ($1, 550, 'movie', 'liked')
 			 on conflict do nothing`, u); err != nil {
 			t.Fatal(err)
 		}
@@ -511,6 +522,16 @@ func TestGatewayRoleEnforcesUserIsolation(t *testing.T) {
 			t.Errorf("as %s, visible subscriptions = %d, want 1", uA, subs)
 		}
 
+		var verdicts int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from title_verdicts where user_id = any($1)`,
+			[]string{uA, uB}).Scan(&verdicts); err != nil {
+			t.Fatal(err)
+		}
+		if verdicts != 1 {
+			t.Errorf("as %s, visible verdicts = %d, want 1", uA, verdicts)
+		}
+
 		// A write for the acting user passes WITH CHECK...
 		if err := probe(t, ctx, tx,
 			`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ('`+uA+`', 99)`); err != nil {
@@ -527,6 +548,17 @@ func TestGatewayRoleEnforcesUserIsolation(t *testing.T) {
 		if err := probe(t, ctx, tx,
 			`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ('`+uB+`', 9)`); !denied(err) {
 			t.Errorf("writing a row for %s while acting as %s: err = %v, want SQLSTATE 42501", uB, uA, err)
+		}
+
+		// Same isolation on title_verdicts: own verdict passes WITH CHECK...
+		if err := probe(t, ctx, tx,
+			`insert into title_verdicts (user_id, tmdb_id, media_type, verdict) values ('`+uA+`', 551, 'movie', 'seen')`); err != nil {
+			t.Errorf("as %s, writing its own verdict: %v", uA, err)
+		}
+		// ...but a verdict for another user is rejected by WITH CHECK.
+		if err := probe(t, ctx, tx,
+			`insert into title_verdicts (user_id, tmdb_id, media_type, verdict) values ('`+uB+`', 551, 'movie', 'seen')`); !denied(err) {
+			t.Errorf("writing a verdict for %s while acting as %s: err = %v, want SQLSTATE 42501", uB, uA, err)
 		}
 	})
 }
