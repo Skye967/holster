@@ -130,6 +130,7 @@ type Handler struct {
 
 	// verdicts.go (T18): the caller's verdict set and the per-title write,
 	// injected the same way as loadProviders/saveSubscription above.
+	// loadVerdicts serves both /api/verdicts and runTurn — see it for why.
 	loadVerdicts func(ctx context.Context, userID string) ([]Verdict, error)
 	saveVerdict  func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error
 

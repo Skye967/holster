@@ -23,9 +23,15 @@ var (
 	}
 )
 
-// Verdict is one row of GET /api/verdicts — the caller's whole set, so the
-// chat UI can hydrate every title card's saved/judged state in one round
-// trip instead of one request per card.
+// Verdict is one row of title_verdicts, used for two things: the response
+// body of GET /api/verdicts — the caller's whole set, so the chat UI can
+// hydrate every title card's saved/judged state in one round trip instead of
+// one request per card — and, unchanged, the shape the gateway hands the
+// agent with each message (chat.go's runTurn fills agentChatRequest.Verdicts
+// straight from loadVerdicts below; deliberately not via chatContext — see
+// that type's comment). One type rather than two: same table, same three
+// columns, and the agent's TitleVerdict (agent/catalog_tool.py) decodes
+// these exact JSON names.
 type Verdict struct {
 	TMDBID    int    `json:"tmdb_id"`
 	MediaType string `json:"media_type"`
@@ -33,13 +39,35 @@ type Verdict struct {
 }
 
 // loadVerdicts mirrors loadProviders' shape (providers.go): a plain function
-// closed over the pool, injected into Handler so it's fakeable in tests.
+// closed over the pool, injected into Handler so it's fakeable in tests. One
+// loader for both consumers — the browser's hydration and the agent's chat
+// context (T19) — so the two can never disagree about what a user has judged.
+//
+// Newest-first because the agent keeps only the first few liked titles for
+// its taste hint (catalog_tool.py's MAX_TASTE_TITLES) and carries no
+// timestamp to re-sort by; /api/verdicts is indifferent. created_at is a
+// proxy, not the truth — saveVerdict's conflict clause below leaves it
+// alone, so a title bookmarked in January and liked today still sorts as
+// January. Exact for a judgment set directly on a title, stale only for the
+// want_to_watch -> liked lifecycle. saveVerdict writes one row per
+// transaction, so production timestamps are distinct and the tie-break is
+// only insurance - it keeps the order total if a batched write or a backfill
+// ever makes them tie, which is what db_test.go exercises.
+//
+// Uncapped, because the agent needs every row to answer "has this user judged
+// this title" - a LIMIT would quietly expire T19's guarantee once someone had
+// judged enough titles. Note the sort is not index-covered: title_verdicts
+// has only its primary key (user_id, tmdb_id, media_type), so this fetches
+// the user's rows and sorts them. Fine at these sizes; a
+// (user_id, created_at desc) index is the fix if it stops being.
 func loadVerdicts(db *pgxpool.Pool) func(ctx context.Context, userID string) ([]Verdict, error) {
 	return func(ctx context.Context, userID string) ([]Verdict, error) {
 		var verdicts []Verdict
 		err := withUser(ctx, db, userID, func(tx pgx.Tx) error {
 			rows, err := tx.Query(ctx,
-				`select tmdb_id, media_type, verdict from title_verdicts where user_id = $1`,
+				`select tmdb_id, media_type, verdict from title_verdicts
+				 where user_id = $1
+				 order by created_at desc, media_type, tmdb_id`,
 				userID)
 			if err != nil {
 				return err

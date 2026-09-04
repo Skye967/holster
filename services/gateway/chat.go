@@ -391,12 +391,42 @@ func (h *Handler) runTurn(
 		return
 	}
 
+	// A second round trip rather than a field on chatContext: see that type's
+	// comment for why the other three loadChatCtx callers must not pay for
+	// this. Sequential after it, matching providers()/watchlist()'s existing
+	// two-transaction shape — the turn is about to spend two model calls and
+	// several TMDB round trips, so a BEGIN/COMMIT is not what makes it slow,
+	// and running loadChatCtx first means a cancelled turn bails before this.
+	//
+	// A failure here fails the turn rather than degrading to no verdicts.
+	// TASKS.md is explicit that "the chat cannot degrade," and degrading
+	// would silently re-show titles the user marked seen — breaking exactly
+	// the guarantee T19 exists to make, in the direction users notice.
+	// Skipped for a caller with no subscriptions: the agent answers that with
+	// its "pick your services" message before it ever looks at verdicts
+	// (agent/chat.py's stream_chat), so loading them is work whose result is
+	// unused - and a title_verdicts problem must not be the thing that stops a
+	// brand-new user, who has no verdicts anyway, from being told to pick some.
+	var verdicts []Verdict
+	if len(chatCtx.Providers) > 0 {
+		verdicts, err = h.loadVerdicts(turnCtx, userID)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			slog.ErrorContext(turnCtx, "chat verdict load failed", "turn", turnID, "error", dbError(err))
+			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
+			return
+		}
+	}
+
 	events, err := h.callAgent(turnCtx, agentChatRequest{
 		Message:            text,
 		WatchRegion:        chatCtx.Region,
 		WatchProviders:     chatCtx.Providers,
 		WatchProviderNames: chatCtx.ProviderNames,
 		History:            windowHistory(history),
+		Verdicts:           verdicts,
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -531,10 +561,14 @@ func humanJoin(items []string) string {
 
 // --- Loading the agent's context --------------------------------------------
 
-// chatContext is what ARCHITECTURE.md's "Flow: asking a question" calls
-// loading "subscriptions, country and recent verdicts." Verdicts are absent:
-// title_verdicts does not exist until T17, later than this task — see
-// TASKS.md T14 and T19, which is where that field will be added.
+// chatContext is the subscriptions-and-country half of what ARCHITECTURE.md's
+// "Flow: asking a question" calls loading "subscriptions, country and every
+// verdict." The verdicts half is deliberately not here: three of
+// loadChatCtx's four callers (providers.go's two handlers and watchlist.go)
+// have no verdict dependency, so loading them here would spend a query those
+// three discard and, worse, would 503 them on a title_verdicts problem they
+// have nothing to do with. runTurn assembles the third piece itself, from
+// verdicts.go's loadVerdicts — see there and T19.
 type chatContext struct {
 	Region        string
 	Providers     []int
@@ -643,6 +677,9 @@ type agentChatRequest struct {
 	// needing its own TMDB lookup.
 	WatchProviderNames []string      `json:"watch_provider_names,omitempty"`
 	History            []historyTurn `json:"history,omitempty"`
+	// The caller's whole verdict set (T19); agent/catalog_tool.py's search()
+	// decides what each value means.
+	Verdicts []Verdict `json:"verdicts,omitempty"`
 }
 
 // agentIntent mirrors DiscoverIntent.model_dump(exclude_none=True) — see

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -188,10 +189,10 @@ func probe(t *testing.T, ctx context.Context, tx pgx.Tx, sql string) error {
 	return execErr
 }
 
-// loadChatContext (chat.go) reads what T14's "gateway loads subscriptions,
-// country and recent verdicts" actually has available today: subscriptions
-// and country are real tables; the provider-name lookup must degrade to an
-// empty list, not an error, when streaming_providers has no row yet for the
+// loadChatContext (chat.go) reads the subscriptions-and-country half of the
+// context; verdicts are loaded separately by runTurn — see chat.go's
+// chatContext for why. The provider-name lookup must degrade to an empty
+// list, not an error, when streaming_providers has no row yet for the
 // country (T15 owns keeping that cache fresh — see chat.go's loadChatContext).
 func TestLoadChatContext(t *testing.T) {
 	pool := testPool(t)
@@ -257,6 +258,95 @@ func TestLoadChatContext(t *testing.T) {
 	}
 	if len(cc.ProviderNames) != 1 || cc.ProviderNames[0] != "Netflix" {
 		t.Errorf("ProviderNames = %v, want [Netflix]", cc.ProviderNames)
+	}
+}
+
+// loadVerdicts (verdicts.go) serves two consumers: the browser's hydration of
+// GET /api/verdicts, and the chat context runTurn hands the agent (T19). The
+// ordering is what the agent depends on -- it keeps only the first few liked
+// titles and has no timestamp of its own to sort by.
+func TestLoadVerdicts(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	load := loadVerdicts(pool)
+
+	const id = "verdict_load_test"
+	// Before as well as after, like TestUpsertUser: a run killed between the
+	// seed and the cleanup would otherwise leave rows behind and every later
+	// run would fail on the "nil before any are set" assertion, pointing at
+	// loadVerdicts rather than at the leftovers.
+	if _, err := pool.Exec(ctx, `delete from users where id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// title_verdicts cascades on user delete.
+		pool.Exec(c, `delete from users where id = $1`, id)
+	})
+
+	if _, err := pool.Exec(ctx,
+		`insert into users (id, email, country) values ($1, $2, 'ZZ')
+		 on conflict (id) do nothing`, id, id+"@example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing set yet: nil, not an error. The handler is what turns that into
+	// [] for the browser (see TestGetVerdictsReturnsEmptyArray).
+	vs, err := load(ctx, id)
+	if err != nil {
+		t.Fatalf("load with no verdicts: %v", err)
+	}
+	// nil specifically, not just empty: verdicts.go's handler relies on this
+	// to substitute [] for the browser (TestGetVerdictsReturnsEmptyArray),
+	// and len() == 0 would pass for an eagerly-allocated slice too, leaving
+	// that branch dead with nothing to flag it.
+	if vs != nil {
+		t.Errorf("Verdicts = %+v, want nil before any are set", vs)
+	}
+
+	// Explicit, distinct created_at values rather than the column default:
+	// now() is transaction start time, so a multi-row insert stamps every row
+	// identically and "newest first" would be asserting on heap order.
+	if _, err := pool.Exec(ctx,
+		`insert into title_verdicts (user_id, tmdb_id, media_type, verdict, created_at)
+		 values ($1, 101, 'movie', 'seen', now() - interval '2 hours'),
+		        ($1, 202, 'tv', 'liked', now() - interval '1 hour'),
+		        ($1, 303, 'movie', 'want_to_watch', now())
+		 on conflict do nothing`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	vs, err = load(ctx, id)
+	if err != nil {
+		t.Fatalf("load with verdicts: %v", err)
+	}
+	want := []Verdict{
+		{TMDBID: 303, MediaType: "movie", Verdict: "want_to_watch"},
+		{TMDBID: 202, MediaType: "tv", Verdict: "liked"},
+		{TMDBID: 101, MediaType: "movie", Verdict: "seen"},
+	}
+	if !slices.Equal(vs, want) {
+		t.Errorf("Verdicts = %+v, want %+v", vs, want)
+	}
+
+	// The tie-break, exercised the only way ties actually arise: one statement
+	// writing several rows, so now() stamps them identically. Without the
+	// tie-break their order is whatever the heap scan returns.
+	if _, err := pool.Exec(ctx,
+		`insert into title_verdicts (user_id, tmdb_id, media_type, verdict, created_at)
+		 values ($1, 505, 'movie', 'liked', now() + interval '1 hour'),
+		        ($1, 404, 'movie', 'liked', now() + interval '1 hour')
+		 on conflict do nothing`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	vs, err = load(ctx, id)
+	if err != nil {
+		t.Fatalf("load with tied timestamps: %v", err)
+	}
+	if len(vs) < 2 || vs[0].TMDBID != 404 || vs[1].TMDBID != 505 {
+		t.Errorf("tied rows = %+v, want 404 before 505 (tmdb_id ascending)", vs[:min(2, len(vs))])
 	}
 }
 

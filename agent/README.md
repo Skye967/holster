@@ -5,7 +5,7 @@ Python. FastAPI + LangChain. Turns a message into TMDB catalog queries and an an
 ## Responsibility
 
 Receive a message plus the context the gateway assembled — the user's streaming
-subscriptions, country, recent verdicts — decide which catalog operations to run,
+subscriptions, country, every verdict — decide which catalog operations to run,
 execute them against TMDB, and return text. There is no service picker in the UI;
 choosing what to reach for is this service's job.
 
@@ -103,7 +103,8 @@ chunked HTTP response (`application/x-ndjson`), not a second WebSocket — the b
 socket belongs to the gateway alone (`../DECISIONS.md`). Each line is one event:
 `intent` (as soon as `interpret()` resolves — well before the full pipeline finishes,
 via `search()`'s `on_intent` hook), `results` or `message` (candidates, or a plain reply
-when there are none — no subscriptions, or nothing survived the relaxation ladder),
+when there are none — no subscriptions, nothing survived the relaxation ladder, or
+everything found was already rated),
 `error` (one of a fixed, closed set of reason codes — never raw exception text), and
 `done`. `error` is terminal on its own; a turn ends with exactly one of `done` or
 `error`, never both.
@@ -118,6 +119,28 @@ the background `search()` call — nothing bespoke on this side.
 gateway's WebSocket connection — there is no persisted conversation yet (`TASKS.md`
 T20). It is folded into the text handed to `interpret()`/`rank()` rather than changing
 `catalog_tool.py`'s `message: str` contract.
+
+`verdicts` in the request body is the caller's whole `title_verdicts` set, loaded by the
+gateway with the message. The gateway only reads the rows; what each verdict *means* for
+a recommendation is decided here, in `search()`:
+
+- **Every verdict but `want_to_watch` removes that title from the candidates `rank()`
+  sees** — the four judgments are settled opinions, `want_to_watch` is an open
+  intention. A set filter applied after the relaxation ladder, never a prompt
+  instruction, so it holds whatever the model does. An unrecognised verdict excludes
+  too, which is the safe direction.
+- **`liked` titles of the search's own media type become a hint prepended to `rank()`'s
+  message**, and are never given to `interpret()` — that step sets hard TMDB filters,
+  and a past like is a preference, not a constraint the user asked for. The hint is the
+  first `MAX_TASTE_TITLES` likes, resolved to names via TMDB since the table stores only
+  ids. Its effect is bounded: it reorders and re-selects within the one page
+  `discover()` returned, it does not change what is in that page.
+
+That second one is order-sensitive. The gateway sends verdicts newest-first and the
+agent keeps the first few likes it sees, so the ordering is a contract rather than a
+detail — `TitleVerdict` carries no timestamp, so the agent cannot re-sort, or even
+notice if the order is lost. `services/gateway/verdicts.go` explains where that
+ordering is itself only a proxy.
 
 ## Tests
 

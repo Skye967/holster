@@ -47,7 +47,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from catalog_tool import CatalogToolError, DiscoverIntent, Interpreter, Ranker, search
+from catalog_tool import (
+    CatalogToolError,
+    DiscoverIntent,
+    Interpreter,
+    Ranker,
+    TitleVerdict,
+    search,
+)
 from tmdb import TMDBClient, TMDBUnavailable
 
 logger = logging.getLogger("holster.chat")
@@ -88,12 +95,21 @@ class ChatRequest(BaseModel):
     # a persisted conversation (no messages table exists yet; see TASKS.md
     # T20). Oldest-first, current message not included here.
     history: list[HistoryTurn] = Field(default_factory=list)
+    # The caller's whole title_verdicts set, loaded by the gateway with the
+    # message (TASKS.md T19). Passed straight through; catalog_tool.search()
+    # decides what each value means.
+    verdicts: list[TitleVerdict] = Field(default_factory=list)
 
 
 def _with_history(message: str, history: list[HistoryTurn]) -> str:
     """Fold recent turns into the text handed to interpret()/rank(), rather
     than changing catalog_tool.py's message: str contract. Keeps that
-    shipped, tested module untouched for a concern that is still settling."""
+    shipped, tested module untouched for a concern that is still settling.
+
+    One of two folding sites now: catalog_tool's _with_taste prepends the
+    liked-title hint to the same string, for rank() only. It prepends
+    precisely because this function leaves "Current message: ..." at the
+    end, and that has to stay the last thing before the candidate list."""
     if not history:
         return message
     lines = [
@@ -115,7 +131,19 @@ def _human_join(items: Sequence[str]) -> str:
     return ", ".join(items[:-1]) + f" and {items[-1]}"
 
 
-def _nothing_found_message(relaxed: Sequence[str]) -> str:
+def _nothing_found_message(relaxed: Sequence[str], all_judged: bool) -> str:
+    """Why nothing came back, in the caller's words. all_judged takes
+    precedence over relaxed: when every title found was already rated, the
+    relaxation story is beside the point. The copy names no constraint,
+    deliberately - the ladder may already have dropped runtime or year to get
+    this page, so "drop the runtime" can be advice to redo what was already
+    done; and this text becomes assistant history feeding the next turn's
+    interpret(), the same hazard _capability_message documents below."""
+    if all_judged:
+        return (
+            "I found things, but you've rated all of them already. Try "
+            "asking for something different."
+        )
     if not relaxed:
         return "Nothing matched that. Try loosening what you're looking for."
     labels = _human_join([_RELAXED_LABELS.get(r, r) for r in relaxed])
@@ -168,6 +196,8 @@ async def stream_chat(
     interpret_model: Interpreter,
     rank_model: Ranker,
 ) -> AsyncGenerator[dict[str, Any]]:
+    # services/gateway's runTurn skips loading verdicts entirely for a caller
+    # with no ticked services, on the strength of this early return.
     if not req.watch_providers:
         yield {"type": "message", "text": NO_PROVIDERS_MESSAGE}
         yield {"type": "done"}
@@ -199,6 +229,7 @@ async def stream_chat(
                 interpret_model=interpret_model,
                 rank_model=rank_model,
                 on_intent=on_intent,
+                verdicts=req.verdicts,
             )
         except Exception as exc:
             # Not `except BaseException` — a cancelled turn (asyncio.CancelledError)
@@ -229,7 +260,10 @@ async def stream_chat(
             )
         else:
             await queue.put(
-                {"type": "message", "text": _nothing_found_message(result.relaxed)}
+                {
+                    "type": "message",
+                    "text": _nothing_found_message(result.relaxed, result.all_judged),
+                }
             )
         await queue.put({"type": "done"})
         await queue.put(None)

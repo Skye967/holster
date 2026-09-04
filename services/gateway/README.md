@@ -126,7 +126,7 @@ the web app is served from, or every request fails with `unauthorized party`.
   the gateway for identity and does not re-verify sessions.
 - **Owns every write.** The agent has no write path to the database by design; if a
   feature needs one, it belongs here.
-- Assembles the context the agent needs — subscriptions, country, recent verdicts — so
+- Assembles the context the agent needs — subscriptions, country, every verdict — so
   the agent never needs broad database access.
 - Serves the cached provider list from `streaming_providers`, refreshing it from TMDB
   when the row for that country is older than 24h. If TMDB fails, serve the stale row
