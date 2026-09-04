@@ -20,7 +20,7 @@ import (
 // newProvidersTestServer for the endpoints verdicts.go adds.
 func newVerdictsTestServer(t *testing.T,
 	loadVerdicts func(context.Context, string) ([]Verdict, error),
-	saveVerdict func(context.Context, string, int, string, *string) error,
+	saveVerdict func(context.Context, string, int, string, *string, string) error,
 ) (*httptest.Server, string) {
 	t.Helper()
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -134,14 +134,15 @@ func TestGetVerdictsDegradesOnLoadFailure(t *testing.T) {
 
 func TestSetVerdictUpsertsAndClears(t *testing.T) {
 	type call struct {
-		userID    string
-		tmdbID    int
-		mediaType string
-		verdict   *string
+		userID          string
+		tmdbID          int
+		mediaType       string
+		verdict         *string
+		expectedVerdict string
 	}
 	var calls []call
-	saveVerdict := func(_ context.Context, userID string, tmdbID int, mediaType string, verdict *string) error {
-		calls = append(calls, call{userID, tmdbID, mediaType, verdict})
+	saveVerdict := func(_ context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error {
+		calls = append(calls, call{userID, tmdbID, mediaType, verdict, expectedVerdict})
 		return nil
 	}
 	srv, token := newVerdictsTestServer(t, noopLoadVerdicts, saveVerdict)
@@ -158,7 +159,7 @@ func TestSetVerdictUpsertsAndClears(t *testing.T) {
 		t.Errorf("PUT response = %v, want verdict: liked", putBody)
 	}
 
-	resp = doJSON(t, srv, token, http.MethodDelete, "/api/verdicts/movie/550")
+	resp = doJSON(t, srv, token, http.MethodDelete, "/api/verdicts/movie/550?expect=liked")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("DELETE status = %d, want 200", resp.StatusCode)
 	}
@@ -176,13 +177,63 @@ func TestSetVerdictUpsertsAndClears(t *testing.T) {
 	if calls[0].verdict == nil || *calls[0].verdict != "liked" || calls[0].tmdbID != 550 || calls[0].mediaType != "movie" {
 		t.Errorf("calls[0] = %+v, want a liked upsert for movie 550", calls[0])
 	}
-	if calls[1].verdict != nil {
-		t.Errorf("calls[1] = %+v, want a nil verdict (clear)", calls[1])
+	if calls[1].verdict != nil || calls[1].expectedVerdict != "liked" {
+		t.Errorf("calls[1] = %+v, want a nil verdict and expectedVerdict %q", calls[1], "liked")
+	}
+}
+
+// DELETE's ?expect must reach saveVerdict unchanged — it's the only signal
+// that tells the SQL which specific verdict it's allowed to remove (see
+// saveVerdict's own comment for why comparing against it is the fix).
+func TestSetVerdictDeletePassesExpectThrough(t *testing.T) {
+	var lastExpected string
+	saveVerdict := func(_ context.Context, _ string, _ int, _ string, _ *string, expectedVerdict string) error {
+		lastExpected = expectedVerdict
+		return nil
+	}
+	srv, token := newVerdictsTestServer(t, noopLoadVerdicts, saveVerdict)
+
+	resp := doJSON(t, srv, token, http.MethodDelete, "/api/verdicts/movie/550?expect=want_to_watch")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if lastExpected != "want_to_watch" {
+		t.Errorf("expectedVerdict = %q, want %q", lastExpected, "want_to_watch")
+	}
+
+	resp = doJSON(t, srv, token, http.MethodDelete, "/api/verdicts/movie/550?expect=liked")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if lastExpected != "liked" {
+		t.Errorf("expectedVerdict = %q, want %q", lastExpected, "liked")
+	}
+}
+
+// A missing or invalid ?expect must 400 before ever reaching saveVerdict —
+// the whole point of requiring it is that no caller can fall back to an
+// unscoped "clear whatever's there".
+func TestSetVerdictRejectsMissingOrInvalidExpect(t *testing.T) {
+	saveVerdict := func(context.Context, string, int, string, *string, string) error {
+		t.Fatal("saveVerdict should not run for a missing or invalid ?expect")
+		return nil
+	}
+	srv, token := newVerdictsTestServer(t, noopLoadVerdicts, saveVerdict)
+
+	for _, path := range []string{
+		"/api/verdicts/movie/550",
+		"/api/verdicts/movie/550?expect=",
+		"/api/verdicts/movie/550?expect=maybe",
+	} {
+		resp := doJSON(t, srv, token, http.MethodDelete, path)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("DELETE %s status = %d, want 400", path, resp.StatusCode)
+		}
 	}
 }
 
 func TestSetVerdictRejectsBadMediaTypeOrID(t *testing.T) {
-	saveVerdict := func(context.Context, string, int, string, *string) error {
+	saveVerdict := func(context.Context, string, int, string, *string, string) error {
 		t.Fatal("saveVerdict should not run for an invalid path")
 		return nil
 	}
@@ -200,7 +251,7 @@ func TestSetVerdictRejectsBadMediaTypeOrID(t *testing.T) {
 }
 
 func TestSetVerdictRejectsBadVerdictValue(t *testing.T) {
-	saveVerdict := func(context.Context, string, int, string, *string) error {
+	saveVerdict := func(context.Context, string, int, string, *string, string) error {
 		t.Fatal("saveVerdict should not run for an invalid verdict")
 		return nil
 	}
@@ -213,7 +264,7 @@ func TestSetVerdictRejectsBadVerdictValue(t *testing.T) {
 }
 
 func TestSetVerdictReturns409WhenLocked(t *testing.T) {
-	saveVerdict := func(context.Context, string, int, string, *string) error {
+	saveVerdict := func(context.Context, string, int, string, *string, string) error {
 		return errVerdictLocked
 	}
 	srv, token := newVerdictsTestServer(t, noopLoadVerdicts, saveVerdict)
@@ -222,10 +273,39 @@ func TestSetVerdictReturns409WhenLocked(t *testing.T) {
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("status = %d, want 409", resp.StatusCode)
 	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["code"] != "verdict_locked" {
+		t.Errorf("code = %q, want verdict_locked", body["code"])
+	}
+}
+
+// The client (chat-panel.tsx) distinguishes this from errVerdictLocked's 409
+// by this stable code, not by wording or by which HTTP method it sent — this
+// test pins the exact value that contract depends on.
+func TestSetVerdictReturns409WhenStale(t *testing.T) {
+	saveVerdict := func(context.Context, string, int, string, *string, string) error {
+		return errVerdictStale
+	}
+	srv, token := newVerdictsTestServer(t, noopLoadVerdicts, saveVerdict)
+
+	resp := doJSON(t, srv, token, http.MethodDelete, "/api/verdicts/movie/550?expect=liked")
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status = %d, want 409", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["code"] != "verdict_stale" {
+		t.Errorf("code = %q, want verdict_stale", body["code"])
+	}
 }
 
 func TestSetVerdictDegradesOnWriteFailure(t *testing.T) {
-	saveVerdict := func(context.Context, string, int, string, *string) error {
+	saveVerdict := func(context.Context, string, int, string, *string, string) error {
 		return errUnauthorizedParty // any non-nil error
 	}
 	srv, token := newVerdictsTestServer(t, noopLoadVerdicts, saveVerdict)

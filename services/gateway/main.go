@@ -132,7 +132,7 @@ type Handler struct {
 	// injected the same way as loadProviders/saveSubscription above.
 	// loadVerdicts serves both /api/verdicts and runTurn — see it for why.
 	loadVerdicts func(ctx context.Context, userID string) ([]Verdict, error)
-	saveVerdict  func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error
+	saveVerdict  func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error
 
 	// watchlist.go (T18.5): the caller's want_to_watch rows and the agent
 	// call that enriches them, injected the same way as loadVerdicts/
@@ -151,7 +151,7 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	loadProviders func(ctx context.Context, country string) ([]Provider, error),
 	saveSubscription func(ctx context.Context, userID string, providerID int, subscribed bool) error,
 	loadVerdicts func(ctx context.Context, userID string) ([]Verdict, error),
-	saveVerdict func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error,
+	saveVerdict func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error,
 	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error),
 	callAgentTitles agentTitlesCaller,
 ) (*Handler, error) {

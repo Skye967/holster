@@ -14,7 +14,15 @@ import {
   gatewayFetch,
   withTimeout,
 } from "@/lib/gateway"
-import { VerdictLockedError, verdictKey, type Verdict } from "@/lib/verdicts"
+import {
+  VERDICT_LOCKED_TEXT,
+  VERDICT_STALE_TEXT,
+  VerdictLockedError,
+  VerdictStaleError,
+  verdictKey,
+  verdictUrl,
+  type Verdict,
+} from "@/lib/verdicts"
 import { fetchWatchlist } from "@/lib/watchlist"
 
 interface RowStatus {
@@ -80,6 +88,12 @@ export function WatchlistView() {
   // need index-preserving reinsertion just to show one. Simpler to disable
   // the row while in flight and remove it only once the gateway confirms —
   // one extra round trip's latency, no new failure mode.
+  // Takes only (tmdbId, mediaType) — fewer parameters than TitleCard's
+  // onClearVerdict type, which TypeScript allows a function value to omit.
+  // Every row in this view is want_to_watch (line ~215 below), so the
+  // gateway's required ?expect= is hardcoded rather than threaded in: the
+  // judgment scope (title-card.tsx's "Clear rating") never renders for a
+  // want_to_watch card, so there's never another value this could be.
   const removeItem = useCallback(
     async (tmdbId: number, mediaType: "movie" | "tv") => {
       const key = verdictKey(tmdbId, mediaType)
@@ -88,12 +102,19 @@ export function WatchlistView() {
         const signal = AbortSignal.timeout(GATEWAY_CALL_TIMEOUT_MS)
         const res = await withTimeout(
           gatewayFetch(
-            `/api/verdicts/${mediaType}/${tmdbId}`,
+            verdictUrl(mediaType, tmdbId, "want_to_watch"),
             { method: "DELETE", signal },
             getToken,
           ),
           GATEWAY_CALL_TIMEOUT_MS,
         )
+        // 409 here means errVerdictStale (verdicts.go): the row is still
+        // want_to_watch elsewhere in its lifecycle but no longer matches
+        // what this row believed — e.g. judged from another tab between this
+        // page's load and this click. Non-optimistic already keeps the row
+        // in place until the gateway confirms, so this can't silently drift;
+        // it's still worth its own message rather than the generic one.
+        if (res.status === 409) throw new VerdictStaleError()
         if (!res.ok) throw new Error(`status ${res.status}`)
         setItems(
           (prev) =>
@@ -108,7 +129,9 @@ export function WatchlistView() {
             error:
               err instanceof GatewaySessionExpiredError
                 ? SESSION_EXPIRED_TEXT
-                : "Couldn't remove that — try again",
+                : err instanceof VerdictStaleError
+                  ? VERDICT_STALE_TEXT
+                  : "Couldn't remove that — try again",
           },
         }))
       }
@@ -128,7 +151,7 @@ export function WatchlistView() {
         const signal = AbortSignal.timeout(GATEWAY_CALL_TIMEOUT_MS)
         const res = await withTimeout(
           gatewayFetch(
-            `/api/verdicts/${mediaType}/${tmdbId}`,
+            verdictUrl(mediaType, tmdbId),
             {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
@@ -158,7 +181,7 @@ export function WatchlistView() {
               err instanceof GatewaySessionExpiredError
                 ? SESSION_EXPIRED_TEXT
                 : err instanceof VerdictLockedError
-                  ? "That title's already been rated and can't be changed"
+                  ? VERDICT_LOCKED_TEXT
                   : "Couldn't save that — try again",
           },
         }))

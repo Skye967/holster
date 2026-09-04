@@ -646,7 +646,8 @@ async def search(
     exclusions are never in the ladder. Each retry is a full discover() call
     with its own retry/backoff; the ladder itself still has no combined
     deadline, and it is reachable from POST /chat, under the gateway's 30s
-    turnDeadline. Worst case is four discover() calls each with their own
+    turnDeadline. Worst case is four discover() calls from the ladder plus one
+    more from the exclusion top-up below, each with their own
     retries, so the ladder can outlast that budget on its own — the same
     hazard TASTE_TIMEOUT_SECONDS bounds for the taste step. Not fixed here.
 
@@ -694,7 +695,7 @@ async def search(
     release_year_lte = intent.release_year_lte
     keywords = intent.keywords
 
-    async def discover() -> list[Title]:
+    async def discover(page: int = 1) -> list[Title]:
         return await client.discover(
             media_type=intent.media_type,
             watch_region=watch_region,
@@ -709,6 +710,7 @@ async def search(
             release_year_gte=release_year_gte,
             release_year_lte=release_year_lte,
             sort_by=intent.sort_by,
+            page=page,
         )
 
     candidates = await discover()
@@ -740,7 +742,9 @@ async def search(
         relaxed.append("keywords")
 
     # Keyed on both fields: movie 550 and tv 550 are unrelated titles.
-    #
+    def key(c: Title) -> tuple[str, int]:
+        return (c["media_type"], c["tmdb_id"])
+
     # After the ladder, not inside discover(): filtering there would make an
     # all-judged page look like "TMDB returned nothing" and relax runtime,
     # year and keywords for a reason unrelated to any of them, leaving
@@ -748,9 +752,22 @@ async def search(
     excluded = {
         (v.media_type, v.tmdb_id) for v in verdicts if v.verdict != "want_to_watch"
     }
-    kept = [c for c in candidates if (c["media_type"], c["tmdb_id"]) not in excluded]
-    all_judged = bool(candidates) and not kept
-    candidates = kept
+    before_exclusion = len(candidates)
+    candidates = [c for c in candidates if key(c) not in excluded]
+    all_judged = bool(before_exclusion) and not candidates
+
+    # Top up from the next page when exclusion actually dropped this page
+    # below intent.limit. Bounded to one extra page, not a pagination loop.
+    # Gated on `len(candidates) < before_exclusion`, not just "some verdict
+    # exists somewhere" — a query that legitimately has few results, for a
+    # user who happens to have judged other, unrelated titles, must not pay
+    # for a second TMDB call that a truly short page would never need.
+    if len(candidates) < before_exclusion and len(candidates) < intent.limit:
+        more = await discover(page=2)
+        known = {key(c) for c in candidates}
+        more_kept = [c for c in more if key(c) not in excluded and key(c) not in known]
+        all_judged = all_judged and not more_kept
+        candidates = candidates + more_kept
 
     # This search's media type only — liked TV shows are no hint for "find me
     # a movie", and each costs a round trip. Guarded on candidates because

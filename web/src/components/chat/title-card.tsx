@@ -4,6 +4,7 @@ import {
   BookmarkCheck,
   Eye,
   MoreHorizontal,
+  RotateCcw,
   Star,
   ThumbsDown,
   ThumbsUp,
@@ -21,8 +22,10 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import type { AgentPick, AgentProvider } from "@/lib/chat-socket"
@@ -99,17 +102,26 @@ export function TitleCard({
     mediaType: "movie" | "tv",
     verdict: Verdict,
   ) => void
-  onClearVerdict: (tmdbId: number, mediaType: "movie" | "tv") => void
+  // expectedVerdict is the verdict this card is currently showing — the
+  // caller sends it as a compare-and-delete guard, so a stale click (this
+  // card re-rendered from state that's since changed elsewhere) clears
+  // nothing instead of erasing whatever's actually there now.
+  onClearVerdict: (
+    tmdbId: number,
+    mediaType: "movie" | "tv",
+    expectedVerdict: Verdict,
+  ) => void
 }) {
   const runtime = formatRuntime(pick.runtime_minutes)
   const cast = pick.cast.slice(0, 3)
 
   const saved = verdict === "want_to_watch"
   const judgment = JUDGMENTS.find((j) => j.value === verdict)
-  // Shared by both controls, including the radio group below: a locked
-  // judgment must block every path to changing it, not just the dropdown's
-  // own trigger — see the DropdownMenuRadioGroup comment for why the trigger
-  // alone doesn't cover an already-open menu.
+  // Shared by the bookmark button and the radio group below, but *not* the
+  // dropdown trigger (see its own disabled prop) — a locked judgment still
+  // blocks switching straight to a different one, or to want_to_watch, but
+  // since T19.5 (DECISIONS.md "Locked judgments can be cleared") the menu
+  // itself must stay reachable so its "Clear rating" item can fire.
   const locked = pending || judgment != null
 
   return (
@@ -130,9 +142,11 @@ export function TitleCard({
         <CardAction className="flex items-center gap-1">
           {/* The primary save control (TASKS.md T18) — one tap, toggles,
               saves immediately, no confirmation. Disabled once a judgment is
-              locked (same condition as the dropdown trigger below) — a
-              locked judgment must not be silently overwritten by re-tapping
-              bookmark, and the gateway rejects that write anyway. */}
+              locked — want_to_watch must not be silently set over a locked
+              judgment, and the gateway rejects that write anyway. Unlike the
+              dropdown trigger below, this stays disabled while locked: there
+              is no "clear from the bookmark" path, only via the dropdown's
+              own clear item. */}
           <Button
             variant="ghost"
             size="icon-sm"
@@ -140,7 +154,7 @@ export function TitleCard({
             aria-label={saved ? "Remove from watchlist" : "Save to watchlist"}
             onClick={() =>
               saved
-                ? onClearVerdict(pick.tmdb_id, pick.media_type)
+                ? onClearVerdict(pick.tmdb_id, pick.media_type, "want_to_watch")
                 : onSetVerdict(pick.tmdb_id, pick.media_type, "want_to_watch")
             }
           >
@@ -150,18 +164,19 @@ export function TitleCard({
               <Bookmark className="size-4" />
             )}
           </Button>
-          {/* The smaller judgment control. Once one of the four judgments is
-              set the trigger disables — title_verdicts' migration comment
-              (20260903002450_verdicts.sql) states they never change, unlike
-              want_to_watch — and swaps to that judgment's own icon so the
-              locked state is still visible, not just inert. */}
+          {/* The smaller judgment control. Disabled only by `pending`, not
+              `locked` — once one of the four judgments is set the menu must
+              still open, so its "Clear rating" item (below) stays reachable
+              (T19.5, DECISIONS.md "Locked judgments can be cleared"). Swaps
+              to that judgment's own icon so the locked state is still
+              visible, not just inert. */}
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
                 <Button
                   variant="ghost"
                   size="icon-sm"
-                  disabled={locked}
+                  disabled={pending}
                   aria-label={
                     judgment ? `Rated: ${judgment.label}` : "Rate this title"
                   }
@@ -175,13 +190,14 @@ export function TitleCard({
               }
             />
             <DropdownMenuContent align="end">
-              {/* disabled here, not just on the trigger above: the trigger's
-                  disabled state only blocks *opening* the menu. If it's
-                  already open when a write completes and locks the judgment
-                  (or when a separate bookmark click starts one), an
-                  already-rendered item stays clickable regardless of the
-                  trigger — base-ui's MenuRadioGroup disabled prop propagates
-                  to every item, closing that gap directly. */}
+              {/* disabled here, not just on the trigger: switching directly
+                  to a *different* judgment stays blocked (the gateway's
+                  upsert guard still rejects it) — clearing first, below, is
+                  the only path to a new judgment. Also closes the same gap
+                  the trigger's disabled state can't: if the menu is already
+                  open when a write locks the judgment (or a separate
+                  bookmark click starts one), base-ui's MenuRadioGroup
+                  disabled prop propagates to every item regardless. */}
               <DropdownMenuRadioGroup
                 value={judgment?.value}
                 disabled={locked}
@@ -196,6 +212,24 @@ export function TitleCard({
                   </DropdownMenuRadioItem>
                 ))}
               </DropdownMenuRadioGroup>
+              {judgment && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    disabled={pending}
+                    onClick={() =>
+                      onClearVerdict(
+                        pick.tmdb_id,
+                        pick.media_type,
+                        judgment.value,
+                      )
+                    }
+                  >
+                    <RotateCcw />
+                    Clear rating
+                  </DropdownMenuItem>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </CardAction>
