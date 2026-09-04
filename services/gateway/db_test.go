@@ -305,14 +305,19 @@ func TestLoadVerdicts(t *testing.T) {
 		t.Errorf("Verdicts = %+v, want nil before any are set", vs)
 	}
 
-	// Explicit, distinct created_at values rather than the column default:
+	// Explicit, distinct verdict_set_at values rather than the column default:
 	// now() is transaction start time, so a multi-row insert stamps every row
 	// identically and "newest first" would be asserting on heap order.
+	//
+	// tmdb_id 303 deliberately has the *oldest* created_at (a title bookmarked
+	// long ago) but the *newest* verdict_set_at (liked just now) — the
+	// want_to_watch -> liked transition verdict_set_at exists for. If load
+	// were still ordering by created_at, 303 would sort last, not first.
 	if _, err := pool.Exec(ctx,
-		`insert into title_verdicts (user_id, tmdb_id, media_type, verdict, created_at)
-		 values ($1, 101, 'movie', 'seen', now() - interval '2 hours'),
-		        ($1, 202, 'tv', 'liked', now() - interval '1 hour'),
-		        ($1, 303, 'movie', 'want_to_watch', now())
+		`insert into title_verdicts (user_id, tmdb_id, media_type, verdict, created_at, verdict_set_at)
+		 values ($1, 101, 'movie', 'seen', now() - interval '3 hours', now() - interval '3 hours'),
+		        ($1, 202, 'tv', 'liked', now() - interval '2 hours', now() - interval '2 hours'),
+		        ($1, 303, 'movie', 'liked', now() - interval '5 hours', now() - interval '1 hour')
 		 on conflict do nothing`, id); err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +327,7 @@ func TestLoadVerdicts(t *testing.T) {
 		t.Fatalf("load with verdicts: %v", err)
 	}
 	want := []Verdict{
-		{TMDBID: 303, MediaType: "movie", Verdict: "want_to_watch"},
+		{TMDBID: 303, MediaType: "movie", Verdict: "liked"},
 		{TMDBID: 202, MediaType: "tv", Verdict: "liked"},
 		{TMDBID: 101, MediaType: "movie", Verdict: "seen"},
 	}
@@ -334,7 +339,7 @@ func TestLoadVerdicts(t *testing.T) {
 	// writing several rows, so now() stamps them identically. Without the
 	// tie-break their order is whatever the heap scan returns.
 	if _, err := pool.Exec(ctx,
-		`insert into title_verdicts (user_id, tmdb_id, media_type, verdict, created_at)
+		`insert into title_verdicts (user_id, tmdb_id, media_type, verdict, verdict_set_at)
 		 values ($1, 505, 'movie', 'liked', now() + interval '1 hour'),
 		        ($1, 404, 'movie', 'liked', now() + interval '1 hour')
 		 on conflict do nothing`, id); err != nil {
@@ -472,16 +477,7 @@ func TestSaveSubscription(t *testing.T) {
 	save := saveSubscription(pool)
 
 	const id = "sub_write_test"
-	t.Cleanup(func() {
-		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		pool.Exec(c, `delete from users where id = $1`, id)
-	})
-	if _, err := pool.Exec(ctx,
-		`insert into users (id, email) values ($1, $2) on conflict (id) do nothing`,
-		id, id+"@example.com"); err != nil {
-		t.Fatal(err)
-	}
+	newTestUser(t, pool, ctx, id)
 
 	exists := func() bool {
 		var n int
@@ -692,20 +688,31 @@ func TestGatewayRoleDeniesWithoutUserContext(t *testing.T) {
 	})
 }
 
-// saveVerdict (verdicts.go, T18): want_to_watch is fully mutable and the only
-// value a judgment may still be set from; once one of the four judgments is
-// set, the row is locked — title_verdicts' migration comment
-// (20260903002450_verdicts.sql) states those "never change." A fake-backed
-// unit test (verdicts_test.go) covers the HTTP layer; only a real database
-// proves the WHERE-guarded upsert's SQL and its RowsAffected-based lock
-// detection actually work, the same reason TestSaveSubscription and
-// TestUpsertUser run against testPool rather than a fake.
-func TestSaveVerdictLocksJudgments(t *testing.T) {
-	pool := testPool(t)
-	ctx := context.Background()
-	save := saveVerdict(pool)
+// currentVerdict reads one title's stored verdict, or false if no row
+// exists — shared by every saveVerdict test below rather than each defining
+// its own copy of the same lookup.
+func currentVerdict(t *testing.T, pool *pgxpool.Pool, ctx context.Context, userID string, tmdbID int) (string, bool) {
+	t.Helper()
+	var v string
+	err := pool.QueryRow(ctx,
+		`select verdict from title_verdicts where user_id = $1 and tmdb_id = $2 and media_type = 'movie'`,
+		userID, tmdbID).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false
+	}
+	if err != nil {
+		t.Fatalf("select verdict for tmdb %d: %v", tmdbID, err)
+	}
+	return v, true
+}
 
-	const id = "verdict_write_test"
+// newTestUser inserts (or reuses) a user row and registers its
+// cascade-delete cleanup — shared by every test below whose setup is exactly
+// this. Several other tests in this file need a differently-shaped seed (an
+// extra column, a pre-delete guard, multiple users) and are left as their own
+// inline blocks rather than bent to fit this signature.
+func newTestUser(t *testing.T, pool *pgxpool.Pool, ctx context.Context, id string) {
+	t.Helper()
 	t.Cleanup(func() {
 		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -716,71 +723,220 @@ func TestSaveVerdictLocksJudgments(t *testing.T) {
 		id, id+"@example.com"); err != nil {
 		t.Fatal(err)
 	}
+}
 
-	current := func() (string, bool) {
-		var v string
-		err := pool.QueryRow(ctx,
-			`select verdict from title_verdicts where user_id = $1 and tmdb_id = 550 and media_type = 'movie'`,
-			id).Scan(&v)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", false
-		}
-		if err != nil {
-			t.Fatalf("select: %v", err)
-		}
-		return v, true
-	}
+// saveVerdict (verdicts.go, T18): want_to_watch is fully mutable and the only
+// value a judgment may still be set from; once one of the four judgments is
+// set, a direct overwrite to a *different* verdict is locked — title_verdicts'
+// migration comment (20260903002450_verdicts.sql) states those "never change."
+// Since T19.5 (DECISIONS.md, "Locked judgments can be cleared") the row can
+// still be cleared and re-judged; only the one-step overwrite stays rejected.
+// A fake-backed unit test (verdicts_test.go) covers the HTTP layer; only a
+// real database proves the WHERE-guarded upsert's SQL and its
+// RowsAffected-based lock detection actually work, the same reason
+// TestSaveSubscription and TestUpsertUser run against testPool rather than a
+// fake.
+func TestSaveVerdictLocksJudgments(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveVerdict(pool)
 	strPtr := func(s string) *string { return &s }
+
+	const id = "verdict_write_test"
+	newTestUser(t, pool, ctx, id)
 
 	// want_to_watch is freely settable from nothing, and the expected
 	// transition into a judgment succeeds (T17: "expected to become seen
 	// later").
-	if err := save(ctx, id, 550, "movie", strPtr("want_to_watch")); err != nil {
+	if err := save(ctx, id, 550, "movie", strPtr("want_to_watch"), ""); err != nil {
 		t.Fatalf("set want_to_watch: %v", err)
 	}
-	if v, ok := current(); !ok || v != "want_to_watch" {
+	if v, ok := currentVerdict(t, pool, ctx, id, 550); !ok || v != "want_to_watch" {
 		t.Fatalf("current = %q, %v; want want_to_watch", v, ok)
 	}
-	if err := save(ctx, id, 550, "movie", strPtr("seen")); err != nil {
+	if err := save(ctx, id, 550, "movie", strPtr("seen"), ""); err != nil {
 		t.Fatalf("want_to_watch -> seen: %v", err)
 	}
-	if v, ok := current(); !ok || v != "seen" {
+	if v, ok := currentVerdict(t, pool, ctx, id, 550); !ok || v != "seen" {
 		t.Fatalf("current = %q, %v; want seen", v, ok)
 	}
 
 	// Once "seen" (a judgment), re-setting the same value is an idempotent
 	// no-op, but changing to a different judgment or back to want_to_watch is
 	// rejected.
-	if err := save(ctx, id, 550, "movie", strPtr("seen")); err != nil {
+	if err := save(ctx, id, 550, "movie", strPtr("seen"), ""); err != nil {
 		t.Errorf("idempotent re-set of the same judgment: %v", err)
 	}
-	if err := save(ctx, id, 550, "movie", strPtr("liked")); !errors.Is(err, errVerdictLocked) {
+	if err := save(ctx, id, 550, "movie", strPtr("liked"), ""); !errors.Is(err, errVerdictLocked) {
 		t.Errorf("seen -> liked: err = %v, want errVerdictLocked", err)
 	}
-	if err := save(ctx, id, 550, "movie", strPtr("want_to_watch")); !errors.Is(err, errVerdictLocked) {
+	if err := save(ctx, id, 550, "movie", strPtr("want_to_watch"), ""); !errors.Is(err, errVerdictLocked) {
 		t.Errorf("seen -> want_to_watch: err = %v, want errVerdictLocked", err)
 	}
-	if v, ok := current(); !ok || v != "seen" {
+	if v, ok := currentVerdict(t, pool, ctx, id, 550); !ok || v != "seen" {
 		t.Errorf("current = %q, %v after rejected writes; want unchanged seen", v, ok)
-	}
-
-	// A locked judgment isn't deletable either — the clear (nil verdict) is a
-	// no-op, not an error, matching setSubscription's idempotent DELETE.
-	if err := save(ctx, id, 550, "movie", nil); err != nil {
-		t.Errorf("clear on a locked judgment: %v", err)
-	}
-	if v, ok := current(); !ok || v != "seen" {
-		t.Errorf("current = %q, %v after clear on a locked judgment; want unchanged seen", v, ok)
 	}
 
 	// A fresh title (no row yet) can be judged directly, no want_to_watch
 	// detour required.
-	if err := save(ctx, id, 551, "movie", strPtr("disliked")); err != nil {
+	if err := save(ctx, id, 551, "movie", strPtr("disliked"), ""); err != nil {
 		t.Fatalf("fresh judgment: %v", err)
 	}
-	if err := pool.QueryRow(ctx,
-		`select verdict from title_verdicts where user_id = $1 and tmdb_id = 551 and media_type = 'movie'`,
-		id).Scan(new(string)); err != nil {
-		t.Errorf("fresh judgment row missing: %v", err)
+	if v, ok := currentVerdict(t, pool, ctx, id, 551); !ok || v != "disliked" {
+		t.Errorf("current = %q, %v; want disliked", v, ok)
 	}
+}
+
+// verdict_set_at (20260904154626_verdict_set_at.sql) must only refresh when
+// the verdict actually changes — an idempotent resubmit (a client retry
+// after a timed-out-but-succeeded request, say) must not bump a title's
+// recency and jump it ahead of a genuinely more recent one in loadVerdicts'
+// ordering. Asserted by exact equality between two reads, not "recent
+// enough": both a correct implementation and a regressed one (the upsert's
+// CASE bumping unconditionally) would pass a mere recency check, since both
+// writes happen within the same test run.
+func TestSaveVerdictSetAtOnlyBumpsOnRealChange(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveVerdict(pool)
+	strPtr := func(s string) *string { return &s }
+
+	const id = "verdict_set_at_test"
+	newTestUser(t, pool, ctx, id)
+
+	readSetAt := func() time.Time {
+		t.Helper()
+		var setAt time.Time
+		if err := pool.QueryRow(ctx,
+			`select verdict_set_at from title_verdicts where user_id = $1 and tmdb_id = 550 and media_type = 'movie'`,
+			id).Scan(&setAt); err != nil {
+			t.Fatalf("select verdict_set_at: %v", err)
+		}
+		return setAt
+	}
+
+	if err := save(ctx, id, 550, "movie", strPtr("want_to_watch"), ""); err != nil {
+		t.Fatalf("set want_to_watch: %v", err)
+	}
+	if err := save(ctx, id, 550, "movie", strPtr("seen"), ""); err != nil {
+		t.Fatalf("want_to_watch -> seen: %v", err)
+	}
+	afterRealChange := readSetAt()
+
+	if err := save(ctx, id, 550, "movie", strPtr("seen"), ""); err != nil {
+		t.Fatalf("idempotent re-set: %v", err)
+	}
+	if afterIdempotentReset := readSetAt(); !afterIdempotentReset.Equal(afterRealChange) {
+		t.Errorf("verdict_set_at = %v after an idempotent re-set, want unchanged %v", afterIdempotentReset, afterRealChange)
+	}
+}
+
+// Clearing (verdict == nil) is a compare-and-delete: it only removes the row
+// when it still holds the exact verdict the caller expects — the same idiom
+// TestSaveVerdictLocksJudgments' upsert already uses. This is what keeps a
+// stale client (a second tab that hasn't seen a write made elsewhere) safe:
+// a mismatched clear is rejected with errVerdictStale rather than either
+// silently succeeding or silently touching the wrong row, whether the
+// mismatch is between want_to_watch and a judgment or between two different
+// judgments. Each scenario below is independent, not a narrative on one
+// title, so each runs as its own subtest — a failure in one must not mask
+// or abort the others.
+func TestSaveVerdictClearIsScopedToExpectedVerdict(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveVerdict(pool)
+	strPtr := func(s string) *string { return &s }
+
+	const id = "verdict_clear_scope_test"
+	newTestUser(t, pool, ctx, id)
+
+	t.Run("bookmark happy path", func(t *testing.T) {
+		// Previously untested against a real database: clearing a
+		// want_to_watch row when the expected value still matches actually
+		// removes it.
+		if err := save(ctx, id, 601, "movie", strPtr("want_to_watch"), ""); err != nil {
+			t.Fatalf("seed want_to_watch: %v", err)
+		}
+		if err := save(ctx, id, 601, "movie", nil, "want_to_watch"); err != nil {
+			t.Errorf("clear matching want_to_watch: %v", err)
+		}
+		if _, ok := currentVerdict(t, pool, ctx, id, 601); ok {
+			t.Errorf("still present after a matching want_to_watch clear")
+		}
+	})
+
+	t.Run("bookmark clear against an already absent row is a silent no-op", func(t *testing.T) {
+		// The row never existed — an idempotent double-click or a retried
+		// request must not error just because there's nothing to remove.
+		if err := save(ctx, id, 605, "movie", nil, "want_to_watch"); err != nil {
+			t.Errorf("clear on an absent row: %v", err)
+		}
+	})
+
+	t.Run("stale bookmark clear against a locked judgment is rejected, not silent", func(t *testing.T) {
+		// A stale bookmark tab expecting want_to_watch against a row that's
+		// since become a locked judgment — the original multi-tab race this
+		// scoping exists to prevent. Rejected with errVerdictStale rather
+		// than a silent no-op, so the caller's optimistic UI has a signal
+		// to correct itself instead of drifting from the server forever.
+		if err := save(ctx, id, 602, "movie", strPtr("want_to_watch"), ""); err != nil {
+			t.Fatalf("seed want_to_watch: %v", err)
+		}
+		if err := save(ctx, id, 602, "movie", strPtr("seen"), ""); err != nil {
+			t.Fatalf("want_to_watch -> seen: %v", err)
+		}
+		if err := save(ctx, id, 602, "movie", nil, "want_to_watch"); !errors.Is(err, errVerdictStale) {
+			t.Errorf("mismatched want_to_watch clear against seen: err = %v, want errVerdictStale", err)
+		}
+		if v, ok := currentVerdict(t, pool, ctx, id, 602); !ok || v != "seen" {
+			t.Errorf("current = %q, %v after a mismatched clear; want unchanged seen", v, ok)
+		}
+	})
+
+	t.Run("judgment happy path", func(t *testing.T) {
+		// Clearing a locked judgment when the expected value matches
+		// exactly actually removes it (T19.5, DECISIONS.md "Locked
+		// judgments can be cleared").
+		if err := save(ctx, id, 603, "movie", strPtr("liked"), ""); err != nil {
+			t.Fatalf("seed liked: %v", err)
+		}
+		if err := save(ctx, id, 603, "movie", nil, "liked"); err != nil {
+			t.Errorf("clear matching liked: %v", err)
+		}
+		if _, ok := currentVerdict(t, pool, ctx, id, 603); ok {
+			t.Errorf("still present after a matching liked clear")
+		}
+	})
+
+	t.Run("stale judgment clear against a different judgment is rejected", func(t *testing.T) {
+		// A stale "Clear rating" click expecting the judgment it last saw,
+		// against a row that's since become a *different* judgment.
+		// Comparing against the exact expected value (not just "any
+		// judgment") is what closes the race between two different
+		// judgments a coarser scope would leave open. Seeded directly as
+		// "disliked" — no need to route through "liked" first, since only
+		// the end state (a locked judgment other than "liked") matters here.
+		if err := save(ctx, id, 604, "movie", strPtr("disliked"), ""); err != nil {
+			t.Fatalf("seed disliked: %v", err)
+		}
+		if err := save(ctx, id, 604, "movie", nil, "liked"); !errors.Is(err, errVerdictStale) {
+			t.Errorf("mismatched liked clear against disliked: err = %v, want errVerdictStale", err)
+		}
+		if v, ok := currentVerdict(t, pool, ctx, id, 604); !ok || v != "disliked" {
+			t.Errorf("current = %q, %v after a mismatched judgment clear; want unchanged disliked", v, ok)
+		}
+
+		// Clearing and re-judging stay two explicit steps: after a real
+		// clear, the row is gone, so a new judgment is a fresh insert, not
+		// a rejected overwrite of a locked one.
+		if err := save(ctx, id, 604, "movie", nil, "disliked"); err != nil {
+			t.Fatalf("clear disliked: %v", err)
+		}
+		if err := save(ctx, id, 604, "movie", strPtr("liked"), ""); err != nil {
+			t.Errorf("re-judge after clearing a locked judgment: %v", err)
+		}
+		if v, ok := currentVerdict(t, pool, ctx, id, 604); !ok || v != "liked" {
+			t.Errorf("current = %q, %v after re-judging a cleared row; want liked", v, ok)
+		}
+	})
 }

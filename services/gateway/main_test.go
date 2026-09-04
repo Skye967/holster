@@ -108,8 +108,10 @@ func noopSaveSubscription(context.Context, string, int, bool) error { return nil
 
 // verdicts.go's own dependencies, for the same reason — verdicts_test.go
 // covers loadVerdicts/saveVerdict for real.
-func noopLoadVerdicts(context.Context, string) ([]Verdict, error)         { return nil, nil }
-func noopSaveVerdict(context.Context, string, int, string, *string) error { return nil }
+func noopLoadVerdicts(context.Context, string) ([]Verdict, error) { return nil, nil }
+func noopSaveVerdict(context.Context, string, int, string, *string, string) error {
+	return nil
+}
 
 // watchlist.go's own dependencies, for the same reason — watchlist_test.go
 // covers loadWatchlistItems/callAgentTitles for real.

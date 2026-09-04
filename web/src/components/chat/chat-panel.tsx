@@ -20,9 +20,13 @@ import {
   withTimeout,
 } from "@/lib/gateway"
 import {
+  VERDICT_LOCKED_TEXT,
+  VERDICT_STALE_TEXT,
   VerdictLockedError,
+  VerdictStaleError,
   fetchVerdicts,
   verdictKey,
+  verdictUrl,
   type Verdict,
 } from "@/lib/verdicts"
 
@@ -119,7 +123,11 @@ function TurnView({
     mediaType: "movie" | "tv",
     verdict: Verdict,
   ) => void
-  onClearVerdict: (tmdbId: number, mediaType: "movie" | "tv") => void
+  onClearVerdict: (
+    tmdbId: number,
+    mediaType: "movie" | "tv",
+    expectedVerdict: Verdict,
+  ) => void
 }) {
   // No field has arrived yet — "Thinking…" rather than a blank screen.
   // Update alongside applyEvent if Turn gains a new optional field.
@@ -231,12 +239,30 @@ export function ChatPanel() {
   // Shared by setVerdict/clearVerdict: optimistic update, then the write,
   // reverting on failure — streaming-picker.tsx's toggle() pattern (TASKS.md's
   // cross-cutting rule: "optimistic UI needs a rollback path").
+  //
+  // expectedVerdict only matters when verdict is undefined (a DELETE): it's
+  // the verdict this card is currently showing, sent as ?expect=<verdict> so
+  // the gateway only clears the row when it still matches — a
+  // compare-and-delete, the same idiom the PUT path's own conditional upsert
+  // already uses. See verdicts.go's saveVerdict for why: a stale client (a
+  // second tab that hasn't seen a write made elsewhere) then gets a safe
+  // no-op instead of erasing whatever's actually there now.
   const writeVerdict = useCallback(
     async (
       tmdbId: number,
       mediaType: "movie" | "tv",
       verdict: Verdict | undefined,
+      expectedVerdict?: Verdict,
     ) => {
+      // expectedVerdict is only meaningless for a PUT (verdict set); a DELETE
+      // (verdict undefined) always needs it — the gateway's ?expect is
+      // required, and building the URL below with it missing would silently
+      // send the literal string "undefined" instead of failing loudly here.
+      if (verdict === undefined && expectedVerdict === undefined) {
+        throw new Error(
+          "writeVerdict: expectedVerdict is required to clear a verdict",
+        )
+      }
       const key = verdictKey(tmdbId, mediaType)
       touchedVerdictsRef.current.add(key)
       // Captured inside the functional updater rather than read from the
@@ -259,7 +285,11 @@ export function ChatPanel() {
         const signal = AbortSignal.timeout(GATEWAY_CALL_TIMEOUT_MS)
         const res = await withTimeout(
           gatewayFetch(
-            `/api/verdicts/${mediaType}/${tmdbId}`,
+            verdictUrl(
+              mediaType,
+              tmdbId,
+              verdict === undefined ? expectedVerdict : undefined,
+            ),
             verdict === undefined
               ? { method: "DELETE", signal }
               : {
@@ -272,11 +302,21 @@ export function ChatPanel() {
           ),
           GATEWAY_CALL_TIMEOUT_MS,
         )
-        // 409 means the gateway's judgment lock rejected the write (verdicts.go's
-        // errVerdictLocked) — a distinct case from a transient failure, since
-        // retrying can never succeed. DELETE never 409s (it's idempotent), so
-        // this check is only ever hit on the PUT path.
-        if (res.status === 409) throw new VerdictLockedError()
+        // 409 means the gateway rejected the write — a distinct case from a
+        // transient failure, since retrying can never succeed as-is. Two
+        // different causes share this status: a PUT hitting the judgment
+        // lock (verdicts.go's errVerdictLocked, code "verdict_locked") or a
+        // DELETE whose ?expect no longer matches (errVerdictStale, code
+        // "verdict_stale"). Read from the body's stable code, not inferred
+        // from which request this was — inferring from the HTTP method
+        // would silently misattribute the moment either path grows a second
+        // 409 cause.
+        if (res.status === 409) {
+          const body: { code?: string } = await res.json().catch(() => ({}))
+          if (body.code === "verdict_stale") throw new VerdictStaleError()
+          if (body.code === "verdict_locked") throw new VerdictLockedError()
+          throw new Error(`status 409, unrecognized code ${body.code}`)
+        }
         if (!res.ok) throw new Error(`status ${res.status}`)
         setVerdictStatus((prev) => ({ ...prev, [key]: { pending: false } }))
       } catch (err) {
@@ -299,8 +339,10 @@ export function ChatPanel() {
               err instanceof GatewaySessionExpiredError
                 ? SESSION_EXPIRED_TEXT
                 : err instanceof VerdictLockedError
-                  ? "That title's already been rated and can't be changed"
-                  : "Couldn't save that — try again",
+                  ? VERDICT_LOCKED_TEXT
+                  : err instanceof VerdictStaleError
+                    ? VERDICT_STALE_TEXT
+                    : "Couldn't save that — try again",
           },
         }))
       }
@@ -314,8 +356,8 @@ export function ChatPanel() {
     [writeVerdict],
   )
   const handleClearVerdict = useCallback(
-    (tmdbId: number, mediaType: "movie" | "tv") =>
-      writeVerdict(tmdbId, mediaType, undefined),
+    (tmdbId: number, mediaType: "movie" | "tv", expectedVerdict: Verdict) =>
+      writeVerdict(tmdbId, mediaType, undefined, expectedVerdict),
     [writeVerdict],
   )
 

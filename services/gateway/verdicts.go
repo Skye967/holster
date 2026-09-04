@@ -45,21 +45,25 @@ type Verdict struct {
 //
 // Newest-first because the agent keeps only the first few liked titles for
 // its taste hint (catalog_tool.py's MAX_TASTE_TITLES) and carries no
-// timestamp to re-sort by; /api/verdicts is indifferent. created_at is a
-// proxy, not the truth — saveVerdict's conflict clause below leaves it
-// alone, so a title bookmarked in January and liked today still sorts as
-// January. Exact for a judgment set directly on a title, stale only for the
-// want_to_watch -> liked lifecycle. saveVerdict writes one row per
-// transaction, so production timestamps are distinct and the tie-break is
-// only insurance - it keeps the order total if a batched write or a backfill
-// ever makes them tie, which is what db_test.go exercises.
+// timestamp to re-sort by; /api/verdicts is indifferent. Ordered by
+// verdict_set_at (20260904154626_verdict_set_at.sql), not created_at:
+// saveVerdict's conflict clause refreshes verdict_set_at on every write, so a
+// title bookmarked in January and liked today correctly sorts as today.
+// created_at is kept as an untouched "first saved" audit column — its only
+// remaining reader is watchlist.go's loadWatchlistItems, which still orders
+// want_to_watch rows by it (correct there: a bookmark's created_at is only
+// ever set once, on insert, and a cleared-then-rebookmarked row is a fresh
+// insert with a fresh timestamp). saveVerdict writes one row per transaction, so
+// production timestamps are distinct and the tie-break is only insurance -
+// it keeps the order total if a batched write or a backfill ever makes them
+// tie, which is what db_test.go exercises.
 //
 // Uncapped, because the agent needs every row to answer "has this user judged
 // this title" - a LIMIT would quietly expire T19's guarantee once someone had
 // judged enough titles. Note the sort is not index-covered: title_verdicts
 // has only its primary key (user_id, tmdb_id, media_type), so this fetches
 // the user's rows and sorts them. Fine at these sizes; a
-// (user_id, created_at desc) index is the fix if it stops being.
+// (user_id, verdict_set_at desc) index is the fix if it stops being.
 func loadVerdicts(db *pgxpool.Pool) func(ctx context.Context, userID string) ([]Verdict, error) {
 	return func(ctx context.Context, userID string) ([]Verdict, error) {
 		var verdicts []Verdict
@@ -67,7 +71,7 @@ func loadVerdicts(db *pgxpool.Pool) func(ctx context.Context, userID string) ([]
 			rows, err := tx.Query(ctx,
 				`select tmdb_id, media_type, verdict from title_verdicts
 				 where user_id = $1
-				 order by created_at desc, media_type, tmdb_id`,
+				 order by verdict_set_at desc, media_type, tmdb_id`,
 				userID)
 			if err != nil {
 				return err
@@ -86,33 +90,78 @@ func loadVerdicts(db *pgxpool.Pool) func(ctx context.Context, userID string) ([]
 	}
 }
 
-// errVerdictLocked is returned by saveVerdict when the write would change one
-// of the four judgments after it's already set — title_verdicts' migration
-// comment (20260903002450_verdicts.sql) states those "never change" once set
-// and assigns enforcing that to "whichever task builds the write path." Only
-// want_to_watch is exempt: TASKS.md's T17 entry describes it as "an intention
-// with a lifecycle, expected to become seen later," never the reverse.
+// errVerdictLocked is returned by saveVerdict when a PUT would change one of
+// the four judgments directly to a *different* value after it's already set
+// — title_verdicts' migration comment (20260903002450_verdicts.sql) states
+// those "never change" once set and assigns enforcing that to "whichever task
+// builds the write path." Only want_to_watch is exempt: TASKS.md's T17 entry
+// describes it as "an intention with a lifecycle, expected to become seen
+// later," never the reverse. Since T19.5 (DECISIONS.md, "Locked judgments can
+// be cleared") a locked judgment can still be *cleared* via DELETE and then
+// re-set — this error is only ever about overwriting one verdict with
+// another in a single step, never about whether a judgment can change at
+// all.
 var errVerdictLocked = errors.New("verdict already set and cannot change")
+
+// errVerdictStale is returned by saveVerdict when a DELETE's ?expect doesn't
+// match because the row now holds a *different* verdict (not because it's
+// already gone, which stays a silent no-op — see saveVerdict's own comment).
+// Left unreported, the caller's optimistic "cleared" UI would silently
+// disagree with the server for the rest of the session, surfacing later only
+// as a confusing 409 on an unrelated PUT.
+var errVerdictStale = errors.New("verdict no longer matches what the caller expected")
 
 // saveVerdict mirrors saveSubscription's shape (providers.go): one function
 // branching on state rather than a separate upsert/delete pair. A nil verdict
 // deletes the row; otherwise it upserts. Both are idempotent, run inside
 // withUser so verdict_isolation's RLS policy
 // (20260903002450_verdicts.sql) applies.
-func saveVerdict(db *pgxpool.Pool) func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error {
-	return func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string) error {
+func saveVerdict(db *pgxpool.Pool) func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error {
+	return func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error {
 		return withUser(ctx, db, userID, func(tx pgx.Tx) error {
 			if verdict == nil {
-				// A locked judgment isn't deletable either — the only
-				// legitimate caller (the bookmark's clear button) only ever
-				// fires when the stored verdict is want_to_watch, so this
-				// guard only closes the raw-API loophole. Idempotent either
-				// way, matching setSubscription's DELETE convention: 0 rows
-				// affected (nothing to delete, or a locked row) is success.
-				_, err := tx.Exec(ctx,
-					`delete from title_verdicts
+				// Compare-and-delete, not an unconditional clear: only
+				// removes the row when it still holds the exact verdict the
+				// caller believes is there — the same idiom the upsert below
+				// already uses (its WHERE only updates when the existing
+				// value matches an expected one). Before T19.5 this clause
+				// was hardcoded to `verdict = 'want_to_watch'`, so a stale
+				// client (e.g. a second tab that hasn't seen a write made
+				// elsewhere) clicking an outdated control was always a safe
+				// no-op — the WHERE simply matched nothing. Comparing against
+				// the caller's own expected value generalizes that same
+				// safety to every verdict, including locked judgments.
+				//
+				// FOR UPDATE, not a bare SELECT then DELETE: it locks the row
+				// (if one exists) for the rest of this transaction, so no
+				// concurrent write can land between the read and the decision
+				// below — the same atomicity the upsert's single
+				// INSERT..ON CONFLICT statement gets for free, made explicit
+				// here since a DELETE has no equivalent one-statement form.
+				var current string
+				err := tx.QueryRow(ctx,
+					`select verdict from title_verdicts
 					 where user_id = $1 and tmdb_id = $2 and media_type = $3
-					   and verdict = 'want_to_watch'`,
+					 for update`,
+					userID, tmdbID, mediaType).Scan(&current)
+				if errors.Is(err, pgx.ErrNoRows) {
+					// Already gone — a double-click or a retried request,
+					// matching setSubscription's idempotent DELETE convention.
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				if current != expectedVerdict {
+					// Still there, holding something else: the caller's local
+					// state is stale. Silently returning success here would
+					// let the browser's optimistic "cleared" UI drift from
+					// the server forever, with no refetch to correct it.
+					return errVerdictStale
+				}
+				_, err = tx.Exec(ctx,
+					`delete from title_verdicts
+					 where user_id = $1 and tmdb_id = $2 and media_type = $3`,
 					userID, tmdbID, mediaType)
 				return err
 			}
@@ -121,12 +170,26 @@ func saveVerdict(db *pgxpool.Pool) func(ctx context.Context, userID string, tmdb
 			// row is still want_to_watch (the one mutable value) or already
 			// holds the requested verdict (an idempotent no-op) — once a row
 			// holds a different judgment, this WHERE excludes it and
-			// RowsAffected is 0, which the caller maps to a 409.
+			// RowsAffected is 0, which the caller maps to a 409. Unchanged by
+			// T19.5: only DELETE (above) was broadened, so setting a
+			// *different* verdict over a locked one is still rejected — the
+			// caller must clear it first.
+			//
+			// verdict_set_at (20260904154626_verdict_set_at.sql) only
+			// refreshes when the verdict actually changes, not on the
+			// idempotent-resubmit branch above — a duplicate PUT (a client
+			// retry after a timed-out-but-succeeded request, say) must not
+			// bump a title's recency and jump it ahead of a genuinely more
+			// recent one in loadVerdicts' ordering.
 			tag, err := tx.Exec(ctx, `
 				insert into title_verdicts (user_id, tmdb_id, media_type, verdict)
 				values ($1, $2, $3, $4)
 				on conflict (user_id, tmdb_id, media_type) do update
-					set verdict = excluded.verdict
+					set verdict = excluded.verdict,
+						verdict_set_at = case
+							when title_verdicts.verdict != excluded.verdict then now()
+							else title_verdicts.verdict_set_at
+						end
 					where title_verdicts.verdict = 'want_to_watch'
 					   or title_verdicts.verdict = excluded.verdict`,
 				userID, tmdbID, mediaType, *verdict)
@@ -164,11 +227,18 @@ type setVerdictBody struct {
 }
 
 // setVerdict is PUT/DELETE /api/verdicts/{mediaType}/{tmdbID}. PUT upserts the
-// given verdict (body: {"verdict": "..."}); DELETE clears whatever verdict is
-// stored, if any — both idempotent, mirroring setSubscription (providers.go).
-// mediaType comes first in the path to match TMDB's own convention
-// (agent/tmdb.py's /{media_type}/{id} calls), not the primary key's column
-// order.
+// given verdict (body: {"verdict": "..."}); DELETE clears it, but only when
+// it still matches the caller's required ?expect=<verdict> — both idempotent,
+// mirroring setSubscription (providers.go). mediaType comes first in the path
+// to match TMDB's own convention (agent/tmdb.py's /{media_type}/{id} calls),
+// not the primary key's column order.
+//
+// ?expect is required on DELETE, not optional: every real caller
+// (title-card.tsx's bookmark and its "Clear rating" item) already knows
+// exactly what verdict it's showing, and validating it the same way PUT's
+// body is validated closes the door on an unscoped "clear whatever's there"
+// call — see saveVerdict's comment for why that scoping is what keeps a
+// stale client safe.
 func (h *Handler) setVerdict(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(ctxUserID).(string)
 
@@ -184,6 +254,7 @@ func (h *Handler) setVerdict(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var verdict *string
+	var expectedVerdict string
 	if r.Method == http.MethodPut {
 		var body setVerdictBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !verdictValues[body.Verdict] {
@@ -191,17 +262,41 @@ func (h *Handler) setVerdict(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		verdict = &body.Verdict
+	} else {
+		expectedVerdict = r.URL.Query().Get("expect")
+		if !verdictValues[expectedVerdict] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing or invalid expect"})
+			return
+		}
 	}
 
-	if err := h.saveVerdict(r.Context(), userID, tmdbID, mediaType, verdict); err != nil {
+	if err := h.saveVerdict(r.Context(), userID, tmdbID, mediaType, verdict, expectedVerdict); err != nil {
 		if errors.Is(err, errVerdictLocked) {
 			// Not routine like an expired token, but not a server failure
-			// either — the normal UI path never attempts this (title-card.tsx
-			// disables both controls once a judgment is locked), so reaching
-			// here means a stale client or a direct API call.
+			// either. Since T19.5, clearing a locked judgment *is* a normal
+			// UI path (title-card.tsx's "Clear rating") — this only fires on
+			// a PUT attempting to overwrite a locked judgment with a
+			// different one directly, which the UI still disables, so
+			// reaching here means a stale client or a direct API call.
 			slog.WarnContext(r.Context(), "verdict write rejected: already locked",
 				"tmdb_id", tmdbID, "media_type", mediaType)
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "verdict already set"})
+			// code is the machine-readable discriminant: two different
+			// errors both 409, and a client that infers which one from the
+			// HTTP method alone (PUT vs DELETE) breaks the moment either
+			// path grows a second cause. code is stable across wording
+			// changes to error, which is meant for logs/humans, not dispatch.
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "verdict already set", "code": "verdict_locked"})
+			return
+		}
+		if errors.Is(err, errVerdictStale) {
+			// Distinct from errVerdictLocked's 409: this is DELETE finding a
+			// row that's still there but no longer matches ?expect — the
+			// caller's local state is stale, not blocked by a lock. Worth a
+			// log (unlike the ordinary already-gone no-op) since it means an
+			// optimistic UI was about to silently disagree with the server.
+			slog.WarnContext(r.Context(), "verdict clear rejected: no longer matches expected value",
+				"tmdb_id", tmdbID, "media_type", mediaType)
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "verdict has changed", "code": "verdict_stale"})
 			return
 		}
 		slog.ErrorContext(r.Context(), "verdict write failed", "error", dbError(err))

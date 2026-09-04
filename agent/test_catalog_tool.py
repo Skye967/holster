@@ -927,7 +927,14 @@ def test_search_does_not_relax_when_every_candidate_is_judged() -> None:
     """Exclusion happens after the ladder, not inside discover(): a page the
     user has entirely judged must not be reported as constraints having been
     loosened, which would make chat.py tell them nothing matched "even after
-    loosening how long" when plenty matched."""
+    loosening how long" when plenty matched.
+
+    The top-up still fires here (exclusion is non-empty and the page had a
+    real candidate) — it's the second discover() call, and FakeTMDB's
+    unqueued-path default ({"results": []}) means it rescues nothing, so
+    all_judged stays true. That second call is exactly the behaviour this
+    task adds; see the top-up tests below for the case where it does find
+    something."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
 
@@ -943,7 +950,98 @@ def test_search_does_not_relax_when_every_candidate_is_judged() -> None:
 
     assert result.picks == []
     assert result.relaxed == []
+    assert fake_tmdb.count("/discover/movie") == 2
+
+
+# --- verdicts: pagination top-up (T19.5) ------------------------------------
+
+
+def test_search_tops_up_from_the_next_page_when_exclusion_leaves_too_few() -> None:
+    """A judged-out first page still returns a full set of picks — the
+    done-when this task adds. Exclusion trimming below intent.limit pulls
+    exactly one more page and merges it in before rank()."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok(
+        "/discover/movie", {"results": [raw_movie(i) for i in range(101, 106)]}
+    )
+    fake_tmdb.ok(
+        "/discover/movie", {"results": [raw_movie(i) for i in range(201, 204)]}
+    )
+    seen: list[list[Title]] = []
+
+    _search_with_verdicts(
+        fake_tmdb,
+        [
+            _verdict(101, "seen"),
+            _verdict(102, "disliked"),
+            _verdict(103, "not_interested"),
+        ],
+        _capture_rank(seen),
+    )
+
+    assert fake_tmdb.count("/discover/movie") == 2
+    assert fake_tmdb.all_params_for("/discover/movie")[1]["page"] == "2"
+    assert [c["tmdb_id"] for c in seen[0]] == [104, 105, 201, 202, 203]
+
+
+def test_search_does_not_top_up_when_nothing_was_excluded() -> None:
+    """The top-up guard is scoped to exclusion, not any short page — a query
+    that legitimately has few results elsewhere must not spend an extra
+    round trip chasing a fuller page that was never taken away."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
+
+    _search_with_verdicts(fake_tmdb, [], _capture_rank([]))
+
     assert fake_tmdb.count("/discover/movie") == 1
+
+
+def test_search_does_not_top_up_when_this_page_lost_nothing_to_exclusion() -> None:
+    """A returning user with verdicts on *other* titles must not pay for a
+    top-up just because their verdict history is non-empty — the guard has
+    to check whether this page actually lost anything, not just whether the
+    user has judged something somewhere before."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
+    seen: list[list[Title]] = []
+
+    _search_with_verdicts(fake_tmdb, [_verdict(999, "seen")], _capture_rank(seen))
+
+    assert fake_tmdb.count("/discover/movie") == 1
+    assert [c["tmdb_id"] for c in seen[0]] == [101]
+
+
+def test_search_stays_all_judged_when_the_topped_up_page_is_also_excluded() -> None:
+    """Rescue only counts when the second page adds something eligible — if
+    it's judged too, the page is still fully judged, not "found more"."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
+    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(102)]})
+
+    result = _search_with_verdicts(
+        fake_tmdb,
+        [_verdict(101, "seen"), _verdict(102, "seen")],
+        rank_must_not_run(ALL_JUDGED),
+    )
+
+    assert result.all_judged is True
+    assert fake_tmdb.count("/discover/movie") == 2
+
+
+def test_search_rescues_an_all_excluded_page_from_the_next_one() -> None:
+    """Nothing survives page 1, but page 2 has a fresh, unjudged title —
+    all_judged must reflect the rescue, not the page-1 wipeout."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
+    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(201)]})
+    seen: list[list[Title]] = []
+
+    result = _search_with_verdicts(
+        fake_tmdb, [_verdict(101, "seen")], _capture_rank(seen)
+    )
+
+    assert result.all_judged is False
+    assert [c["tmdb_id"] for c in seen[0]] == [201]
 
 
 def test_search_gives_liked_titles_to_rank_but_never_to_interpret() -> None:
