@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -330,7 +331,7 @@ func fakeAgentEvents(events ...agentEvent) agentCaller {
 // newChatTestServer wires a full Handler (real ticket store, real WS routing)
 // with fake loadChatCtx/callAgent, and returns an httptest.Server plus a
 // ready-to-use Bearer token for its one test user.
-func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chatContext, error), callAgent agentCaller) (*httptest.Server, string) {
+func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chatContext, error), callAgent agentCaller, loadVerdicts func(context.Context, string) ([]Verdict, error)) (*httptest.Server, string) {
 	t.Helper()
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -347,7 +348,7 @@ func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chat
 		func(context.Context, string, string) error { return nil },
 		loadCtx, callAgent, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
-		noopLoadVerdicts, noopSaveVerdict,
+		loadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 	)
 	if err != nil {
@@ -398,7 +399,7 @@ func dialChat(t *testing.T, srv *httptest.Server, ticket string) *websocket.Conn
 }
 
 func TestChatTicketIsRequiredToOpenTheSocket(t *testing.T) {
-	srv, _ := newChatTestServer(t, noopChatCtx, noopAgentCaller)
+	srv, _ := newChatTestServer(t, noopChatCtx, noopAgentCaller, noopLoadVerdicts)
 	url := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ws/chat?ticket=bogus"
 	_, resp, err := websocket.Dial(t.Context(), url, nil)
 	if err == nil {
@@ -427,7 +428,7 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 		}}},
 		agentEvent{Type: "done"},
 	)
-	srv, token := newChatTestServer(t, loadCtx, callAgent)
+	srv, token := newChatTestServer(t, loadCtx, callAgent, noopLoadVerdicts)
 	ticket := mintTicket(t, srv, token)
 	conn := dialChat(t, srv, ticket)
 
@@ -485,7 +486,7 @@ func TestChatTurnSendsProviderNamesToTheAgent(t *testing.T) {
 		close(events)
 		return events, nil
 	}
-	srv, token := newChatTestServer(t, loadCtx, callAgent)
+	srv, token := newChatTestServer(t, loadCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "what can you do?"})
@@ -506,7 +507,7 @@ func TestChatErrorReasonBecomesFriendlyText(t *testing.T) {
 		return cc, nil
 	}
 	callAgent := fakeAgentEvents(agentEvent{Type: "error", Reason: "tmdb_unavailable"})
-	srv, token := newChatTestServer(t, loadCtx, callAgent)
+	srv, token := newChatTestServer(t, loadCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
@@ -535,7 +536,7 @@ func TestChatCancelStopsTheAgentCall(t *testing.T) {
 		sawCancel.Store(true)
 		return nil, ctx.Err()
 	}
-	srv, token := newChatTestServer(t, noopChatCtx, callAgent)
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
@@ -576,7 +577,7 @@ func TestChatNewMessageSupersedesTheInFlightTurn(t *testing.T) {
 		return ch, nil
 	}
 
-	srv, token := newChatTestServer(t, noopChatCtx, callAgent)
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "first"})
@@ -616,7 +617,8 @@ func TestRunTurnDoesNotBlockSendingToAnUnreadDoneChannel(t *testing.T) {
 	done := make(chan turnRecord) // unbuffered, no reader
 
 	h := &Handler{
-		loadChatCtx: noopChatCtx,
+		loadChatCtx:  noopChatCtx,
+		loadVerdicts: noopLoadVerdicts,
 		callAgent: func(context.Context, agentChatRequest) (<-chan agentEvent, error) {
 			ch := make(chan agentEvent)
 			close(ch)
@@ -649,7 +651,7 @@ func TestChatCancelsTurnContextPromptlyOnNormalCompletion(t *testing.T) {
 		close(ch)
 		return ch, nil
 	}
-	srv, token := newChatTestServer(t, noopChatCtx, callAgent)
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
@@ -688,7 +690,7 @@ func TestChatDroppedAgentStreamStillSendsATerminalEvent(t *testing.T) {
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US", Providers: []int{8}}, nil
 	}
-	srv, token := newChatTestServer(t, loadCtx, callAgent)
+	srv, token := newChatTestServer(t, loadCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
@@ -722,7 +724,7 @@ func TestChatUnknownAgentEventTypeIsLoggedAndSkipped(t *testing.T) {
 		agentEvent{Type: "some_future_type"},
 		agentEvent{Type: "done"},
 	)
-	srv, token := newChatTestServer(t, noopChatCtx, callAgent)
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
@@ -750,7 +752,7 @@ func TestChatMalformedIntentIsLogged(t *testing.T) {
 		agentEvent{Type: "intent", Intent: json.RawMessage(`not-json`)},
 		agentEvent{Type: "done"},
 	)
-	srv, token := newChatTestServer(t, noopChatCtx, callAgent)
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
@@ -786,5 +788,108 @@ func TestInterpretingLineSurfacesKeywordsExclusionsAndCastCrew(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Errorf("interpretingLine() = %q, missing %q", line, want)
 		}
+	}
+}
+
+// TestChatTurnSendsVerdictsToTheAgent proves runTurn forwards what
+// loadVerdicts returns on to the agent (TASKS.md T19) — a load of its own,
+// not a field on chatContext, which is why this is the one call site that
+// passes a real loadVerdicts rather than the noop.
+func TestChatTurnSendsVerdictsToTheAgent(t *testing.T) {
+	verdicts := []Verdict{
+		{TMDBID: 101, MediaType: "movie", Verdict: "seen"},
+		{TMDBID: 202, MediaType: "tv", Verdict: "liked"},
+	}
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8}}, nil
+	}
+	loadVerdicts := func(context.Context, string) ([]Verdict, error) {
+		return verdicts, nil
+	}
+	var got agentChatRequest
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		got = req
+		events := make(chan agentEvent, 1)
+		events <- agentEvent{Type: "done"}
+		close(events)
+		return events, nil
+	}
+	srv, token := newChatTestServer(t, loadCtx, callAgent, loadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "something good"})
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(got.Verdicts, verdicts) {
+		t.Errorf("Verdicts = %+v, want %+v", got.Verdicts, verdicts)
+	}
+}
+
+// TestChatTurnFailsWhenVerdictsCannotLoad pins the deliberate choice at
+// runTurn's verdict load: fail the turn, never degrade to no verdicts.
+// Degrading would silently put titles the user marked seen back on screen —
+// the one guarantee T19 exists to make — and TASKS.md says outright that the
+// chat cannot degrade. Without this test the fix is a comment: every other
+// call site here passes a loadVerdicts that cannot fail, so a later change
+// to the degrade-shape used elsewhere in this codebase would go unnoticed.
+func TestChatTurnFailsWhenVerdictsCannotLoad(t *testing.T) {
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8}}, nil
+	}
+	loadVerdicts := func(context.Context, string) ([]Verdict, error) {
+		return nil, errors.New("verdict read failed")
+	}
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		t.Error("agent must not be called when verdicts fail to load")
+		return nil, errors.New("unreachable")
+	}
+	srv, token := newChatTestServer(t, loadCtx, callAgent, loadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "something good"})
+
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "error" || ev.Text != genericErrorText {
+		t.Errorf("event = %+v, want an error event with the generic text", ev)
+	}
+}
+
+// TestChatTurnWithNoSubscriptionsSkipsVerdicts pins the exception to the
+// fail-closed rule above. A caller with nothing ticked gets the agent's "pick
+// your services" answer, which never reads verdicts - so a title_verdicts
+// problem must not be what stops a brand-new user, who has no verdicts
+// anyway, from being onboarded.
+func TestChatTurnWithNoSubscriptionsSkipsVerdicts(t *testing.T) {
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{}}, nil
+	}
+	loadVerdicts := func(context.Context, string) ([]Verdict, error) {
+		t.Error("verdicts must not be loaded when the caller has no subscriptions")
+		return nil, errors.New("title_verdicts unavailable")
+	}
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		events := make(chan agentEvent, 2)
+		events <- agentEvent{Type: "message", Text: "Pick your services."}
+		events <- agentEvent{Type: "done"}
+		close(events)
+		return events, nil
+	}
+	srv, token := newChatTestServer(t, loadCtx, callAgent, loadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi"})
+
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "token" || ev.Text != "Pick your services." {
+		t.Errorf("event = %+v, want the agent's message forwarded", ev)
 	}
 }

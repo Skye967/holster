@@ -96,7 +96,7 @@ on read when older than 24 hours, and served stale if TMDB is unreachable.
 
 ```
 web         → gateway   message
-gateway     → db        load subscriptions, country, recent verdicts
+gateway     → db        load subscriptions, country, every verdict
 gateway     → agent     message + that context
 agent       → tmdb      discover, filtered by subscriptions and region
 agent       → gateway   answer
@@ -106,6 +106,10 @@ gateway     → web       answer
 
 The gateway assembles the context and performs the writes. The agent receives what it
 needs and returns text.
+
+Verdicts are the one piece not windowed the way history is: the agent needs every one
+to answer "has this user judged this title", so a cap would quietly expire that
+guarantee for the heaviest users.
 
 ## Where taste comes from
 

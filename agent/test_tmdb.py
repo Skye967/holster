@@ -188,6 +188,7 @@ def test_title_details_movie_returns_runtime_and_cast() -> None:
     fake.ok(
         "/movie/101",
         {
+            "id": 101,
             "runtime": 128,
             "credits": {
                 "cast": [
@@ -211,7 +212,7 @@ def test_title_details_movie_returns_runtime_and_cast() -> None:
 
 def test_title_details_tv_uses_first_episode_run_time() -> None:
     fake = FakeTMDB()
-    fake.ok("/tv/9", {"episode_run_time": [45, 60], "credits": {"cast": []}})
+    fake.ok("/tv/9", {"id": 9, "episode_run_time": [45, 60], "credits": {"cast": []}})
 
     details = run(fake.client().title_details(media_type="tv", tmdb_id=9))
 
@@ -220,7 +221,7 @@ def test_title_details_tv_uses_first_episode_run_time() -> None:
 
 def test_title_details_tv_empty_episode_run_time_is_none() -> None:
     fake = FakeTMDB()
-    fake.ok("/tv/9", {"episode_run_time": [], "credits": {"cast": []}})
+    fake.ok("/tv/9", {"id": 9, "episode_run_time": [], "credits": {"cast": []}})
 
     details = run(fake.client().title_details(media_type="tv", tmdb_id=9))
 
@@ -242,7 +243,7 @@ def test_title_details_404_returns_none_and_is_cached() -> None:
 
 def test_title_details_is_cached_across_calls() -> None:
     fake = FakeTMDB()
-    fake.ok("/movie/101", {"runtime": 100, "credits": {"cast": []}})
+    fake.ok("/movie/101", {"id": 101, "runtime": 100, "credits": {"cast": []}})
 
     client = fake.client()
     run(client.title_details(media_type="movie", tmdb_id=101))
@@ -517,6 +518,16 @@ def test_client_error_is_a_bug_not_transient() -> None:
 def test_non_json_body_is_unavailable_not_a_crash() -> None:
     fake = FakeTMDB()
     fake.queue("/discover/movie", httpx2.Response(200, content=b"<html>down</html>"))
+    with pytest.raises(TMDBUnavailable):
+        run(fake.client().discover(media_type="movie", watch_region="US"))
+
+
+def test_non_object_json_body_is_unavailable_not_a_crash() -> None:
+    """Parseable JSON that is not an object. Every caller does data.get(...),
+    so without the guard this surfaces as an AttributeError - a bug, when it
+    is a TMDB fault. Sibling of the non-JSON case above."""
+    fake = FakeTMDB()
+    fake.queue("/discover/movie", httpx2.Response(200, json=[1, 2, 3]))
     with pytest.raises(TMDBUnavailable):
         run(fake.client().discover(media_type="movie", watch_region="US"))
 

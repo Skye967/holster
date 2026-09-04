@@ -16,9 +16,51 @@ from typing import Any
 
 import httpx2
 
-from catalog_tool import DiscoverIntent
-from tmdb import TMDBClient
+from catalog_tool import DiscoverIntent, Ranker, RankResult
+from tmdb import Title, TMDBClient
 
+# The reasons rank() must not be reached, shared so a typo at a call site is
+# a NameError rather than a silently drifted string.
+DISCOVER_RAISED = "discover() raised"
+NO_CANDIDATES = "no candidates came back"
+ALL_JUDGED = "every candidate was judged"
+CAPABILITY_QUESTION = "on a capability question"
+INTERPRET_RAISED = "interpret() raised"
+NO_PROVIDERS = "no providers ticked"
+
+
+def raw_movie(tmdb_id: int) -> dict[str, Any]:
+    """discover()/search_titles()'s list shape — genre_ids flat, unlike
+    raw_movie_full's genre objects. For fixtures that need several distinct
+    discover() rows; MOVIE_A below is spelled out separately on purpose."""
+    return {
+        "id": tmdb_id,
+        "title": f"Title {tmdb_id}",
+        "release_date": "2020-01-01",
+        "overview": "An overview.",
+        "vote_average": 7.5,
+        "vote_count": 500,
+        "genre_ids": [],
+    }
+
+
+def raw_movie_full(tmdb_id: int, title: str) -> dict[str, Any]:
+    """The single-title endpoint's shape, which _trim_title_from_full reads:
+    genres arrive as objects here, not the list endpoint's flat genre_ids."""
+    return {
+        "id": tmdb_id,
+        "title": title,
+        "release_date": "2016-01-01",
+        "overview": "",
+        "vote_average": 7.0,
+        "vote_count": 100,
+        "genres": [{"id": 80, "name": "Crime"}],
+    }
+
+
+# Spelled out rather than derived from raw_movie(): the pre-existing suite
+# asserts against these values, and a field added to raw_movie for a new
+# fixture must not change them underneath those tests.
 MOVIE_A = {
     "id": 101,
     "title": "Fake Heist",
@@ -78,3 +120,14 @@ def make_intent(**overrides: Any) -> DiscoverIntent:
 
 async def ok_interpret(message: str) -> DiscoverIntent:
     return make_intent()
+
+
+def rank_must_not_run(reason: str) -> Ranker:
+    """rank() must not be reached. Several unrelated contracts say so — pass
+    one of the constants above; a regression's failure then points at the
+    right one instead of a generic "rank must not run"."""
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        raise AssertionError(f"rank must not run: {reason}")
+
+    return fake_rank

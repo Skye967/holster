@@ -31,7 +31,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NoReturn, TypedDict, cast
 
 import httpx2
 
@@ -227,90 +227,120 @@ def _year(date: str | None) -> int | None:
     return int(date[:4]) if date and date[:4].isdigit() else None
 
 
+def _unusable(what: str, exc: Exception) -> NoReturn:
+    """A malformed TMDB body is a TMDBError, not a silent bug here — see
+    _safe's docstring for why that, and not TMDBUnavailable, is the class
+    that keeps this loud (logger.exception) rather than quietly downgraded
+    as a transient, retry-later case. Shared so the five parsers below
+    don't each restate the reasoning; only the noun changes per call site."""
+    raise TMDBError(f"TMDB returned an unusable {what}") from exc
+
+
 def _trim_title(raw: dict[str, Any], media_type: MediaType) -> Title:
-    date_key = "release_date" if media_type == "movie" else "first_air_date"
-    date = raw.get(date_key)
-    return Title(
-        tmdb_id=raw["id"],
-        media_type=media_type,
-        title=raw.get("title") or raw.get("name") or "",
-        year=_year(date),
-        overview=raw.get("overview") or "",
-        poster_url=_image_url(raw.get("poster_path"), POSTER_SIZE),
-        vote_average=float(raw.get("vote_average") or 0.0),
-        vote_count=int(raw.get("vote_count") or 0),
-        genre_ids=list(raw.get("genre_ids") or []),
-    )
+    """One row of a list endpoint's results."""
+    try:
+        date_key = "release_date" if media_type == "movie" else "first_air_date"
+        date = raw.get(date_key)
+        return Title(
+            tmdb_id=raw["id"],
+            media_type=media_type,
+            title=raw.get("title") or raw.get("name") or "",
+            year=_year(date),
+            overview=raw.get("overview") or "",
+            poster_url=_image_url(raw.get("poster_path"), POSTER_SIZE),
+            vote_average=float(raw.get("vote_average") or 0.0),
+            vote_count=int(raw.get("vote_count") or 0),
+            genre_ids=list(raw.get("genre_ids") or []),
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        _unusable("title row", exc)
 
 
 def _trim_title_from_full(raw: dict[str, Any], media_type: MediaType) -> Title:
     """Same shape as _trim_title, for the single-title endpoint's raw
     response rather than discover()/search_titles()'s list shape -- genres
     arrive as [{"id","name"}] objects here, not a flat genre_ids list."""
-    date_key = "release_date" if media_type == "movie" else "first_air_date"
-    date = raw.get(date_key)
-    return Title(
-        tmdb_id=raw["id"],
-        media_type=media_type,
-        title=raw.get("title") or raw.get("name") or "",
-        year=_year(date),
-        overview=raw.get("overview") or "",
-        poster_url=_image_url(raw.get("poster_path"), POSTER_SIZE),
-        vote_average=float(raw.get("vote_average") or 0.0),
-        vote_count=int(raw.get("vote_count") or 0),
-        genre_ids=[g["id"] for g in raw.get("genres") or []],
-    )
+    try:
+        date_key = "release_date" if media_type == "movie" else "first_air_date"
+        date = raw.get(date_key)
+        return Title(
+            tmdb_id=raw["id"],
+            media_type=media_type,
+            title=raw.get("title") or raw.get("name") or "",
+            year=_year(date),
+            overview=raw.get("overview") or "",
+            poster_url=_image_url(raw.get("poster_path"), POSTER_SIZE),
+            vote_average=float(raw.get("vote_average") or 0.0),
+            vote_count=int(raw.get("vote_count") or 0),
+            genre_ids=[g["id"] for g in raw.get("genres") or []],
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        _unusable("title page's fields", exc)
 
 
 def _trim_details(raw: dict[str, Any], media_type: MediaType) -> TitleDetails:
-    if media_type == "movie":
-        runtime = raw.get("runtime")
-    else:
-        # TMDB's own inconsistency: TV has no single "runtime", just a list of
-        # typical episode lengths. The first is the best single number to show.
-        episode_run_time = raw.get("episode_run_time") or []
-        runtime = episode_run_time[0] if episode_run_time else None
+    """Never reads "id" itself, so it cannot tell an error envelope from a
+    real page on its own — both callers already gate on "id" being present
+    (title_details() explicitly; title_with_details() by calling
+    _trim_title_from_full on the same raw dict first) before reaching here."""
+    try:
+        if media_type == "movie":
+            runtime = raw.get("runtime")
+        else:
+            # TMDB's own inconsistency: TV has no single "runtime", just a list of
+            # typical episode lengths. The first is the best single number to show.
+            episode_run_time = raw.get("episode_run_time") or []
+            runtime = episode_run_time[0] if episode_run_time else None
 
-    # TMDB already returns credits.cast in billing order; sorting on `order`
-    # anyway is cheap insurance at this external boundary rather than relying
-    # on an undocumented guarantee.
-    cast_raw = sorted(
-        (raw.get("credits") or {}).get("cast") or [],
-        key=lambda c: c.get("order", 10**9),
-    )
-    return TitleDetails(
-        # runtime: 0 is TMDB's own "not yet filled in" sentinel for titles
-        # with incomplete metadata (same convention _trim_title leans on for
-        # vote_average) — deliberately treated as "no data," not a real zero.
-        runtime_minutes=int(runtime) if runtime else None,
-        # Filter for a name before slicing, not after: a nameless entry among
-        # the top CAST_LIMIT billed must not silently shrink the result below
-        # CAST_LIMIT when a later-billed entry does have a name.
-        cast=[c["name"] for c in cast_raw if c.get("name")][:CAST_LIMIT],
-    )
+        # TMDB already returns credits.cast in billing order; sorting on `order`
+        # anyway is cheap insurance at this external boundary rather than relying
+        # on an undocumented guarantee.
+        cast_raw = sorted(
+            (raw.get("credits") or {}).get("cast") or [],
+            key=lambda c: c.get("order", 10**9),
+        )
+        return TitleDetails(
+            # runtime: 0 is TMDB's own "not yet filled in" sentinel for titles
+            # with incomplete metadata (same convention _trim_title leans on for
+            # vote_average) — deliberately treated as "no data," not a real zero.
+            runtime_minutes=int(runtime) if runtime else None,
+            # Filter for a name before slicing, not after: a nameless entry among
+            # the top CAST_LIMIT billed must not silently shrink the result below
+            # CAST_LIMIT when a later-billed entry does have a name.
+            cast=[c["name"] for c in cast_raw if c.get("name")][:CAST_LIMIT],
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        _unusable("title page's runtime/cast", exc)
 
 
 def _trim_provider(raw: dict[str, Any]) -> Provider:
-    return Provider(
-        provider_id=raw["provider_id"],
-        provider_name=raw.get("provider_name") or "",
-        logo_url=_image_url(raw.get("logo_path"), LOGO_SIZE),
-    )
+    """One provider entry."""
+    try:
+        return Provider(
+            provider_id=raw["provider_id"],
+            provider_name=raw.get("provider_name") or "",
+            logo_url=_image_url(raw.get("logo_path"), LOGO_SIZE),
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        _unusable("provider entry", exc)
 
 
 def _trim_region_provider(raw: dict[str, Any], region: str) -> RegionProvider | None:
     # display_priorities is keyed by every region TMDB tracks; a provider with
     # no entry for this one is not actually available here, so it is dropped
     # rather than given a fake priority.
-    priority = (raw.get("display_priorities") or {}).get(region)
-    if priority is None:
-        return None
-    return RegionProvider(
-        provider_id=raw["provider_id"],
-        provider_name=raw.get("provider_name") or "",
-        logo_url=_image_url(raw.get("logo_path"), LOGO_SIZE),
-        display_priority=int(priority),
-    )
+    try:
+        priority = (raw.get("display_priorities") or {}).get(region)
+        if priority is None:
+            return None
+        return RegionProvider(
+            provider_id=raw["provider_id"],
+            provider_name=raw.get("provider_name") or "",
+            logo_url=_image_url(raw.get("logo_path"), LOGO_SIZE),
+            display_priority=int(priority),
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        _unusable("provider entry", exc)
 
 
 def _genres_into(
@@ -400,7 +430,7 @@ class TMDBClient:
                 response = await self._client.get(path, params=params)
                 response.raise_for_status()
                 try:
-                    data: dict[str, Any] = response.json()
+                    data = response.json()
                 except ValueError as exc:
                     # A 2xx with a non-JSON body — a CDN error page or captive
                     # portal, say. Not a status code to retry on, but still
@@ -408,6 +438,13 @@ class TMDBClient:
                     raise TMDBUnavailable(
                         f"TMDB returned an unparseable response for {path}"
                     ) from exc
+                # Parseable but not an object — a bare array or scalar. Same
+                # category as the branch above, and the reason this is checked
+                # rather than annotated: every caller does data.get(...), so
+                # without it the annotation is a promise the code never keeps
+                # and the AttributeError surfaces as a bug, not a TMDB fault.
+                if not isinstance(data, dict):
+                    raise TMDBUnavailable(f"TMDB returned a non-object body for {path}")
                 return data
             except httpx2.HTTPStatusError as exc:
                 status = exc.response.status_code
@@ -609,7 +646,10 @@ class TMDBClient:
             {"language": LANGUAGE, "append_to_response": "credits"},
             allow_404=True,
         )
-        details = _trim_details(data, media_type) if data else None
+        # "id" as well as truthiness: a 2xx error envelope is a non-empty
+        # dict that _trim_details reads happily, yielding empty details that
+        # this cache would then serve as permanent truth.
+        details = _trim_details(data, media_type) if data and "id" in data else None
         self._title_details[key] = details
         return details
 

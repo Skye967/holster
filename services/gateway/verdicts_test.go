@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -248,5 +249,62 @@ func TestVerdictRoutesRequireAuth(t *testing.T) {
 		if resp := doJSON(t, srv, "", p.method, p.path); resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("%s %s without a token = %d, want 401", p.method, p.path, resp.StatusCode)
 		}
+	}
+}
+
+// TestVerdictJSONTagsAreTheCrossServiceContract pins the wire names, which
+// three things decode independently: web/src/lib/verdicts.ts's VerdictEntry,
+// the agent's TitleVerdict (agent/catalog_tool.py), and this package's own
+// round trip. Every other test here decodes back into Verdict, so it would
+// stay green through a rename — and so would the agent's Python-side test,
+// which hardcodes these same strings without ever seeing Go. Renaming a tag
+// to suit one consumer would leave every title card unmarked in the browser
+// AND 422 every chat turn at the agent, with both suites passing. This is
+// the assertion that fails instead.
+func TestVerdictJSONTagsAreTheCrossServiceContract(t *testing.T) {
+	got, err := json.Marshal(Verdict{TMDBID: 101, MediaType: "movie", Verdict: "seen"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"tmdb_id":101,"media_type":"movie","verdict":"seen"}`
+	if string(got) != want {
+		t.Errorf("Verdict JSON = %s, want %s", got, want)
+	}
+
+	// The values are as much of the contract as the field names. The agent
+	// decides what to exclude with a bare string compare against
+	// "want_to_watch" (agent/catalog_tool.py's search()), so renaming that
+	// value here for the browser's sake would silently invert the meaning of
+	// every bookmarked title — they would start being excluded from
+	// recommendations instead of staying eligible — with the Go, Python and
+	// TypeScript suites all still green. Pin the spelling here so it isn't.
+	wantVerdicts := map[string]bool{
+		"liked": true, "disliked": true, "seen": true,
+		"not_interested": true, "want_to_watch": true,
+	}
+	if !maps.Equal(verdictValues, wantVerdicts) {
+		t.Errorf("verdictValues = %v, want %v", verdictValues, wantVerdicts)
+	}
+
+	// The outer key matters as much as the inner three, and fails more
+	// quietly: Pydantic's verdicts field has a default, so a renamed key is
+	// accepted as an empty list rather than rejected. Every turn would
+	// silently revert to "no verdicts" — judged titles back on screen — with
+	// nothing failing. The round-trip tests can't catch it; they decode back
+	// through the same Go struct.
+	body, err := json.Marshal(agentChatRequest{
+		Message:     "hi",
+		WatchRegion: "US",
+		Verdicts:    []Verdict{{TMDBID: 101, MediaType: "movie", Verdict: "seen"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keyed map[string]json.RawMessage
+	if err := json.Unmarshal(body, &keyed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := keyed["verdicts"]; !ok {
+		t.Errorf("agentChatRequest JSON = %s, want a \"verdicts\" key", body)
 	}
 }
