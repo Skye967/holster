@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { TitleCard } from "@/components/chat/title-card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { fetchChatHistory } from "@/lib/chat-history"
 import {
   type AgentPick,
   type ChatEvent,
@@ -230,6 +231,40 @@ export function ChatPanel() {
       .catch(() => {
         // Best-effort hydration: cards just render unmarked if this fails,
         // same as any other title with no verdict yet.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isLoaded, getToken])
+
+  // Rehydrates the last exchanges on mount so a page reload keeps the
+  // conversation (TASKS.md T20) instead of starting blank. Seeded only when
+  // `turns` is still empty at the time this resolves — a user who types and
+  // sends a message before the GET returns must not have it wiped out from
+  // under them, the same race verdicts hydration above guards against with
+  // touchedVerdictsRef, applied here as "don't clobber a non-empty list"
+  // since a rehydrated turn has no id of its own to merge against a live
+  // one. No picks/interpreting on a rehydrated turn — only text is
+  // persisted, so it renders as chat-panel.tsx's plain tokenText case.
+  useEffect(() => {
+    if (!isLoaded) return
+    let cancelled = false
+    fetchChatHistory(getToken)
+      .then((history) => {
+        if (cancelled) return
+        setTurns((prev) =>
+          prev.length === 0
+            ? history.map((t) => ({
+                id: crypto.randomUUID(),
+                userText: t.user_text,
+                tokenText: t.assistant_text,
+              }))
+            : prev,
+        )
+      })
+      .catch(() => {
+        // Best-effort hydration: an empty thread on failure is the same
+        // experience a brand-new account already has.
       })
     return () => {
       cancelled = true

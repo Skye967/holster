@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -937,6 +940,453 @@ func TestSaveVerdictClearIsScopedToExpectedVerdict(t *testing.T) {
 		}
 		if v, ok := currentVerdict(t, pool, ctx, id, 604); !ok || v != "liked" {
 			t.Errorf("current = %q, %v after re-judging a cleared row; want liked", v, ok)
+		}
+	})
+}
+
+// --- conversations.go (T20) -------------------------------------------------
+
+// TestLoadConversationReturnsEmptyForANewCaller proves loadConversation
+// degrades to ("", nil, nil) rather than an error for a caller with no
+// conversation yet — runChatConnection treats that as "start blank," the
+// same as every pre-T20 connection.
+func TestLoadConversationReturnsEmptyForANewCaller(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	load := loadConversation(pool)
+
+	const id = "conv_empty_test"
+	newTestUser(t, pool, ctx, id)
+
+	convID, history, err := load(ctx, id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if convID != "" {
+		t.Errorf("conversation id = %q, want empty for a caller with no conversation", convID)
+	}
+	if history != nil {
+		t.Errorf("history = %#v, want nil", history)
+	}
+}
+
+// TestLoadConversationOrdersAndCapsHistory seeds more than loadConversation's
+// own cap (windowHistory's window, not maxStoredHistoryMessages — that one
+// bounds GET /api/chat/history instead, see TestLoadConversationTurns*) and
+// confirms it returns only the most recent ones, oldest-first — windowHistory
+// and the agent both depend on chronological order, and the cap exists
+// precisely so a long-running account doesn't load its entire history on
+// every reconnect just to discard most of it.
+func TestLoadConversationOrdersAndCapsHistory(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	load := loadConversation(pool)
+
+	const id = "conv_cap_test"
+	newTestUser(t, pool, ctx, id)
+
+	var convID string
+	if err := pool.QueryRow(ctx,
+		`insert into conversations (user_id) values ($1) returning id`, id).Scan(&convID); err != nil {
+		t.Fatal(err)
+	}
+
+	// One more pair than the cap allows, tagged by index so ordering is
+	// verifiable — content isn't otherwise unique.
+	const pairs = maxHistoryExchanges + 1
+	for i := range pairs {
+		if _, err := pool.Exec(ctx, `
+			insert into messages (conversation_id, role, content) values
+				($1, 'user', $2), ($1, 'assistant', $3)`,
+			convID, fmt.Sprintf("q%d", i), fmt.Sprintf("a%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gotID, history, err := load(ctx, id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if gotID != convID {
+		t.Errorf("conversation id = %q, want %q", gotID, convID)
+	}
+	if len(history) != maxHistoryExchanges*2 {
+		t.Fatalf("history length = %d, want %d", len(history), maxHistoryExchanges*2)
+	}
+	// The oldest pair (q0/a0) must have been dropped by the cap, and what
+	// remains must still be oldest-first.
+	if history[0].Text != "q1" {
+		t.Errorf("history[0].Text = %q, want %q (oldest surviving pair)", history[0].Text, "q1")
+	}
+	last := history[len(history)-1]
+	if last.Text != fmt.Sprintf("a%d", pairs-1) {
+		t.Errorf("last history entry = %q, want the most recent assistant text", last.Text)
+	}
+}
+
+// TestLoadConversationTurnsPairsMessages proves GET /api/chat/history's
+// loader pairs stored role/content rows into completed exchanges in
+// chronological order.
+func TestLoadConversationTurnsPairsMessages(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	load := loadConversationTurns(pool)
+
+	const id = "conv_turns_test"
+	newTestUser(t, pool, ctx, id)
+
+	var convID string
+	if err := pool.QueryRow(ctx,
+		`insert into conversations (user_id) values ($1) returning id`, id).Scan(&convID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		insert into messages (conversation_id, role, content) values
+			($1, 'user', 'a heist movie'), ($1, 'assistant', 'Suggested: Heat'),
+			($1, 'user', 'something shorter'), ($1, 'assistant', 'Suggested: Ronin')`,
+		convID); err != nil {
+		t.Fatal(err)
+	}
+
+	turns, err := load(ctx, id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	want := []conversationTurn{
+		{UserText: "a heist movie", AssistantText: "Suggested: Heat"},
+		{UserText: "something shorter", AssistantText: "Suggested: Ronin"},
+	}
+	if len(turns) != len(want) {
+		t.Fatalf("turns = %+v, want %+v", turns, want)
+	}
+	for i := range want {
+		if turns[i] != want[i] {
+			t.Errorf("turns[%d] = %+v, want %+v", i, turns[i], want[i])
+		}
+	}
+}
+
+// TestLoadConversationTurnsReturnsEmptyArray mirrors
+// TestGetVerdictsReturnsEmptyArray (verdicts_test.go): the JSON wire contract
+// is `[]`, never `null`, for a caller with nothing yet.
+func TestLoadConversationTurnsReturnsEmptyArray(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	load := loadConversationTurns(pool)
+
+	const id = "conv_turns_empty_test"
+	newTestUser(t, pool, ctx, id)
+
+	turns, err := load(ctx, id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if turns == nil || len(turns) != 0 {
+		t.Errorf("turns = %#v, want non-nil empty slice", turns)
+	}
+}
+
+// TestSaveMessagesCreatesConversationLazilyThenAppends proves the lazy-create
+// shape: an empty conversationID creates a row on first use, and a later call
+// with the returned id appends to the same conversation rather than creating
+// a second one.
+func TestSaveMessagesCreatesConversationLazilyThenAppends(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveMessages(pool)
+
+	const id = "conv_save_lazy_test"
+	newTestUser(t, pool, ctx, id)
+
+	convID, err := save(ctx, id, "", "a heist movie", "Suggested: Heat", nil)
+	if err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	if convID == "" {
+		t.Fatal("conversation id is empty after a lazy create")
+	}
+
+	convID2, err := save(ctx, id, convID, "something shorter", "Suggested: Ronin", nil)
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if convID2 != convID {
+		t.Errorf("second save's conversation id = %q, want the same %q", convID2, convID)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx,
+		`select count(*) from conversations where user_id = $1`, id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("conversations for %s = %d, want 1 (no second row from the second save)", id, count)
+	}
+
+	var msgCount int
+	if err := pool.QueryRow(ctx,
+		`select count(*) from messages where conversation_id = $1`, convID).Scan(&msgCount); err != nil {
+		t.Fatal(err)
+	}
+	if msgCount != 4 {
+		t.Errorf("messages in %s = %d, want 4 (two turns of two rows each)", convID, msgCount)
+	}
+}
+
+// TestSaveMessagesPersistsTitleRefsOnAssistantRowOnly proves saveMessages
+// writes the shown title ids onto the assistant row (DECISIONS.md's "the
+// title IDs shown") and leaves the user row's title_refs null, and that a nil
+// slice persists as SQL NULL rather than the JSON literal "null".
+func TestSaveMessagesPersistsTitleRefsOnAssistantRowOnly(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveMessages(pool)
+
+	const id = "conv_save_refs_test"
+	newTestUser(t, pool, ctx, id)
+
+	refs := []agentTitleRef{{TMDBID: 550, MediaType: "movie"}, {TMDBID: 603, MediaType: "movie"}}
+	convID, err := save(ctx, id, "", "a heist movie", "Suggested: Fight Club, The Matrix", refs)
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	rows, err := pool.Query(ctx,
+		`select role, title_refs from messages where conversation_id = $1 order by created_at`, convID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var sawUser, sawAssistant bool
+	for rows.Next() {
+		var role string
+		var refsJSON []byte
+		if err := rows.Scan(&role, &refsJSON); err != nil {
+			t.Fatal(err)
+		}
+		switch role {
+		case "user":
+			sawUser = true
+			if refsJSON != nil {
+				t.Errorf("user row title_refs = %s, want SQL NULL", refsJSON)
+			}
+		case "assistant":
+			sawAssistant = true
+			var got []agentTitleRef
+			if err := json.Unmarshal(refsJSON, &got); err != nil {
+				t.Fatalf("decode title_refs: %v", err)
+			}
+			if len(got) != 2 || got[0].TMDBID != 550 || got[1].TMDBID != 603 {
+				t.Errorf("assistant row title_refs = %+v, want %+v", got, refs)
+			}
+		}
+	}
+	if !sawUser || !sawAssistant {
+		t.Fatalf("expected one user and one assistant row, sawUser=%v sawAssistant=%v", sawUser, sawAssistant)
+	}
+}
+
+// TestSaveMessagesReturnsInputConversationIDOnWriteFailure proves the
+// contract saveMessages' own doc comment makes: a failed write must return
+// the input conversationID unchanged, never a partially-created or
+// rolled-back one. testPool connects as the table owner (see this file's
+// TEST_DATABASE_URL comment and services/gateway/README.md), which bypasses
+// RLS entirely — so this forces the failure with a foreign key violation
+// instead (a nonexistent conversation id), a failure mode RLS status can't
+// mask. Cross-user denial itself is TestMessagePolicyEnforcesUserIsolation's
+// job, via an explicit asRole("gateway_app") the way every other RLS-
+// enforcement test in this file does it.
+func TestSaveMessagesReturnsInputConversationIDOnWriteFailure(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveMessages(pool)
+
+	const id = "conv_save_fk_test"
+	newTestUser(t, pool, ctx, id)
+
+	const bogusConvID = "11111111-1111-1111-1111-111111111111"
+	gotID, err := save(ctx, id, bogusConvID, "hello", "hi", nil)
+	if err == nil {
+		t.Fatal("save against a nonexistent conversation succeeded, want a foreign key violation")
+	}
+	if gotID != bogusConvID {
+		t.Errorf("returned id = %q, want the unchanged input %q", gotID, bogusConvID)
+	}
+
+	var msgCount int
+	if err := pool.QueryRow(ctx,
+		`select count(*) from messages where conversation_id = $1`, bogusConvID).Scan(&msgCount); err != nil {
+		t.Fatal(err)
+	}
+	if msgCount != 0 {
+		t.Errorf("messages written despite the failed insert = %d, want 0", msgCount)
+	}
+}
+
+// TestSaveMessagesLazyCreateConvergesOnConcurrentCreate proves the fix this
+// task's code review found necessary: two callers racing to create the same
+// user's first-ever conversation (two WS connections, or two turns on one
+// connection completing close enough together — see chat.go's
+// runChatConnection) must not end up with two separate conversation rows.
+// saveMessages' lazy-create is an upsert against conversations' `unique
+// (user_id)` specifically so both converge on one row instead.
+func TestSaveMessagesLazyCreateConvergesOnConcurrentCreate(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveMessages(pool)
+
+	const id = "conv_concurrent_create_test"
+	newTestUser(t, pool, ctx, id)
+
+	const racers = 5
+	ids := make([]string, racers)
+	errs := make([]error, racers)
+	var wg sync.WaitGroup
+	for i := range racers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = save(ctx, id, "", fmt.Sprintf("q%d", i), fmt.Sprintf("a%d", i), nil)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("racer %d: %v", i, err)
+		}
+	}
+	for i := 1; i < racers; i++ {
+		if ids[i] != ids[0] {
+			t.Errorf("racer %d converged on conversation id %q, want %q (same as racer 0)", i, ids[i], ids[0])
+		}
+	}
+
+	var convCount int
+	if err := pool.QueryRow(ctx,
+		`select count(*) from conversations where user_id = $1`, id).Scan(&convCount); err != nil {
+		t.Fatal(err)
+	}
+	if convCount != 1 {
+		t.Errorf("conversations for %s = %d, want 1", id, convCount)
+	}
+
+	var msgCount int
+	if err := pool.QueryRow(ctx,
+		`select count(*) from messages where conversation_id = $1`, ids[0]).Scan(&msgCount); err != nil {
+		t.Fatal(err)
+	}
+	if msgCount != racers*2 {
+		t.Errorf("messages = %d, want %d (every racer's pair landed on the one conversation)", msgCount, racers*2)
+	}
+}
+
+// TestAgentRoleCanReadConversationsAndMessages is agent_ro's first positive
+// read test (T10 gave it no grants at all; T20's own migration comment names
+// this task as the one that adds them). Proves the select grant and per-user
+// policy actually work, not just that writes are still denied.
+func TestAgentRoleCanReadConversationsAndMessages(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const id = "agent_read_test"
+	newTestUser(t, pool, ctx, id)
+	var convID string
+	if err := pool.QueryRow(ctx,
+		`insert into conversations (user_id) values ($1) returning id`, id).Scan(&convID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`insert into messages (conversation_id, role, content) values ($1, 'user', 'hi')`,
+		convID); err != nil {
+		t.Fatal(err)
+	}
+
+	asRole(t, pool, "agent_ro", func(ctx context.Context, tx pgx.Tx) {
+		if _, err := tx.Exec(ctx, `select set_config('holster.user_id', $1, true)`, id); err != nil {
+			t.Fatalf("set_config: %v", err)
+		}
+
+		var gotConvID string
+		if err := tx.QueryRow(ctx, `select id from conversations where user_id = $1`, id).
+			Scan(&gotConvID); err != nil {
+			t.Errorf("agent_ro select on conversations: %v", err)
+		} else if gotConvID != convID {
+			t.Errorf("conversation id = %q, want %q", gotConvID, convID)
+		}
+
+		var content string
+		if err := tx.QueryRow(ctx, `select content from messages where conversation_id = $1`, convID).
+			Scan(&content); err != nil {
+			t.Errorf("agent_ro select on messages: %v", err)
+		} else if content != "hi" {
+			t.Errorf("content = %q, want %q", content, "hi")
+		}
+	})
+
+	// Extends TestAgentRoleIsReadOnly's coverage rather than duplicating its
+	// whole table: conversations/messages are agent_ro's first-ever grant, so
+	// the negative case matters here specifically, not just generically.
+	asRole(t, pool, "agent_ro", func(ctx context.Context, tx pgx.Tx) {
+		if _, err := tx.Exec(ctx, `select set_config('holster.user_id', $1, true)`, id); err != nil {
+			t.Fatalf("set_config: %v", err)
+		}
+		writes := map[string]string{
+			"insert conversation": `insert into conversations (user_id) values ('` + id + `')`,
+			"insert message":      `insert into messages (conversation_id, role, content) values ('` + convID + `', 'user', 'x')`,
+			"delete message":      `delete from messages where conversation_id = '` + convID + `'`,
+		}
+		for name, sql := range writes {
+			if err := probe(t, ctx, tx, sql); !denied(err) {
+				t.Errorf("%s: err = %v, want SQLSTATE 42501", name, err)
+			}
+		}
+	})
+}
+
+// TestMessagePolicyEnforcesUserIsolation covers the one policy shape in this
+// schema that isn't a direct user_id comparison: messages has no user_id
+// column, so its isolation predicate joins through conversations via a
+// subquery (20260904191046_conversations.sql). Proves that shape actually
+// denies cross-user access rather than assuming the direct-column pattern
+// (TestGatewayRoleEnforcesUserIsolation) transfers unverified.
+func TestMessagePolicyEnforcesUserIsolation(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const uA, uB = "msg_rls_a", "msg_rls_b"
+	newTestUser(t, pool, ctx, uA)
+	newTestUser(t, pool, ctx, uB)
+
+	var convA string
+	if err := pool.QueryRow(ctx,
+		`insert into conversations (user_id) values ($1) returning id`, uA).Scan(&convA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`insert into messages (conversation_id, role, content) values ($1, 'user', 'a-only')`,
+		convA); err != nil {
+		t.Fatal(err)
+	}
+
+	asRole(t, pool, "gateway_app", func(ctx context.Context, tx pgx.Tx) {
+		if _, err := tx.Exec(ctx, `select set_config('holster.user_id', $1, true)`, uB); err != nil {
+			t.Fatalf("set_config: %v", err)
+		}
+
+		var count int
+		if err := tx.QueryRow(ctx, `select count(*) from messages where conversation_id = $1`, convA).
+			Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Errorf("as %s, visible messages in %s's conversation = %d, want 0", uB, uA, count)
+		}
+
+		if err := probe(t, ctx, tx,
+			`insert into messages (conversation_id, role, content) values ('`+convA+`', 'user', 'intrusion')`); !denied(err) {
+			t.Errorf("writing into %s's conversation while acting as %s: err = %v, want SQLSTATE 42501", uA, uB, err)
 		}
 	})
 }

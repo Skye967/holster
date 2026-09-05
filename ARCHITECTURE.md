@@ -150,7 +150,12 @@ title_verdicts            user_id, tmdb_id, media_type,
 
 conversations             user_id, title, created_at
 
-messages                  conversation_id, role, content, created_at
+messages                  conversation_id, role, content, title_refs,
+                          created_at, seq
+                          title_refs is the tmdb_id/media_type pairs shown in
+                          an assistant turn's picks, null otherwise. seq (an
+                          identity column) is read order — a turn's user and
+                          assistant row share one created_at
 ```
 
 `users` rows are created on first authenticated request, not by Clerk — see

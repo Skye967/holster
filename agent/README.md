@@ -115,9 +115,10 @@ it from these. Cancellation is plain `asyncio` cancellation: the gateway abortin
 HTTP call closes the response body, which stops `stream_chat()` iterating, which cancels
 the background `search()` call — nothing bespoke on this side.
 
-`history` in the request body is the last few exchanges only, held in memory on the
-gateway's WebSocket connection — there is no persisted conversation yet (`TASKS.md`
-T20). It is folded into the text handed to `interpret()`/`rank()` rather than changing
+`history` in the request body is the last few exchanges only, windowed by the gateway
+from a `messages` table that now persists the full conversation (`TASKS.md` T20) — this
+agent still never reads that table itself, only the windowed slice handed to it per
+call. It is folded into the text handed to `interpret()`/`rank()` rather than changing
 `catalog_tool.py`'s `message: str` contract.
 
 `verdicts` in the request body is the caller's whole `title_verdicts` set, loaded by the
