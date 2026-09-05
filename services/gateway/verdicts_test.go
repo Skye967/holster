@@ -40,6 +40,7 @@ func newVerdictsTestServer(t *testing.T,
 		noopLoadProviders, noopSaveSubscription,
 		loadVerdicts, saveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages,
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -84,6 +84,7 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 		noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +119,19 @@ func noopSaveVerdict(context.Context, string, int, string, *string, string) erro
 func noopLoadWatchlistItems(context.Context, string) ([]watchlistItem, error) { return nil, nil }
 func noopCallAgentTitles(context.Context, agentTitlesRequest) ([]agentPick, error) {
 	return nil, nil
+}
+
+// conversations.go's own dependencies, for the same reason — chat_test.go
+// covers loadConversation/saveMessages for real, conversations_test.go
+// covers loadConversationTurns.
+func noopLoadConversation(context.Context, string) (string, []historyTurn, error) {
+	return "", nil, nil
+}
+func noopLoadConversationTurns(context.Context, string) ([]conversationTurn, error) {
+	return nil, nil
+}
+func noopSaveMessages(context.Context, string, string, string, string, []agentTitleRef) (string, error) {
+	return "", nil
 }
 
 func TestVerifyTokenAcceptsValidToken(t *testing.T) {
@@ -309,7 +323,8 @@ func TestProvisioningReceivesTokenIdentity(t *testing.T) {
 		},
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
-		noopLoadWatchlistItems, noopCallAgentTitles)
+		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +371,8 @@ func TestProvisioningFailureBlocksRequest(t *testing.T) {
 		func(context.Context, string, string) error { return errors.New("connection refused") },
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
-		noopLoadWatchlistItems, noopCallAgentTitles)
+		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +410,8 @@ func TestClientDisconnectIsNotAProvisioningFailure(t *testing.T) {
 		func(ctx context.Context, _, _ string) error { return ctx.Err() },
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
-		noopLoadWatchlistItems, noopCallAgentTitles)
+		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +466,8 @@ func TestProvisioningDeadlineReturns503(t *testing.T) {
 		},
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
-		noopLoadWatchlistItems, noopCallAgentTitles)
+		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +501,8 @@ func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 	_, err := newHandler(kf, testIssuer, testAudience, map[string]struct{}{}, noop,
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
-		noopLoadWatchlistItems, noopCallAgentTitles)
+		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
 	if err == nil {
 		t.Error("built a Handler with no authorized parties, which would reject every request")
 	}
@@ -842,7 +861,8 @@ func TestKeyRotationSelfHeals(t *testing.T) {
 		func(context.Context, string, string) error { return nil },
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
-		noopLoadWatchlistItems, noopCallAgentTitles)
+		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -875,7 +895,8 @@ func TestUnknownKidDoesNotAmplify(t *testing.T) {
 		func(context.Context, string, string) error { return nil },
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
-		noopLoadWatchlistItems, noopCallAgentTitles)
+		noopLoadWatchlistItems, noopCallAgentTitles,
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
 	if err != nil {
 		t.Fatal(err)
 	}

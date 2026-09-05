@@ -109,9 +109,7 @@ func (h *Handler) chatTicket(w http.ResponseWriter, r *http.Request) {
 // One socket per session (../../DECISIONS.md): messages up, curated events
 // down, an explicit cancel rather than hanging up and hoping the server
 // notices. The gateway owns conversation state for the life of the
-// connection; there is no persistence yet (TASKS.md T20), so a reconnect
-// starts with empty history — the same as a page reload losing the thread
-// until that task lands.
+// connection, seeded and persisted via conversations.go (TASKS.md T20).
 
 // inboundMessage is what the browser sends up the socket.
 type inboundMessage struct {
@@ -147,6 +145,9 @@ type turnRecord struct {
 	ok            bool // false on error/cancel: nothing worth remembering happened
 	userText      string
 	assistantText string
+	// The tmdb_id/media_type pairs shown, from a "results" event; nil for a
+	// "message" turn, which showed no picks.
+	titleRefs []agentTitleRef
 }
 
 // Only the last few exchanges reach the agent — see agent/chat.py's
@@ -231,9 +232,31 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 		}
 	}()
 
-	var history []historyTurn
+	// Seeds this connection's history from the caller's conversation (TASKS.md
+	// T20), so a reconnect or reload picks the thread back up. Bounded like
+	// every DB call in this package — unbounded would block the coordinator
+	// loop below from ever starting. Best-effort on error: unlike runTurn's
+	// verdicts load (which fails the turn outright to avoid a wrong answer),
+	// this only costs the in-memory seed — the next save still finds the
+	// caller's real conversation via its upsert (`unique (user_id)`, see
+	// conversations.go's saveMessages).
+	loadCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
+	conversationID, history, err := h.loadConversation(loadCtx, userID)
+	cancel()
+	if err != nil {
+		slog.ErrorContext(ctx, "conversation load failed", "error", dbError(err))
+		conversationID = ""
+		history = nil
+	}
 	var cancelCurrent context.CancelFunc
 	var currentTurn string
+	// How many dispatched turns haven't yet reported to `done` — a
+	// superseded turn's goroutine keeps running (and will still eventually
+	// send) after cancelCurrent, so more than one can be outstanding at
+	// once. Used by the disconnect drain below to wait for all of them, not
+	// just currentTurn, so an earlier-superseded turn isn't dropped in
+	// favor of persisting a stale record while the real one goes unread.
+	var outstanding int
 	done := make(chan turnRecord)
 
 	defer func() {
@@ -245,10 +268,52 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			if cancelCurrent != nil {
+				cancelCurrent()
+			}
+			// Best-effort, not a guarantee: runTurn's own reply races this
+			// same ctx.Done() as its escape hatch (see its deferred send),
+			// so a turn already mid-unwind may take that hatch instead of
+			// ever reaching `done` — waiting here could then hang forever,
+			// which is why this only peeks. Whatever's already queued still
+			// gets persisted; anything not yet delivered is an accepted,
+			// bounded loss (one turn, self-healing on the user's next
+			// message) rather than a reason to give the two cases separate
+			// signals. context.Background(), not ctx: ctx is what just
+			// fired, so a save derived from it would fail immediately.
+			for {
+				select {
+				case rec := <-done:
+					history, conversationID = h.finishTurn(context.Background(), userID, history, conversationID, rec)
+				default:
+					return
+				}
+			}
 
 		case msg, ok := <-inbound:
 			if !ok {
+				// Cancel, then wait: rec.ok can already be true before
+				// "done" arrives (an earlier "results"/"message" event set
+				// it), so an ordinary disconnect must still persist it.
+				// Draining a full count, not just one peek, so an
+				// earlier-superseded turn FIFO-ahead of this one doesn't
+				// get skipped. Each wait still escapes via ctx.Done(): ctx
+				// isn't cancelled by a mere disconnect, but if shutdown
+				// happens to race this same disconnect, runTurn's own reply
+				// races that identical signal (see the case above), so
+				// waiting past it here would risk the same hang.
+				if cancelCurrent != nil {
+					cancelCurrent()
+				}
+				for outstanding > 0 {
+					select {
+					case rec := <-done:
+						history, conversationID = h.finishTurn(ctx, userID, history, conversationID, rec)
+						outstanding--
+					case <-ctx.Done():
+						outstanding = 0
+					}
+				}
 				return // socket closed or read failed
 			}
 			switch msg.Type {
@@ -267,6 +332,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				// coordinator's feet; the turn goroutine must see a stable
 				// snapshot of what existed when it started.
 				snapshot := append([]historyTurn(nil), history...)
+				outstanding++
 				go h.runTurn(turnCtx, ctx, conn, userID, msg.Turn, msg.Text, snapshot, done)
 			case "cancel":
 				if cancelCurrent != nil && currentTurn == msg.Turn {
@@ -275,6 +341,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 			}
 
 		case rec := <-done:
+			outstanding--
 			if rec.turn == currentTurn {
 				// Release turnDeadline's timer now rather than letting it
 				// idle until it fires on its own — same reason the
@@ -283,9 +350,33 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				cancelCurrent = nil
 				currentTurn = ""
 			}
-			history = appendHistory(history, rec)
+			history, conversationID = h.finishTurn(ctx, userID, history, conversationID, rec)
 		}
 	}
+}
+
+// finishTurn records rec into history and, if it succeeded, persists it —
+// the two steps a completed turn needs regardless of whether it arrived via
+// the normal `done` case or the disconnect drain above.
+func (h *Handler) finishTurn(ctx context.Context, userID string, history []historyTurn, conversationID string, rec turnRecord) ([]historyTurn, string) {
+	history = appendHistory(history, rec)
+	if !rec.ok {
+		return history, conversationID
+	}
+	// Blocking, not backgrounded: a two-row insert, not a TMDB round trip —
+	// DECISIONS.md's bar for this file ("shipping the simpler design
+	// cleanly beats the complex one badly").
+	saveCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
+	newID, err := h.saveMessages(saveCtx, userID, conversationID, rec.userText, rec.assistantText, rec.titleRefs)
+	cancel()
+	if err != nil {
+		// Logged, not shown to the browser: what the user already saw
+		// stays on screen. "" rather than the old id: the next attempt
+		// self-heals through saveMessages' upsert either way.
+		slog.ErrorContext(ctx, "message persist failed", "turn", rec.turn, "error", dbError(err))
+		return history, ""
+	}
+	return history, newID
 }
 
 // sendEvent writes one curated event down the socket, tagged with turn. It
@@ -465,12 +556,22 @@ func (h *Handler) runTurn(
 				rec.ok = true
 				rec.userText = text
 				rec.assistantText = summary
+				rec.titleRefs = make([]agentTitleRef, len(ev.Picks))
+				for i, p := range ev.Picks {
+					rec.titleRefs[i] = agentTitleRef{TMDBID: p.TMDBID, MediaType: p.MediaType}
+				}
 			}
 		case "message":
 			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "token", Text: ev.Text})
 			rec.ok = true
 			rec.userText = text
 			rec.assistantText = ev.Text
+			// Not reachable today (agent/chat.py emits "results" xor
+			// "message" per turn) but cheap to keep correct: without this,
+			// a "results" event followed by a "message" event in the same
+			// stream would leave rec.titleRefs pointing at picks that don't
+			// match rec.assistantText's replacement text.
+			rec.titleRefs = nil
 		case "error":
 			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "error", Text: friendlyError(ev.Reason)})
 			rec.ok = false

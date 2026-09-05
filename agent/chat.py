@@ -91,9 +91,11 @@ class ChatRequest(BaseModel):
     # reused here rather than re-resolved, so a capability-question answer
     # can name the caller's services without a second TMDB lookup.
     watch_provider_names: list[str] = Field(default_factory=list)
-    # The last few exchanges only — the gateway's job to window, this is not
-    # a persisted conversation (no messages table exists yet; see TASKS.md
-    # T20). Oldest-first, current message not included here.
+    # The last few exchanges only — the gateway's job to window. A messages
+    # table persists the full conversation now (TASKS.md T20), but this agent
+    # still never reads it directly; it only ever sees this windowed slice,
+    # handed to it fresh on every call. Oldest-first, current message not
+    # included here.
     history: list[HistoryTurn] = Field(default_factory=list)
     # The caller's whole title_verdicts set, loaded by the gateway with the
     # message (TASKS.md T19). Passed straight through; catalog_tool.search()

@@ -35,9 +35,10 @@ const (
 // stays well under a full lifetime.
 const clockLeeway = 5 * time.Second
 
-// Ceiling on the per-request provisioning upsert — a single-row write on a
-// primary key, so this is generous even to Supabase. A var, not a const, so a
-// test can shorten it without waiting the full two seconds.
+// Ceiling on a small, per-connection DB operation — the provisioning upsert
+// here, and chat.go's conversation load/save (a couple of statements each,
+// still generous even to Supabase). A var, not a const, so a test can
+// shorten it without waiting the full two seconds.
 var provisionTimeout = 2 * time.Second
 
 type Claims struct {
@@ -139,6 +140,14 @@ type Handler struct {
 	// callAgent above.
 	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error)
 	callAgentTitles    agentTitlesCaller
+
+	// conversations.go (T20): the caller's most recent conversation (id plus
+	// its history, for seeding a WS reconnect) and paired turns (for GET
+	// /api/chat/history), and the write that persists one completed turn —
+	// injected the same way as loadVerdicts/saveVerdict above.
+	loadConversation      func(ctx context.Context, userID string) (string, []historyTurn, error)
+	loadConversationTurns func(ctx context.Context, userID string) ([]conversationTurn, error)
+	saveMessages          func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (string, error)
 }
 
 // newHandler guards the keyfunc and rejects an empty origin allowlist, which
@@ -154,6 +163,9 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	saveVerdict func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error,
 	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error),
 	callAgentTitles agentTitlesCaller,
+	loadConversation func(ctx context.Context, userID string) (string, []historyTurn, error),
+	loadConversationTurns func(ctx context.Context, userID string) ([]conversationTurn, error),
+	saveMessages func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (string, error),
 ) (*Handler, error) {
 
 	if len(parties) == 0 {
@@ -192,6 +204,15 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	if callAgentTitles == nil {
 		return nil, errors.New("no watchlist agent caller configured")
 	}
+	if loadConversation == nil {
+		return nil, errors.New("no conversation loader configured")
+	}
+	if loadConversationTurns == nil {
+		return nil, errors.New("no conversation turns loader configured")
+	}
+	if saveMessages == nil {
+		return nil, errors.New("no message writer configured")
+	}
 
 	origins := make([]string, 0, len(parties))
 	for p := range parties {
@@ -199,22 +220,25 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	}
 
 	return &Handler{
-		keyfunc:            requireKID(kf),
-		issuer:             issuer,
-		audience:           audience,
-		parties:            parties,
-		ensureUser:         ensureUser,
-		loadChatCtx:        loadChatCtx,
-		callAgent:          callAgent,
-		tickets:            newChatTicketStore(),
-		originPatterns:     origins,
-		rootCtx:            rootCtx,
-		loadProviders:      loadProviders,
-		saveSubscription:   saveSubscription,
-		loadVerdicts:       loadVerdicts,
-		saveVerdict:        saveVerdict,
-		loadWatchlistItems: loadWatchlistItems,
-		callAgentTitles:    callAgentTitles,
+		keyfunc:               requireKID(kf),
+		issuer:                issuer,
+		audience:              audience,
+		parties:               parties,
+		ensureUser:            ensureUser,
+		loadChatCtx:           loadChatCtx,
+		callAgent:             callAgent,
+		tickets:               newChatTicketStore(),
+		originPatterns:        origins,
+		rootCtx:               rootCtx,
+		loadProviders:         loadProviders,
+		saveSubscription:      saveSubscription,
+		loadVerdicts:          loadVerdicts,
+		saveVerdict:           saveVerdict,
+		loadWatchlistItems:    loadWatchlistItems,
+		callAgentTitles:       callAgentTitles,
+		loadConversation:      loadConversation,
+		loadConversationTurns: loadConversationTurns,
+		saveMessages:          saveMessages,
 	}, nil
 }
 
@@ -485,6 +509,7 @@ func (h *Handler) routes() http.Handler {
 	register("PUT /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
 	register("DELETE /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
 	register("GET /api/watchlist", h.watchlist)
+	register("GET /api/chat/history", h.chatHistory)
 
 	allowMethods := make([]string, 0, len(methods))
 	for m := range methods {
@@ -617,7 +642,8 @@ func main() {
 		loadChatContext(db), newAgentCaller(agentClient, agentURL), ctx,
 		loadProviders(db, newAgentProviderCaller(agentClient, agentURL)), saveSubscription(db),
 		loadVerdicts(db), saveVerdict(db),
-		loadWatchlistItems(db), newAgentTitlesCaller(agentClient, agentURL))
+		loadWatchlistItems(db), newAgentTitlesCaller(agentClient, agentURL),
+		loadConversation(db), loadConversationTurns(db), saveMessages(db))
 	if err != nil {
 		log.Fatalf("handler: %v", err)
 	}
