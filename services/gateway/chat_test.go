@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -100,22 +99,6 @@ func TestWindowHistoryPassesShortHistoryThrough(t *testing.T) {
 	got := windowHistory(history)
 	if len(got) != 1 {
 		t.Errorf("len = %d, want 1", len(got))
-	}
-}
-
-func TestAppendHistorySkipsFailedTurns(t *testing.T) {
-	history := appendHistory(nil, turnRecord{turn: "t1", ok: false, userText: "x"})
-	if len(history) != 0 {
-		t.Errorf("a failed/cancelled turn was recorded in history: %+v", history)
-	}
-}
-
-func TestAppendHistoryRecordsSuccessfulTurns(t *testing.T) {
-	history := appendHistory(nil, turnRecord{
-		turn: "t1", ok: true, userText: "hi", assistantText: "hello",
-	})
-	if len(history) != 2 || history[0].Role != "user" || history[1].Role != "assistant" {
-		t.Errorf("history = %+v, want [user, assistant]", history)
 	}
 }
 
@@ -1339,32 +1322,15 @@ func TestChatMessageRejectsAMalformedConversationID(t *testing.T) {
 	}
 }
 
-// --- expiringMap ---------------------------------------------------------
-
-// TestExpiringMapDoesNotLetAnEarlierTimerDeleteALaterWrite is a direct
-// regression guard for the timer bug this design is exposed to: writing the
-// same key twice schedules two independent removal timers, and the earlier
-// one must not delete a value the later write refreshed.
-func TestExpiringMapDoesNotLetAnEarlierTimerDeleteALaterWrite(t *testing.T) {
-	m := newExpiringMap[int](30 * time.Millisecond)
-	m.set("k", 1) // would expire ~t+30ms
-	time.Sleep(20 * time.Millisecond)
-	m.set("k", 2)                     // refreshes to ~t+50ms
-	time.Sleep(20 * time.Millisecond) // t=40ms: the FIRST write's timer fires here
-	if got, ok := m.take("k"); !ok || got != 2 {
-		t.Errorf("take(k) = %d, %v; want 2, true (an earlier write's timer deleted a value a later write refreshed)", got, ok)
-	}
-}
-
 // --- conversationDeletions -------------------------------------------------
 
 // TestConversationDeletionsNeverForgetsARealDelete is the regression guard
 // for a previous, expiring implementation: a real delete's generation must
 // never revert to "never deleted," no matter how long afterward it's
 // checked — an earlier version aged it out after a fixed TTL, and a
-// long-lived connection's cached entry (conversationCache) could then
-// compare clean again against a conversation it had already been told was
-// deleted, silently serving pre-deletion history as agent context.
+// long-lived connection's own in-memory state could then compare clean
+// again against a conversation it had already been told was deleted,
+// silently serving pre-deletion history as agent context.
 func TestConversationDeletionsNeverForgetsARealDelete(t *testing.T) {
 	c := newConversationDeletions()
 	c.bump("conv1")
@@ -1386,7 +1352,7 @@ func TestConversationDeletionsBumpIncrementsOnEachRealDelete(t *testing.T) {
 	}
 }
 
-// --- finishTurn / conversationCache -----------------------------------------
+// --- finishTurn --------------------------------------------------------------
 
 // TestFinishTurnSkipsPersistingAStragglerFromBeforeItsConversationsDeletion
 // covers the original delete race: a turn dispatched before its conversation
@@ -1403,15 +1369,11 @@ func TestFinishTurnSkipsPersistingAStragglerFromBeforeItsConversationsDeletion(t
 	}
 	h.conversationDeletions.bump(testConversationID) // generation -> 1, after dispatch
 
-	cache := newConversationCache()
 	rec := turnRecord{turn: "t1", conversation: testConversationID, deletionGen: 0, ok: true, userText: "hi", assistantText: "hello"}
-	h.finishTurn(t.Context(), t.Context(), "user_1", cache, rec, nil)
+	h.finishTurn(t.Context(), t.Context(), "user_1", rec, nil)
 
 	if saveCalled {
 		t.Error("finishTurn persisted a turn dispatched before its conversation's deletion")
-	}
-	if len(cache.snapshot(testConversationID)) != 0 {
-		t.Error("finishTurn merged a suppressed turn into the cache")
 	}
 }
 
@@ -1430,16 +1392,15 @@ func TestFinishTurnPersistsANewMessageDispatchedAfterItsConversationsDeletion(t 
 	}
 	gen := h.conversationDeletions.bump(testConversationID) // deleted, then...
 
-	cache := newConversationCache()
 	rec := turnRecord{turn: "t1", conversation: testConversationID, deletionGen: gen, ok: true, userText: "hi", assistantText: "hello"} // ...a fresh dispatch captures the post-delete generation
-	h.finishTurn(t.Context(), t.Context(), "user_1", cache, rec, nil)
+	h.finishTurn(t.Context(), t.Context(), "user_1", rec, nil)
 
 	if !saveCalled {
 		t.Error("finishTurn suppressed a legitimate turn dispatched after its conversation's deletion")
 	}
 }
 
-func TestFinishTurnPersistsAndMergesWhenNeverDeleted(t *testing.T) {
+func TestFinishTurnPersistsWhenNeverDeleted(t *testing.T) {
 	var saveCalled bool
 	h := &Handler{
 		saveMessages: func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
@@ -1448,151 +1409,11 @@ func TestFinishTurnPersistsAndMergesWhenNeverDeleted(t *testing.T) {
 		},
 		conversationDeletions: newConversationDeletions(),
 	}
-	cache := newConversationCache()
-	cache.store(testConversationID, 0, nil) // must have been loaded for merge to take effect
 	rec := turnRecord{turn: "t1", conversation: testConversationID, ok: true, userText: "hi", assistantText: "hello"}
-	h.finishTurn(t.Context(), t.Context(), "user_1", cache, rec, nil)
+	h.finishTurn(t.Context(), t.Context(), "user_1", rec, nil)
 
 	if !saveCalled {
 		t.Error("finishTurn did not persist an ordinary successful turn")
-	}
-	if len(cache.snapshot(testConversationID)) != 2 {
-		t.Errorf("cache = %+v, want the turn merged in", cache.snapshot(testConversationID))
-	}
-}
-
-// --- conversationCache -------------------------------------------------------
-
-func TestConversationCacheDoesNotMergeIntoAConversationItNeverLoaded(t *testing.T) {
-	c := newConversationCache()
-	rec := turnRecord{conversation: "conv-x", ok: true, userText: "hi", assistantText: "hello"}
-	c.merge("conv-x", rec)
-	if c.isLoaded("conv-x", 0) {
-		t.Error("merge marked a never-loaded conversation as loaded")
-	}
-	if len(c.snapshot("conv-x")) != 0 {
-		t.Error("merge stored history for a never-loaded conversation")
-	}
-}
-
-func TestConversationCacheEvictsOldestConversationBeyondItsCap(t *testing.T) {
-	c := newConversationCache()
-	for i := 0; i < maxCachedConversations; i++ {
-		c.store("conv-"+strconv.Itoa(i), 0, nil)
-	}
-	c.store("conv-new", 0, nil) // one past the cap
-
-	if c.isLoaded("conv-0", 0) {
-		t.Error("oldest conversation was not evicted")
-	}
-	if !c.isLoaded("conv-1", 0) || !c.isLoaded("conv-new", 0) {
-		t.Error("a still-recent or newly stored conversation was incorrectly evicted")
-	}
-}
-
-// TestConversationCacheMergeAppendsANewTurn proves merge appends a
-// successful turn to the stored history (below the cap — see
-// TestConversationCacheMergeCapsHistoryAtTheWindowAfterManyTurns for the cap
-// itself).
-func TestConversationCacheMergeAppendsANewTurn(t *testing.T) {
-	c := newConversationCache()
-	c.store(testConversationID, 0, []historyTurn{{Role: "user", Text: "seed"}, {Role: "assistant", Text: "seed-reply"}})
-	c.merge(testConversationID, turnRecord{conversation: testConversationID, ok: true, userText: "hi", assistantText: "hello"})
-
-	got := c.snapshot(testConversationID)
-	if len(got) != 4 || got[2].Text != "hi" || got[3].Text != "hello" {
-		t.Errorf("history = %+v, want the seed plus the new turn appended", got)
-	}
-}
-
-// TestConversationCacheMergeCapsHistoryAtTheWindowAfterManyTurns is the
-// actual regression guard for merge re-applying windowHistory's cap: the
-// test above only reaches exactly the cap (2 seed turns + 1 merge =
-// maxHistoryExchanges*2) and would pass whether or not merge re-applies
-// windowHistory. This proves the cap actually holds once a connection's
-// history grows past it.
-func TestConversationCacheMergeCapsHistoryAtTheWindowAfterManyTurns(t *testing.T) {
-	c := newConversationCache()
-	c.store(testConversationID, 0, []historyTurn{
-		{Role: "user", Text: "u1"}, {Role: "assistant", Text: "a1"},
-		{Role: "user", Text: "u2"}, {Role: "assistant", Text: "a2"},
-	}) // already at the cap (maxHistoryExchanges*2 == 4)
-
-	c.merge(testConversationID, turnRecord{conversation: testConversationID, ok: true, userText: "u3", assistantText: "a3"})
-
-	got := c.snapshot(testConversationID)
-	want := []historyTurn{
-		{Role: "user", Text: "u2"}, {Role: "assistant", Text: "a2"},
-		{Role: "user", Text: "u3"}, {Role: "assistant", Text: "a3"},
-	}
-	if !slices.Equal(got, want) {
-		t.Errorf("history = %+v, want %+v (merge must keep re-applying windowHistory's cap)", got, want)
-	}
-}
-
-func TestConversationCacheEvictRemovesAnExistingEntry(t *testing.T) {
-	c := newConversationCache()
-	c.store(testConversationID, 0, []historyTurn{{Role: "user", Text: "hi"}})
-	c.evict(testConversationID)
-
-	if c.isLoaded(testConversationID, 0) {
-		t.Error("evict left the entry loaded")
-	}
-	if len(c.snapshot(testConversationID)) != 0 {
-		t.Error("evict left history behind")
-	}
-}
-
-func TestConversationCacheEvictIsANoOpOnAnAbsentEntry(t *testing.T) {
-	c := newConversationCache()
-	c.evict("never-cached") // must not panic
-	if c.isLoaded("never-cached", 0) {
-		t.Error("evict marked an absent entry as loaded")
-	}
-}
-
-// TestChatSwitchingBackToAConversationReusesItsCachedHistoryInsteadOfReloading
-// is the regression guard for the switch-then-switch-back hazard: a switch
-// back to a conversation this connection has already visited must be a cache
-// hit against histories, not another DB read that could race a still-in-flight
-// turn's own persist on that same conversation (see runChatConnection's
-// "message" case).
-func TestChatSwitchingBackToAConversationReusesItsCachedHistoryInsteadOfReloading(t *testing.T) {
-	const convX = "22222222-2222-2222-2222-222222222222"
-	const convY = "33333333-3333-3333-3333-333333333333"
-
-	var loadCalls atomic.Int32
-	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
-		loadCalls.Add(1)
-		return nil, nil
-	}
-	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
-		events := make(chan agentEvent, 2)
-		events <- agentEvent{Type: "message", Text: "answer"}
-		events <- agentEvent{Type: "done"}
-		close(events)
-		return events, nil
-	}
-	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
-		loadConversation, noopSaveMessages)
-	conn := dialChat(t, srv, mintTicket(t, srv, token))
-
-	for _, step := range []struct{ turn, conv string }{
-		{"t1", convX}, {"t2", convY}, {"t3", convX},
-	} {
-		if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: step.turn, Text: "hi", Conversation: step.conv}); err != nil {
-			t.Fatal(err)
-		}
-		for range 2 { // token, then done
-			var ev outboundEvent
-			if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	if got := loadCalls.Load(); got != 2 {
-		t.Errorf("loadConversation called %d times, want 2 (once per conversation, not again on the switch back to X)", got)
 	}
 }
 
@@ -1722,22 +1543,20 @@ func TestDeleteConversationTombstoneAppliesRegardlessOfIDCase(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // margin for finishTurn to run server-side
 }
 
-// TestChatRetriesConversationLoadAfterAFailedLoadEvenAfterATurnCompletes is
-// the end-to-end regression guard for the histories-poisoning bug: a
-// transient loadConversation failure must not be cached as "seen" just
-// because a turn dispatched against that conversation went on to complete —
-// the next message on that conversation must retry the load.
-func TestChatRetriesConversationLoadAfterAFailedLoadEvenAfterATurnCompletes(t *testing.T) {
-	var loadCalls atomic.Int32
+// TestChatTurnDegradesToEmptyHistoryWhenConversationLoadFails proves a
+// conversation-history load failure degrades to an empty history window
+// rather than failing the turn outright — history is a nice-to-have for the
+// agent (loadConversation's own contract already treats "nothing saved yet"
+// as a normal nil result), not a hard requirement like T19's verdicts, so a
+// transient read error here must not stop the user from getting an answer.
+func TestChatTurnDegradesToEmptyHistoryWhenConversationLoadFails(t *testing.T) {
 	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
-		if loadCalls.Add(1) == 1 {
-			return nil, errors.New("transient db error")
-		}
-		return nil, nil
+		return nil, errors.New("transient db error")
 	}
+	var got agentChatRequest
 	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
-		ch := make(chan agentEvent, 2)
-		ch <- agentEvent{Type: "message", Text: "ok"}
+		got = req
+		ch := make(chan agentEvent, 1)
 		ch <- agentEvent{Type: "done"}
 		close(ch)
 		return ch, nil
@@ -1746,19 +1565,18 @@ func TestChatRetriesConversationLoadAfterAFailedLoadEvenAfterATurnCompletes(t *t
 		loadConversation, noopSaveMessages)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	for _, turn := range []string{"t1", "t2"} {
-		if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: turn, Text: "hi", Conversation: testConversationID}); err != nil {
-			t.Fatal(err)
-		}
-		for range 2 { // token, then done
-			var ev outboundEvent
-			if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
-				t.Fatal(err)
-			}
-		}
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
 	}
-	if got := loadCalls.Load(); got != 2 {
-		t.Errorf("loadConversation called %d times, want 2 (a failed load must be retried on the next message)", got)
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "done" {
+		t.Fatalf("event type = %q, want done — a history load failure must not fail the turn", ev.Type)
+	}
+	if len(got.History) != 0 {
+		t.Errorf("History sent to the agent = %+v, want empty after a failed load", got.History)
 	}
 }
 
@@ -1815,21 +1633,6 @@ func TestChatNewMessageToASinceDeletedConversationIsNotDropped(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a legitimate new message to a since-deleted conversation id was dropped")
-	}
-}
-
-// TestConversationCacheIsLoadedTreatsAnAdvancedGenerationAsStale is a direct
-// unit test of the cache-invalidation mechanism: a cache entry recorded at
-// generation g must be treated as absent once the live generation has moved
-// past g (a delete landed on that conversation since it was cached).
-func TestConversationCacheIsLoadedTreatsAnAdvancedGenerationAsStale(t *testing.T) {
-	c := newConversationCache()
-	c.store(testConversationID, 0, []historyTurn{{Role: "user", Text: "old"}})
-	if !c.isLoaded(testConversationID, 0) {
-		t.Error("isLoaded = false, want true when the live generation matches what was recorded")
-	}
-	if c.isLoaded(testConversationID, 1) {
-		t.Error("isLoaded = true, want false once the live generation has advanced (a delete landed since)")
 	}
 }
 
@@ -1890,144 +1693,6 @@ func TestChatDeleteDuringInFlightLoadStillSuppressesTheStragglingTurn(t *testing
 		}
 	}
 	time.Sleep(100 * time.Millisecond) // margin for finishTurn to run server-side
-}
-
-// TestChatCacheInvalidatesAfterADeleteRatherThanReusingStaleHistory is the
-// end-to-end regression guard for cache invalidation on delete: a
-// conversation this connection has already cached, then deleted out from
-// under it, must be reloaded (not served from cache) on its next message —
-// proven by loadConversation being called a second time, not just by
-// inspecting internal state.
-func TestChatCacheInvalidatesAfterADeleteRatherThanReusingStaleHistory(t *testing.T) {
-	var loadCalls atomic.Int32
-	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
-		loadCalls.Add(1)
-		return nil, nil
-	}
-	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
-		ch := make(chan agentEvent, 2)
-		ch <- agentEvent{Type: "message", Text: "ok"}
-		ch <- agentEvent{Type: "done"}
-		close(ch)
-		return ch, nil
-	}
-	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
-		loadConversation, noopSaveMessages)
-	conn := dialChat(t, srv, mintTicket(t, srv, token))
-
-	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
-		t.Fatal(err)
-	}
-	var ev outboundEvent
-	for range 2 {
-		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := loadCalls.Load(); got != 1 {
-		t.Fatalf("loadConversation called %d times, want 1 after the first message", got)
-	}
-
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/conversations/"+testConversationID, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := srv.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("delete status = %d, want 200", resp.StatusCode)
-	}
-
-	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t2", Text: "hi again", Conversation: testConversationID}); err != nil {
-		t.Fatal(err)
-	}
-	for range 2 {
-		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := loadCalls.Load(); got != 2 {
-		t.Errorf("loadConversation called %d times, want 2 (the cache must invalidate after a delete, not be reused)", got)
-	}
-}
-
-// TestChatFailedReloadAfterADeleteEvictsTheStaleCacheEntryInsteadOfServingIt
-// is the regression guard for the histories-poisoning bug this fixes. A
-// delete correctly forces a reload (see
-// TestChatCacheInvalidatesAfterADeleteRatherThanReusingStaleHistory), but if
-// that reload itself fails, the connection's existing cache entry for the
-// conversation — recorded before the delete — must not be left in place: the
-// next turn dispatched against it would otherwise still be handed that
-// stale, pre-deletion history as agent context.
-func TestChatFailedReloadAfterADeleteEvictsTheStaleCacheEntryInsteadOfServingIt(t *testing.T) {
-	var loadCalls atomic.Int32
-	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
-		if loadCalls.Add(1) == 1 {
-			return []historyTurn{{Role: "user", Text: "before delete"}, {Role: "assistant", Text: "reply"}}, nil
-		}
-		return nil, errors.New("transient db error")
-	}
-	gotSecondReq := make(chan agentChatRequest, 1)
-	var callCount atomic.Int32
-	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
-		ch := make(chan agentEvent, 2)
-		ch <- agentEvent{Type: "message", Text: "ok"}
-		ch <- agentEvent{Type: "done"}
-		close(ch)
-		if callCount.Add(1) == 2 {
-			gotSecondReq <- req
-		}
-		return ch, nil
-	}
-	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
-		loadConversation, noopSaveMessages)
-	conn := dialChat(t, srv, mintTicket(t, srv, token))
-
-	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
-		t.Fatal(err)
-	}
-	var ev outboundEvent
-	for range 2 { // token, done
-		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/conversations/"+testConversationID, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := srv.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("delete status = %d, want 200", resp.StatusCode)
-	}
-
-	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t2", Text: "hi again", Conversation: testConversationID}); err != nil {
-		t.Fatal(err)
-	}
-	for range 2 {
-		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	select {
-	case got := <-gotSecondReq:
-		if len(got.History) != 0 {
-			t.Errorf("History sent to the agent = %+v, want empty (the stale pre-deletion cache entry must have been evicted)", got.History)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the agent was never called for the second turn")
-	}
 }
 
 // --- conversation_created event ----------------------------------------------
@@ -2197,13 +1862,12 @@ func TestFinishTurnSkipsTheWebSocketSendOnceItsEventContextIsDone(t *testing.T) 
 		},
 		conversationDeletions: newConversationDeletions(),
 	}
-	cache := newConversationCache()
 	rec := turnRecord{turn: "t1", conversation: testConversationID, ok: true, userText: "hi", assistantText: "hello"}
 
 	eventCtx, cancel := context.WithCancel(t.Context())
 	cancel() // already done, as runChatConnection's shutdown drain leaves it
 
-	h.finishTurn(t.Context(), eventCtx, "user_1", cache, rec, serverConn)
+	h.finishTurn(t.Context(), eventCtx, "user_1", rec, serverConn)
 
 	if !saveCalled {
 		t.Error("finishTurn must still persist via dbCtx even when eventCtx is already done")
