@@ -1,6 +1,23 @@
 import { describe, expect, test } from "bun:test"
 
-import { withTimeout } from "./gateway"
+import {
+  GatewaySessionExpiredError,
+  SESSION_EXPIRED_TEXT,
+  gatewayErrorText,
+  withTimeout,
+} from "./gateway"
+
+describe("gatewayErrorText", () => {
+  test("returns the shared session-expired text for a GatewaySessionExpiredError", () => {
+    expect(gatewayErrorText(new GatewaySessionExpiredError(), "fallback")).toBe(
+      SESSION_EXPIRED_TEXT,
+    )
+  })
+
+  test("returns the caller's fallback for any other error", () => {
+    expect(gatewayErrorText(new Error("boom"), "fallback")).toBe("fallback")
+  })
+})
 
 describe("withTimeout", () => {
   test("resolves with the promise's value when it settles first", async () => {

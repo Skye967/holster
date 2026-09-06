@@ -8,11 +8,8 @@ import { useCallback, useEffect, useState } from "react"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
-import {
-  GatewaySessionExpiredError,
-  SESSION_EXPIRED_TEXT,
-  gatewayFetch,
-} from "@/lib/gateway"
+import { useRowStatus } from "@/hooks/use-row-status"
+import { gatewayErrorText, gatewayFetch } from "@/lib/gateway"
 
 // Always-visible providers, ranked by TMDB's own display_priority — everything
 // past this is reachable only through search. TASKS.md T15: "surface the
@@ -27,11 +24,6 @@ interface ProviderEntry {
   subscribed: boolean
 }
 
-interface RowStatus {
-  pending: boolean
-  error?: string
-}
-
 export function StreamingPicker() {
   const { getToken, isLoaded } = useAuth()
   const [providers, setProviders] = useState<ProviderEntry[] | null>(null)
@@ -40,7 +32,12 @@ export function StreamingPicker() {
   // Per-row mutation status, keyed by provider_id — pending disables that
   // row's Switch so a second click can't race the first write, error shows
   // an inline message on revert.
-  const [rowStatus, setRowStatus] = useState<Record<number, RowStatus>>({})
+  const {
+    status: rowStatus,
+    setPending,
+    setSuccess,
+    setFailure,
+  } = useRowStatus<number>()
 
   useEffect(() => {
     if (!isLoaded) return
@@ -69,7 +66,7 @@ export function StreamingPicker() {
       // a previous failed attempt on this row — set before the optimistic
       // update / first await so a second click is already disabled by the
       // time React re-renders.
-      setRowStatus((prev) => ({ ...prev, [providerId]: { pending: true } }))
+      setPending(providerId)
       // Optimistic: flip immediately, revert with an inline message if the
       // write fails (TASKS.md's cross-cutting rule — never show a status code).
       setProviders(
@@ -86,7 +83,7 @@ export function StreamingPicker() {
           getToken,
         )
         if (!res.ok) throw new Error(`status ${res.status}`)
-        setRowStatus((prev) => ({ ...prev, [providerId]: { pending: false } }))
+        setSuccess(providerId)
       } catch (err) {
         setProviders(
           (prev) =>
@@ -96,19 +93,13 @@ export function StreamingPicker() {
                 : p,
             ) ?? prev,
         )
-        setRowStatus((prev) => ({
-          ...prev,
-          [providerId]: {
-            pending: false,
-            error:
-              err instanceof GatewaySessionExpiredError
-                ? SESSION_EXPIRED_TEXT
-                : "Couldn't save that — try again",
-          },
-        }))
+        setFailure(
+          providerId,
+          gatewayErrorText(err, "Couldn't save that — try again"),
+        )
       }
     },
-    [getToken],
+    [getToken, setPending, setSuccess, setFailure],
   )
 
   if (loadError) {

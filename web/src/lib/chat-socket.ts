@@ -8,8 +8,7 @@ import { useCallback, useEffect, useRef } from "react"
 
 import {
   GATEWAY_CALL_TIMEOUT_MS,
-  GatewaySessionExpiredError,
-  SESSION_EXPIRED_TEXT,
+  gatewayErrorText,
   gatewayFetch,
   withTimeout,
   type GetToken,
@@ -53,13 +52,17 @@ export interface AgentPick {
 // outboundEvent tags it `json:"relaxed,omitempty"`, so the key is absent
 // from the wire entirely whenever nothing was relaxed (the common case) —
 // typing it as always-present string[] would be a lie the JSON.parse cast
-// below can't catch.
+// below can't catch. conversation_created carries nothing beyond turn: it
+// isn't rendered inline in any turn's UI, and chat-session-provider.tsx
+// intercepts it — telling the sidebar to refetch — before it ever reaches a
+// ChatPanel (see that file and services/gateway/chat.go's finishTurn).
 export type ChatEvent =
   | { type: "interpreting"; turn: string; text: string }
   | { type: "results"; turn: string; picks: AgentPick[]; relaxed?: string[] }
   | { type: "token"; turn: string; text: string }
   | { type: "error"; turn: string; text: string }
   | { type: "done"; turn: string }
+  | { type: "conversation_created"; turn: string }
 
 function wsURL(ticket: string): string {
   const base = process.env.NEXT_PUBLIC_GATEWAY_URL
@@ -95,12 +98,7 @@ async function connect(getToken: GetToken): Promise<ConnectResult> {
   try {
     ticket = await mintTicket(getToken)
   } catch (err) {
-    return {
-      error:
-        err instanceof GatewaySessionExpiredError
-          ? SESSION_EXPIRED_TEXT
-          : UNREACHABLE_TEXT,
-    }
+    return { error: gatewayErrorText(err, UNREACHABLE_TEXT) }
   }
 
   const socket = new WebSocket(wsURL(ticket))
@@ -216,14 +214,21 @@ export function useChatSocket(
   }, [isLoaded, ensureSocket])
 
   const send = useCallback(
-    (text: string): string => {
+    (text: string, conversationId: string): string => {
       const turn = crypto.randomUUID()
       ensureSocket().then((result) => {
         if ("error" in result) {
           onEventRef.current({ type: "error", turn, text: result.error })
           return
         }
-        result.socket.send(JSON.stringify({ type: "message", turn, text }))
+        result.socket.send(
+          JSON.stringify({
+            type: "message",
+            turn,
+            text,
+            conversation: conversationId,
+          }),
+        )
       })
       return turn
     },

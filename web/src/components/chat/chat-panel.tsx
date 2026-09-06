@@ -4,19 +4,16 @@ import { useAuth } from "@clerk/nextjs"
 import { Send } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 
+import { useChatSession } from "@/components/chat/chat-session-provider"
 import { TitleCard } from "@/components/chat/title-card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { useRowStatus, type RowStatus } from "@/hooks/use-row-status"
 import { fetchChatHistory } from "@/lib/chat-history"
-import {
-  type AgentPick,
-  type ChatEvent,
-  useChatSocket,
-} from "@/lib/chat-socket"
+import { type AgentPick, type ChatEvent } from "@/lib/chat-socket"
 import {
   GATEWAY_CALL_TIMEOUT_MS,
-  GatewaySessionExpiredError,
-  SESSION_EXPIRED_TEXT,
+  gatewayErrorText,
   gatewayFetch,
   withTimeout,
 } from "@/lib/gateway"
@@ -40,11 +37,6 @@ interface Turn {
   error?: string
 }
 
-interface VerdictRowStatus {
-  pending: boolean
-  error?: string
-}
-
 function applyEvent(turn: Turn, ev: ChatEvent): Turn {
   switch (ev.type) {
     case "interpreting":
@@ -56,6 +48,10 @@ function applyEvent(turn: Turn, ev: ChatEvent): Turn {
     case "error":
       return { ...turn, error: ev.text }
     case "done":
+      return turn
+    case "conversation_created":
+      // Fully handled upstream in chat-session-provider.tsx — this case
+      // exists only so the exhaustiveness check below keeps compiling.
       return turn
     default:
       // gateway and frontend deploy independently (ARCHITECTURE.md) — a
@@ -118,7 +114,7 @@ function TurnView({
   turn: Turn
   onRetry: () => void
   verdicts: Record<string, Verdict>
-  verdictStatus: Record<string, VerdictRowStatus>
+  verdictStatus: Record<string, RowStatus>
   onSetVerdict: (
     tmdbId: number,
     mediaType: "movie" | "tv",
@@ -180,7 +176,7 @@ function TurnView({
   )
 }
 
-export function ChatPanel() {
+export function ChatPanel({ conversationId }: { conversationId: string }) {
   const { getToken, isLoaded } = useAuth()
   const [turns, setTurns] = useState<Turn[]>([])
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null)
@@ -202,9 +198,12 @@ export function ChatPanel() {
   // judgment menu both write the same title_verdicts row, so both must
   // disable on the same pending flag or a double-click across the two
   // controls could race.
-  const [verdictStatus, setVerdictStatus] = useState<
-    Record<string, VerdictRowStatus>
-  >({})
+  const {
+    status: verdictStatus,
+    setPending: setVerdictPending,
+    setSuccess: setVerdictSuccess,
+    setFailure: setVerdictFailure,
+  } = useRowStatus<string>()
 
   // Keys writeVerdict has ever touched this session (set or cleared) — the
   // hydration GET below must never let its (possibly stale-by-the-time-it-
@@ -237,19 +236,18 @@ export function ChatPanel() {
     }
   }, [isLoaded, getToken])
 
-  // Rehydrates the last exchanges on mount so a page reload keeps the
-  // conversation (TASKS.md T20) instead of starting blank. Seeded only when
-  // `turns` is still empty at the time this resolves — a user who types and
-  // sends a message before the GET returns must not have it wiped out from
-  // under them, the same race verdicts hydration above guards against with
-  // touchedVerdictsRef, applied here as "don't clobber a non-empty list"
-  // since a rehydrated turn has no id of its own to merge against a live
-  // one. No picks/interpreting on a rehydrated turn — only text is
-  // persisted, so it renders as chat-panel.tsx's plain tokenText case.
+  // Rehydrates conversationId's last exchanges on mount, so a page reload
+  // keeps the conversation (TASKS.md T20). A switch to a different
+  // conversation (TASKS.md T20.5) is a fresh mount, not a change this
+  // effect reacts to — [id]/page.tsx keys ChatPanel by conversationId, so
+  // `turns` genuinely starts empty here, which is what the
+  // "sent a message before the GET resolves" race below relies on. No
+  // picks/interpreting on a rehydrated turn — only text is persisted, so
+  // it renders as chat-panel.tsx's plain tokenText case.
   useEffect(() => {
     if (!isLoaded) return
     let cancelled = false
-    fetchChatHistory(getToken)
+    fetchChatHistory(getToken, conversationId)
       .then((history) => {
         if (cancelled) return
         setTurns((prev) =>
@@ -264,12 +262,12 @@ export function ChatPanel() {
       })
       .catch(() => {
         // Best-effort hydration: an empty thread on failure is the same
-        // experience a brand-new account already has.
+        // experience a brand-new conversation already has.
       })
     return () => {
       cancelled = true
     }
-  }, [isLoaded, getToken])
+  }, [isLoaded, getToken, conversationId])
 
   // Shared by setVerdict/clearVerdict: optimistic update, then the write,
   // reverting on failure — streaming-picker.tsx's toggle() pattern (TASKS.md's
@@ -307,7 +305,7 @@ export function ChatPanel() {
       // change instead of only when getToken changes.
       let previous: Verdict | undefined
 
-      setVerdictStatus((prev) => ({ ...prev, [key]: { pending: true } }))
+      setVerdictPending(key)
       setVerdicts((prev) => {
         previous = prev[key]
         const next = { ...prev }
@@ -353,7 +351,7 @@ export function ChatPanel() {
           throw new Error(`status 409, unrecognized code ${body.code}`)
         }
         if (!res.ok) throw new Error(`status ${res.status}`)
-        setVerdictStatus((prev) => ({ ...prev, [key]: { pending: false } }))
+        setVerdictSuccess(key)
       } catch (err) {
         // Abandon the touch on failure, not just the optimistic value: if the
         // mount-time hydration GET is still in flight, its (correct) answer
@@ -366,23 +364,20 @@ export function ChatPanel() {
           else next[key] = previous
           return next
         })
-        setVerdictStatus((prev) => ({
-          ...prev,
-          [key]: {
-            pending: false,
-            error:
-              err instanceof GatewaySessionExpiredError
-                ? SESSION_EXPIRED_TEXT
-                : err instanceof VerdictLockedError
-                  ? VERDICT_LOCKED_TEXT
-                  : err instanceof VerdictStaleError
-                    ? VERDICT_STALE_TEXT
-                    : "Couldn't save that — try again",
-          },
-        }))
+        setVerdictFailure(
+          key,
+          gatewayErrorText(
+            err,
+            err instanceof VerdictLockedError
+              ? VERDICT_LOCKED_TEXT
+              : err instanceof VerdictStaleError
+                ? VERDICT_STALE_TEXT
+                : "Couldn't save that — try again",
+          ),
+        )
       }
     },
-    [getToken],
+    [getToken, setVerdictPending, setVerdictSuccess, setVerdictFailure],
   )
 
   const handleSetVerdict = useCallback(
@@ -425,7 +420,16 @@ export function ChatPanel() {
     [handleEvent],
   )
 
-  const { send } = useChatSocket(handleEvent, handleDisconnect)
+  const { send, setListener, clearListener } = useChatSession()
+
+  // Registers this mounted panel as the shared socket's current listener —
+  // ChatSessionProvider forwards every event/disconnect to whichever
+  // ChatPanel last called this, which is always the one for the
+  // conversation currently on screen.
+  useEffect(() => {
+    setListener({ onEvent: handleEvent, onDisconnect: handleDisconnect })
+    return () => clearListener()
+  }, [setListener, clearListener, handleEvent, handleDisconnect])
 
   // The only send path — typing a new message and retrying a failed turn
   // both call this with the text to (re)send. A retry is nothing more than
@@ -436,12 +440,12 @@ export function ChatPanel() {
     (text: string) => {
       const trimmed = text.trim()
       if (!trimmed || activeTurnId) return
-      const turnId = send(trimmed)
+      const turnId = send(trimmed, conversationId)
       activeTurnIdRef.current = turnId
       setTurns((prev) => [...prev, { id: turnId, userText: trimmed }])
       setActiveTurnId(turnId)
     },
-    [activeTurnId, send],
+    [activeTurnId, send, conversationId],
   )
 
   const handleSubmit = useCallback(() => {
