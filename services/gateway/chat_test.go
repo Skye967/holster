@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,12 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )
+
+// testConversationID is the conversation id most tests below send on every
+// "message" frame — its value is arbitrary (TASKS.md T20.5: conversation ids
+// are client-generated, opaque UUIDs), only used where a test isn't itself
+// about multi-conversation behavior.
+const testConversationID = "11111111-1111-1111-1111-111111111111"
 
 // --- ticketStore -------------------------------------------------------
 
@@ -336,17 +343,18 @@ func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chat
 	return newChatTestServerWithConversations(t, loadCtx, callAgent, loadVerdicts, noopLoadConversation, noopSaveMessages)
 }
 
-// newChatTestServerWithConversations is newChatTestServer plus the two T20
-// dependencies, for the tests below that need to fake conversation hydration
-// or observe what gets persisted — every other test goes through the plain
-// wrapper above and gets the pre-T20 behaviour (no history, saves discarded).
+// newChatTestServerWithConversations is newChatTestServer plus the two T20/
+// T20.5 dependencies, for the tests below that need to fake conversation
+// hydration or observe what gets persisted — every other test goes through
+// the plain wrapper above and gets the default behaviour (no history, saves
+// discarded).
 func newChatTestServerWithConversations(
 	t *testing.T,
 	loadCtx func(context.Context, string) (chatContext, error),
 	callAgent agentCaller,
 	loadVerdicts func(context.Context, string) ([]Verdict, error),
-	loadConversation func(context.Context, string) (string, []historyTurn, error),
-	saveMessages func(context.Context, string, string, string, string, []agentTitleRef) (string, error),
+	loadConversation func(context.Context, string, string) ([]historyTurn, error),
+	saveMessages func(context.Context, string, string, string, string, []agentTitleRef) (bool, error),
 ) (*httptest.Server, string) {
 	t.Helper()
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -367,6 +375,7 @@ func newChatTestServerWithConversations(
 		loadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		loadConversation, noopLoadConversationTurns, saveMessages,
+		noopLoadConversationSummaries, noopDeleteConversation,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -449,7 +458,7 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 	ticket := mintTicket(t, srv, token)
 	conn := dialChat(t, srv, ticket)
 
-	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie"}); err != nil {
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie", Conversation: testConversationID}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -506,7 +515,7 @@ func TestChatTurnSendsProviderNamesToTheAgent(t *testing.T) {
 	srv, token := newChatTestServer(t, loadCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "what can you do?"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "what can you do?", Conversation: testConversationID})
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
 		t.Fatal(err)
@@ -527,7 +536,7 @@ func TestChatErrorReasonBecomesFriendlyText(t *testing.T) {
 	srv, token := newChatTestServer(t, loadCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything", Conversation: testConversationID})
 
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
@@ -556,7 +565,7 @@ func TestChatCancelStopsTheAgentCall(t *testing.T) {
 	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything", Conversation: testConversationID})
 	<-blocked // the fake agent call is now hanging on ctx.Done()
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "cancel", Turn: "t1"})
 
@@ -597,9 +606,9 @@ func TestChatNewMessageSupersedesTheInFlightTurn(t *testing.T) {
 	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "first"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "first", Conversation: testConversationID})
 	<-firstBlocked
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t2", Text: "second"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t2", Text: "second", Conversation: testConversationID})
 
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
@@ -645,7 +654,7 @@ func TestRunTurnDoesNotBlockSendingToAnUnreadDoneChannel(t *testing.T) {
 
 	finished := make(chan struct{})
 	go func() {
-		h.runTurn(turnCtx, connCtx, nil, "user_1", "t1", "hi", nil, done)
+		h.runTurn(turnCtx, connCtx, nil, "user_1", "t1", testConversationID, "hi", nil, 0, done)
 		close(finished)
 	}()
 
@@ -671,7 +680,7 @@ func TestChatCancelsTurnContextPromptlyOnNormalCompletion(t *testing.T) {
 	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything", Conversation: testConversationID})
 
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
@@ -710,7 +719,7 @@ func TestChatDroppedAgentStreamStillSendsATerminalEvent(t *testing.T) {
 	srv, token := newChatTestServer(t, loadCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything", Conversation: testConversationID})
 
 	var got []outboundEvent
 	for range 2 {
@@ -744,7 +753,7 @@ func TestChatUnknownAgentEventTypeIsLoggedAndSkipped(t *testing.T) {
 	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything", Conversation: testConversationID})
 
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
@@ -772,7 +781,7 @@ func TestChatMalformedIntentIsLogged(t *testing.T) {
 	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything", Conversation: testConversationID})
 
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
@@ -834,7 +843,7 @@ func TestChatTurnSendsVerdictsToTheAgent(t *testing.T) {
 	srv, token := newChatTestServer(t, loadCtx, callAgent, loadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "something good"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "something good", Conversation: testConversationID})
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
 		t.Fatal(err)
@@ -866,7 +875,7 @@ func TestChatTurnFailsWhenVerdictsCannotLoad(t *testing.T) {
 	srv, token := newChatTestServer(t, loadCtx, callAgent, loadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "something good"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "something good", Conversation: testConversationID})
 
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
@@ -900,7 +909,7 @@ func TestChatTurnWithNoSubscriptionsSkipsVerdicts(t *testing.T) {
 	srv, token := newChatTestServer(t, loadCtx, callAgent, loadVerdicts)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID})
 
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
@@ -911,16 +920,20 @@ func TestChatTurnWithNoSubscriptionsSkipsVerdicts(t *testing.T) {
 	}
 }
 
-// --- T20: conversation hydration and persistence ----------------------------
+// --- T20/T20.5: conversation hydration, switching, and persistence ---------
 
-// TestChatConnectionHydratesHistoryFromStoredConversation proves
-// runChatConnection seeds its in-memory history from loadConversation at
-// connect time (TASKS.md T20), so a fresh WS connection — the reconnect a
-// page reload produces — carries prior turns into the very first agent call,
-// not just into what the browser re-renders.
+// TestChatConnectionHydratesHistoryFromStoredConversation proves the "message"
+// case in runChatConnection seeds its in-memory history from loadConversation
+// the first time it sees a given conversation id (TASKS.md T20/T20.5) — a
+// reload/reconnect that resends its conversation id on the first message
+// carries prior turns into the very first agent call, not just into what the
+// browser re-renders.
 func TestChatConnectionHydratesHistoryFromStoredConversation(t *testing.T) {
-	loadConversation := func(context.Context, string) (string, []historyTurn, error) {
-		return "conv_1", []historyTurn{
+	loadConversation := func(_ context.Context, _ string, conversationID string) ([]historyTurn, error) {
+		if conversationID != testConversationID {
+			t.Errorf("loadConversation called with %q, want %q", conversationID, testConversationID)
+		}
+		return []historyTurn{
 			{Role: "user", Text: "a heist movie"},
 			{Role: "assistant", Text: "Suggested: Heat"},
 		}, nil
@@ -940,7 +953,7 @@ func TestChatConnectionHydratesHistoryFromStoredConversation(t *testing.T) {
 		loadConversation, noopSaveMessages)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "something shorter"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "something shorter", Conversation: testConversationID})
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
 		t.Fatal(err)
@@ -953,13 +966,10 @@ func TestChatConnectionHydratesHistoryFromStoredConversation(t *testing.T) {
 }
 
 // TestChatCompletedTurnPersistsViaSaveMessages proves a successfully
-// completed turn calls saveMessages with the conversation id, the exact text
-// shown, and the title ids from its picks — DECISIONS.md's "clean text and
-// the title IDs shown."
+// completed turn calls saveMessages with the conversation id the client sent,
+// the exact text shown, and the title ids from its picks — DECISIONS.md's
+// "clean text and the title IDs shown."
 func TestChatCompletedTurnPersistsViaSaveMessages(t *testing.T) {
-	loadConversation := func(context.Context, string) (string, []historyTurn, error) {
-		return "conv_1", nil, nil
-	}
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US", Providers: []int{8}}, nil
 	}
@@ -971,19 +981,19 @@ func TestChatCompletedTurnPersistsViaSaveMessages(t *testing.T) {
 	)
 
 	type saveCall struct {
-		userID, conversationID, userText, assistantText string
-		titleRefs                                       []agentTitleRef
+		conversationID, userText, assistantText string
+		titleRefs                               []agentTitleRef
 	}
 	saved := make(chan saveCall, 1)
-	saveMessages := func(_ context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (string, error) {
-		saved <- saveCall{userID, conversationID, userText, assistantText, titleRefs}
-		return conversationID, nil
+	saveMessages := func(_ context.Context, _ string, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error) {
+		saved <- saveCall{conversationID, userText, assistantText, titleRefs}
+		return false, nil
 	}
 	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
-		loadConversation, saveMessages)
+		noopLoadConversation, saveMessages)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie"})
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie", Conversation: testConversationID})
 	for range 2 { // "results", then "done"
 		var ev outboundEvent
 		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
@@ -993,8 +1003,8 @@ func TestChatCompletedTurnPersistsViaSaveMessages(t *testing.T) {
 
 	select {
 	case call := <-saved:
-		if call.conversationID != "conv_1" {
-			t.Errorf("conversationID = %q, want %q", call.conversationID, "conv_1")
+		if call.conversationID != testConversationID {
+			t.Errorf("conversationID = %q, want %q", call.conversationID, testConversationID)
 		}
 		if call.userText != "a heist movie" {
 			t.Errorf("userText = %q, want %q", call.userText, "a heist movie")
@@ -1010,13 +1020,10 @@ func TestChatCompletedTurnPersistsViaSaveMessages(t *testing.T) {
 	}
 }
 
-// TestChatBackToBackTurnsPersistInOrder proves two turns completed one after
-// another persist in the order they completed, each carrying the
-// conversation id the previous one's save established.
+// TestChatBackToBackTurnsPersistInOrder proves two turns on the same
+// conversation, completed one after another, persist in the order they
+// completed, each carrying the conversation id the client sent.
 func TestChatBackToBackTurnsPersistInOrder(t *testing.T) {
-	loadConversation := func(context.Context, string) (string, []historyTurn, error) {
-		return "", nil, nil
-	}
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US"}, nil
 	}
@@ -1029,16 +1036,16 @@ func TestChatBackToBackTurnsPersistInOrder(t *testing.T) {
 	}
 	type saveCall struct{ userText, conversationID string }
 	saved := make(chan saveCall, 2)
-	saveMessages := func(_ context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (string, error) {
+	saveMessages := func(_ context.Context, _ string, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error) {
 		saved <- saveCall{userText: userText, conversationID: conversationID}
-		return "conv_1", nil
+		return false, nil
 	}
 	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
-		loadConversation, saveMessages)
+		noopLoadConversation, saveMessages)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
 	for _, turn := range []string{"t1", "t2"} {
-		if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: turn, Text: turn}); err != nil {
+		if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: turn, Text: turn, Conversation: testConversationID}); err != nil {
 			t.Fatal(err)
 		}
 		for range 2 { // "token", then "done"
@@ -1050,8 +1057,8 @@ func TestChatBackToBackTurnsPersistInOrder(t *testing.T) {
 	}
 
 	want := []saveCall{
-		{userText: "t1", conversationID: ""},       // no conversation yet
-		{userText: "t2", conversationID: "conv_1"}, // t1's save established it
+		{userText: "t1", conversationID: testConversationID},
+		{userText: "t2", conversationID: testConversationID},
 	}
 	for _, want := range want {
 		select {
@@ -1074,9 +1081,6 @@ func TestChatBackToBackTurnsPersistInOrder(t *testing.T) {
 // path in runChatConnection's `!ok` branch, not just the narrower
 // already-on-the-channel case a non-blocking peek alone would catch.
 func TestChatDisconnectAfterResultsButBeforeDonePersists(t *testing.T) {
-	loadConversation := func(context.Context, string) (string, []historyTurn, error) {
-		return "", nil, nil
-	}
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US"}, nil
 	}
@@ -1093,15 +1097,15 @@ func TestChatDisconnectAfterResultsButBeforeDonePersists(t *testing.T) {
 		return events, nil
 	}
 	saved := make(chan string, 1)
-	saveMessages := func(_ context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (string, error) {
+	saveMessages := func(_ context.Context, _ string, _ string, _ string, assistantText string, _ []agentTitleRef) (bool, error) {
 		saved <- assistantText
-		return "conv_1", nil
+		return false, nil
 	}
 	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
-		loadConversation, saveMessages)
+		noopLoadConversation, saveMessages)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi"}); err != nil {
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
 		t.Fatal(err)
 	}
 	// Wait for the "message" event to actually reach the browser before
@@ -1137,9 +1141,6 @@ func TestChatDisconnectAfterResultsButBeforeDonePersists(t *testing.T) {
 // correctness check on the end state, not a proven regression guard for
 // this specific race.
 func TestChatDisconnectPersistsBothSupersededAndCurrentTurns(t *testing.T) {
-	loadConversation := func(context.Context, string) (string, []historyTurn, error) {
-		return "", nil, nil
-	}
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US"}, nil
 	}
@@ -1169,22 +1170,22 @@ func TestChatDisconnectPersistsBothSupersededAndCurrentTurns(t *testing.T) {
 		return events, nil
 	}
 	saved := make(chan string, 2)
-	saveMessages := func(_ context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (string, error) {
+	saveMessages := func(_ context.Context, _ string, _ string, _ string, assistantText string, _ []agentTitleRef) (bool, error) {
 		saved <- assistantText
-		return "conv_1", nil
+		return false, nil
 	}
 	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
-		loadConversation, saveMessages)
+		noopLoadConversation, saveMessages)
 	conn := dialChat(t, srv, mintTicket(t, srv, token))
 
-	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "tA", Text: "A"}); err != nil {
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "tA", Text: "A", Conversation: testConversationID}); err != nil {
 		t.Fatal(err)
 	}
 	var ev outboundEvent
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil { // A's token
 		t.Fatal(err)
 	}
-	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "tB", Text: "B"}); err != nil {
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "tB", Text: "B", Conversation: testConversationID}); err != nil {
 		t.Fatal(err)
 	}
 	if err := wsjson.Read(t.Context(), conn, &ev); err != nil { // B's token
@@ -1203,5 +1204,1015 @@ func TestChatDisconnectPersistsBothSupersededAndCurrentTurns(t *testing.T) {
 	}
 	if !got["answer A"] || !got["answer B"] {
 		t.Errorf("persisted = %v, want both answer A and answer B", got)
+	}
+}
+
+// TestChatSwitchingConversationsDoesNotBleedHistoryOrPersistence is the
+// regression guard for T20.5's core hazard: a turn still in flight on one
+// conversation when the user switches to another must (a) still persist
+// against the conversation it actually ran on, never the one that's current
+// by the time it finishes, and (b) never have its answer merged into the
+// in-memory history window the new conversation's next turn sees.
+func TestChatSwitchingConversationsDoesNotBleedHistoryOrPersistence(t *testing.T) {
+	const convX = "22222222-2222-2222-2222-222222222222"
+	const convY = "33333333-3333-3333-3333-333333333333"
+	ySeed := []historyTurn{{Role: "user", Text: "seed"}, {Role: "assistant", Text: "seed-reply"}}
+
+	loadConversation := func(_ context.Context, _ string, conversationID string) ([]historyTurn, error) {
+		if conversationID == convY {
+			return append([]historyTurn(nil), ySeed...), nil
+		}
+		return nil, nil
+	}
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US"}, nil
+	}
+	gotYReq := make(chan agentChatRequest, 1)
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		if req.Message == "A" {
+			events := make(chan agentEvent, 1)
+			events <- agentEvent{Type: "message", Text: "answer A"}
+			// Only unwinds once superseded by B's switch — never sends
+			// "done" on its own, same shape as the disconnect tests above.
+			go func() {
+				<-ctx.Done()
+				close(events)
+			}()
+			return events, nil
+		}
+		gotYReq <- req
+		events := make(chan agentEvent, 2)
+		events <- agentEvent{Type: "message", Text: "answer B"}
+		events <- agentEvent{Type: "done"}
+		close(events)
+		return events, nil
+	}
+	type saveCall struct{ conversationID, userText, assistantText string }
+	saved := make(chan saveCall, 2)
+	saveMessages := func(_ context.Context, _ string, conversationID, userText, assistantText string, _ []agentTitleRef) (bool, error) {
+		saved <- saveCall{conversationID, userText, assistantText}
+		return false, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
+		loadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "tA", Text: "A", Conversation: convX}); err != nil {
+		t.Fatal(err)
+	}
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil { // A's token — proves A is dispatched before B switches away
+		t.Fatal(err)
+	}
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "tB", Text: "B", Conversation: convY}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // B's "token", then "done"
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case req := <-gotYReq:
+		if !slices.Equal(req.History, ySeed) {
+			t.Errorf("B's History = %+v, want conv Y's own seed %+v (not A's exchange)", req.History, ySeed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the agent was never called for conversation Y")
+	}
+
+	want := map[string]saveCall{
+		convX: {conversationID: convX, userText: "A", assistantText: "answer A"},
+		convY: {conversationID: convY, userText: "B", assistantText: "answer B"},
+	}
+	for range 2 {
+		select {
+		case got := <-saved:
+			if w, ok := want[got.conversationID]; !ok || got != w {
+				t.Errorf("save = %+v, unexpected or wrong for its conversation", got)
+			} else {
+				delete(want, got.conversationID)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only got saves for %v, missing the rest", want)
+		}
+	}
+	if len(want) != 0 {
+		t.Errorf("missing saves for: %v", want)
+	}
+}
+
+// TestChatMessageRejectsAMalformedConversationID proves the WS "message" case
+// validates the conversation id the same way the REST handlers do (uuid.Parse)
+// rather than only checking for an empty string — a malformed id must never
+// reach loadConversation/callAgent, since conversations.id is a uuid column
+// and letting a bad value through would surface as a database type-cast error
+// instead of a clean signal (see runChatConnection's "message" case).
+func TestChatMessageRejectsAMalformedConversationID(t *testing.T) {
+	for _, conv := range []string{"", "not-a-uuid", "11111111-1111-1111-1111-11111111111"} {
+		t.Run(conv, func(t *testing.T) {
+			loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
+				t.Error("loadConversation must not be called for a malformed conversation id")
+				return nil, nil
+			}
+			callAgent := func(context.Context, agentChatRequest) (<-chan agentEvent, error) {
+				t.Error("the agent must not be called for a malformed conversation id")
+				return nil, errors.New("unreachable")
+			}
+			srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+				loadConversation, noopSaveMessages)
+			conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+			if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: conv}); err != nil {
+				t.Fatal(err)
+			}
+			var ev outboundEvent
+			if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+				t.Fatal(err)
+			}
+			if ev.Type != "error" || ev.Text != genericErrorText {
+				t.Errorf("event = %+v, want a generic error event", ev)
+			}
+		})
+	}
+}
+
+// --- expiringMap ---------------------------------------------------------
+
+// TestExpiringMapDoesNotLetAnEarlierTimerDeleteALaterWrite is a direct
+// regression guard for the timer bug this design is exposed to: writing the
+// same key twice schedules two independent removal timers, and the earlier
+// one must not delete a value the later write refreshed.
+func TestExpiringMapDoesNotLetAnEarlierTimerDeleteALaterWrite(t *testing.T) {
+	m := newExpiringMap[int](30 * time.Millisecond)
+	m.set("k", 1) // would expire ~t+30ms
+	time.Sleep(20 * time.Millisecond)
+	m.set("k", 2)                     // refreshes to ~t+50ms
+	time.Sleep(20 * time.Millisecond) // t=40ms: the FIRST write's timer fires here
+	if got, ok := m.take("k"); !ok || got != 2 {
+		t.Errorf("take(k) = %d, %v; want 2, true (an earlier write's timer deleted a value a later write refreshed)", got, ok)
+	}
+}
+
+// --- conversationDeletions -------------------------------------------------
+
+// TestConversationDeletionsNeverForgetsARealDelete is the regression guard
+// for a previous, expiring implementation: a real delete's generation must
+// never revert to "never deleted," no matter how long afterward it's
+// checked — an earlier version aged it out after a fixed TTL, and a
+// long-lived connection's cached entry (conversationCache) could then
+// compare clean again against a conversation it had already been told was
+// deleted, silently serving pre-deletion history as agent context.
+func TestConversationDeletionsNeverForgetsARealDelete(t *testing.T) {
+	c := newConversationDeletions()
+	c.bump("conv1")
+	if got := c.generation("conv1"); got != 1 {
+		t.Fatalf("generation = %d, want 1", got)
+	}
+	if got := c.generation("conv1"); got != 1 {
+		t.Errorf("generation = %d, want still 1 (a real delete must never be forgotten)", got)
+	}
+}
+
+func TestConversationDeletionsBumpIncrementsOnEachRealDelete(t *testing.T) {
+	c := newConversationDeletions()
+	if got := c.bump("conv1"); got != 1 {
+		t.Errorf("bump = %d, want 1", got)
+	}
+	if got := c.bump("conv1"); got != 2 {
+		t.Errorf("bump = %d, want 2", got)
+	}
+}
+
+// --- finishTurn / conversationCache -----------------------------------------
+
+// TestFinishTurnSkipsPersistingAStragglerFromBeforeItsConversationsDeletion
+// covers the original delete race: a turn dispatched before its conversation
+// was deleted (captured generation 0) must be suppressed once the generation
+// has since advanced.
+func TestFinishTurnSkipsPersistingAStragglerFromBeforeItsConversationsDeletion(t *testing.T) {
+	var saveCalled bool
+	h := &Handler{
+		saveMessages: func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+			saveCalled = true
+			return false, nil
+		},
+		conversationDeletions: newConversationDeletions(),
+	}
+	h.conversationDeletions.bump(testConversationID) // generation -> 1, after dispatch
+
+	cache := newConversationCache()
+	rec := turnRecord{turn: "t1", conversation: testConversationID, deletionGen: 0, ok: true, userText: "hi", assistantText: "hello"}
+	h.finishTurn(t.Context(), t.Context(), "user_1", cache, rec, nil)
+
+	if saveCalled {
+		t.Error("finishTurn persisted a turn dispatched before its conversation's deletion")
+	}
+	if len(cache.snapshot(testConversationID)) != 0 {
+		t.Error("finishTurn merged a suppressed turn into the cache")
+	}
+}
+
+// TestFinishTurnPersistsANewMessageDispatchedAfterItsConversationsDeletion is
+// the regression guard for the "browser back button to a since-deleted
+// conversation" hazard: a turn dispatched *after* a delete captures the
+// post-delete generation itself, so it must never be suppressed.
+func TestFinishTurnPersistsANewMessageDispatchedAfterItsConversationsDeletion(t *testing.T) {
+	var saveCalled bool
+	h := &Handler{
+		saveMessages: func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+			saveCalled = true
+			return false, nil
+		},
+		conversationDeletions: newConversationDeletions(),
+	}
+	gen := h.conversationDeletions.bump(testConversationID) // deleted, then...
+
+	cache := newConversationCache()
+	rec := turnRecord{turn: "t1", conversation: testConversationID, deletionGen: gen, ok: true, userText: "hi", assistantText: "hello"} // ...a fresh dispatch captures the post-delete generation
+	h.finishTurn(t.Context(), t.Context(), "user_1", cache, rec, nil)
+
+	if !saveCalled {
+		t.Error("finishTurn suppressed a legitimate turn dispatched after its conversation's deletion")
+	}
+}
+
+func TestFinishTurnPersistsAndMergesWhenNeverDeleted(t *testing.T) {
+	var saveCalled bool
+	h := &Handler{
+		saveMessages: func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+			saveCalled = true
+			return false, nil
+		},
+		conversationDeletions: newConversationDeletions(),
+	}
+	cache := newConversationCache()
+	cache.store(testConversationID, 0, nil) // must have been loaded for merge to take effect
+	rec := turnRecord{turn: "t1", conversation: testConversationID, ok: true, userText: "hi", assistantText: "hello"}
+	h.finishTurn(t.Context(), t.Context(), "user_1", cache, rec, nil)
+
+	if !saveCalled {
+		t.Error("finishTurn did not persist an ordinary successful turn")
+	}
+	if len(cache.snapshot(testConversationID)) != 2 {
+		t.Errorf("cache = %+v, want the turn merged in", cache.snapshot(testConversationID))
+	}
+}
+
+// --- conversationCache -------------------------------------------------------
+
+func TestConversationCacheDoesNotMergeIntoAConversationItNeverLoaded(t *testing.T) {
+	c := newConversationCache()
+	rec := turnRecord{conversation: "conv-x", ok: true, userText: "hi", assistantText: "hello"}
+	c.merge("conv-x", rec)
+	if c.isLoaded("conv-x", 0) {
+		t.Error("merge marked a never-loaded conversation as loaded")
+	}
+	if len(c.snapshot("conv-x")) != 0 {
+		t.Error("merge stored history for a never-loaded conversation")
+	}
+}
+
+func TestConversationCacheEvictsOldestConversationBeyondItsCap(t *testing.T) {
+	c := newConversationCache()
+	for i := 0; i < maxCachedConversations; i++ {
+		c.store("conv-"+strconv.Itoa(i), 0, nil)
+	}
+	c.store("conv-new", 0, nil) // one past the cap
+
+	if c.isLoaded("conv-0", 0) {
+		t.Error("oldest conversation was not evicted")
+	}
+	if !c.isLoaded("conv-1", 0) || !c.isLoaded("conv-new", 0) {
+		t.Error("a still-recent or newly stored conversation was incorrectly evicted")
+	}
+}
+
+// TestConversationCacheMergeAppendsANewTurn proves merge appends a
+// successful turn to the stored history (below the cap — see
+// TestConversationCacheMergeCapsHistoryAtTheWindowAfterManyTurns for the cap
+// itself).
+func TestConversationCacheMergeAppendsANewTurn(t *testing.T) {
+	c := newConversationCache()
+	c.store(testConversationID, 0, []historyTurn{{Role: "user", Text: "seed"}, {Role: "assistant", Text: "seed-reply"}})
+	c.merge(testConversationID, turnRecord{conversation: testConversationID, ok: true, userText: "hi", assistantText: "hello"})
+
+	got := c.snapshot(testConversationID)
+	if len(got) != 4 || got[2].Text != "hi" || got[3].Text != "hello" {
+		t.Errorf("history = %+v, want the seed plus the new turn appended", got)
+	}
+}
+
+// TestConversationCacheMergeCapsHistoryAtTheWindowAfterManyTurns is the
+// actual regression guard for merge re-applying windowHistory's cap: the
+// test above only reaches exactly the cap (2 seed turns + 1 merge =
+// maxHistoryExchanges*2) and would pass whether or not merge re-applies
+// windowHistory. This proves the cap actually holds once a connection's
+// history grows past it.
+func TestConversationCacheMergeCapsHistoryAtTheWindowAfterManyTurns(t *testing.T) {
+	c := newConversationCache()
+	c.store(testConversationID, 0, []historyTurn{
+		{Role: "user", Text: "u1"}, {Role: "assistant", Text: "a1"},
+		{Role: "user", Text: "u2"}, {Role: "assistant", Text: "a2"},
+	}) // already at the cap (maxHistoryExchanges*2 == 4)
+
+	c.merge(testConversationID, turnRecord{conversation: testConversationID, ok: true, userText: "u3", assistantText: "a3"})
+
+	got := c.snapshot(testConversationID)
+	want := []historyTurn{
+		{Role: "user", Text: "u2"}, {Role: "assistant", Text: "a2"},
+		{Role: "user", Text: "u3"}, {Role: "assistant", Text: "a3"},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("history = %+v, want %+v (merge must keep re-applying windowHistory's cap)", got, want)
+	}
+}
+
+func TestConversationCacheEvictRemovesAnExistingEntry(t *testing.T) {
+	c := newConversationCache()
+	c.store(testConversationID, 0, []historyTurn{{Role: "user", Text: "hi"}})
+	c.evict(testConversationID)
+
+	if c.isLoaded(testConversationID, 0) {
+		t.Error("evict left the entry loaded")
+	}
+	if len(c.snapshot(testConversationID)) != 0 {
+		t.Error("evict left history behind")
+	}
+}
+
+func TestConversationCacheEvictIsANoOpOnAnAbsentEntry(t *testing.T) {
+	c := newConversationCache()
+	c.evict("never-cached") // must not panic
+	if c.isLoaded("never-cached", 0) {
+		t.Error("evict marked an absent entry as loaded")
+	}
+}
+
+// TestChatSwitchingBackToAConversationReusesItsCachedHistoryInsteadOfReloading
+// is the regression guard for the switch-then-switch-back hazard: a switch
+// back to a conversation this connection has already visited must be a cache
+// hit against histories, not another DB read that could race a still-in-flight
+// turn's own persist on that same conversation (see runChatConnection's
+// "message" case).
+func TestChatSwitchingBackToAConversationReusesItsCachedHistoryInsteadOfReloading(t *testing.T) {
+	const convX = "22222222-2222-2222-2222-222222222222"
+	const convY = "33333333-3333-3333-3333-333333333333"
+
+	var loadCalls atomic.Int32
+	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
+		loadCalls.Add(1)
+		return nil, nil
+	}
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		events := make(chan agentEvent, 2)
+		events <- agentEvent{Type: "message", Text: "answer"}
+		events <- agentEvent{Type: "done"}
+		close(events)
+		return events, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		loadConversation, noopSaveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	for _, step := range []struct{ turn, conv string }{
+		{"t1", convX}, {"t2", convY}, {"t3", convX},
+	} {
+		if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: step.turn, Text: "hi", Conversation: step.conv}); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 { // token, then done
+			var ev outboundEvent
+			if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if got := loadCalls.Load(); got != 2 {
+		t.Errorf("loadConversation called %d times, want 2 (once per conversation, not again on the switch back to X)", got)
+	}
+}
+
+// TestDeleteConversationPreventsAStragglingTurnFromResurrectingIt is the
+// regression guard for the delete race: a turn still in flight on a
+// conversation when it's deleted must not have its own completion resurrect
+// that conversation via saveMessages' on-conflict-do-nothing insert. The
+// DELETE is forced to land strictly before the turn's own "done" via the
+// proceed gate below, so this proves the tombstone is actually consulted, not
+// just that events happened to land in a hoped-for order.
+func TestDeleteConversationPreventsAStragglingTurnFromResurrectingIt(t *testing.T) {
+	proceed := make(chan struct{})
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		events := make(chan agentEvent, 2)
+		events <- agentEvent{Type: "message", Text: "partial answer"}
+		go func() {
+			<-proceed
+			events <- agentEvent{Type: "done"}
+			close(events)
+		}()
+		return events, nil
+	}
+	saveMessages := func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+		t.Error("a straggling turn resurrected a just-deleted conversation via saveMessages")
+		return false, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "token" {
+		t.Fatalf("got %+v, want a token event before deleting", ev)
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/conversations/"+testConversationID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200", resp.StatusCode)
+	}
+
+	close(proceed) // let the turn finish, strictly after the delete landed
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "done" {
+		t.Fatalf("event type = %q, want done", ev.Type)
+	}
+
+	time.Sleep(100 * time.Millisecond) // margin for finishTurn to run server-side
+}
+
+// TestDeleteConversationTombstoneAppliesRegardlessOfIDCase is the regression
+// guard for case-normalization: conversationDeletions is keyed by the
+// parsed-and-reserialized uuid, not the caller's raw string, so a delete
+// sent under one casing of a conversation id must still tombstone a
+// straggling turn dispatched under a differently-cased (but equal) uuid.
+func TestDeleteConversationTombstoneAppliesRegardlessOfIDCase(t *testing.T) {
+	const lower = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	const upper = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+
+	proceed := make(chan struct{})
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		events := make(chan agentEvent, 2)
+		events <- agentEvent{Type: "message", Text: "partial answer"}
+		go func() {
+			<-proceed
+			events <- agentEvent{Type: "done"}
+			close(events)
+		}()
+		return events, nil
+	}
+	saveMessages := func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+		t.Error("a straggling turn resurrected a just-deleted conversation via saveMessages")
+		return false, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: lower}); err != nil {
+		t.Fatal(err)
+	}
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "token" {
+		t.Fatalf("got %+v, want a token event before deleting", ev)
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/conversations/"+upper, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200", resp.StatusCode)
+	}
+
+	close(proceed)
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "done" {
+		t.Fatalf("event type = %q, want done", ev.Type)
+	}
+	time.Sleep(100 * time.Millisecond) // margin for finishTurn to run server-side
+}
+
+// TestChatRetriesConversationLoadAfterAFailedLoadEvenAfterATurnCompletes is
+// the end-to-end regression guard for the histories-poisoning bug: a
+// transient loadConversation failure must not be cached as "seen" just
+// because a turn dispatched against that conversation went on to complete —
+// the next message on that conversation must retry the load.
+func TestChatRetriesConversationLoadAfterAFailedLoadEvenAfterATurnCompletes(t *testing.T) {
+	var loadCalls atomic.Int32
+	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
+		if loadCalls.Add(1) == 1 {
+			return nil, errors.New("transient db error")
+		}
+		return nil, nil
+	}
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		ch := make(chan agentEvent, 2)
+		ch <- agentEvent{Type: "message", Text: "ok"}
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		loadConversation, noopSaveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	for _, turn := range []string{"t1", "t2"} {
+		if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: turn, Text: "hi", Conversation: testConversationID}); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 { // token, then done
+			var ev outboundEvent
+			if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if got := loadCalls.Load(); got != 2 {
+		t.Errorf("loadConversation called %d times, want 2 (a failed load must be retried on the next message)", got)
+	}
+}
+
+// TestChatNewMessageToASinceDeletedConversationIsNotDropped is the
+// end-to-end regression guard for the "browser back button to a
+// since-deleted conversation" hazard: a brand-new, legitimate message sent
+// to a conversation id after it was deleted must persist normally, not be
+// silently dropped by the tombstone built to catch a pre-delete straggler.
+func TestChatNewMessageToASinceDeletedConversationIsNotDropped(t *testing.T) {
+	saved := make(chan string, 1)
+	saveMessages := func(_ context.Context, _ string, _ string, _ string, assistantText string, _ []agentTitleRef) (bool, error) {
+		saved <- assistantText
+		return false, nil
+	}
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		ch := make(chan agentEvent, 2)
+		ch <- agentEvent{Type: "message", Text: "welcome back"}
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/conversations/"+testConversationID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200", resp.StatusCode)
+	}
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi again", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // token, then done
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case got := <-saved:
+		if got != "welcome back" {
+			t.Errorf("persisted text = %q, want %q", got, "welcome back")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a legitimate new message to a since-deleted conversation id was dropped")
+	}
+}
+
+// TestConversationCacheIsLoadedTreatsAnAdvancedGenerationAsStale is a direct
+// unit test of the cache-invalidation mechanism: a cache entry recorded at
+// generation g must be treated as absent once the live generation has moved
+// past g (a delete landed on that conversation since it was cached).
+func TestConversationCacheIsLoadedTreatsAnAdvancedGenerationAsStale(t *testing.T) {
+	c := newConversationCache()
+	c.store(testConversationID, 0, []historyTurn{{Role: "user", Text: "old"}})
+	if !c.isLoaded(testConversationID, 0) {
+		t.Error("isLoaded = false, want true when the live generation matches what was recorded")
+	}
+	if c.isLoaded(testConversationID, 1) {
+		t.Error("isLoaded = true, want false once the live generation has advanced (a delete landed since)")
+	}
+}
+
+// TestChatDeleteDuringInFlightLoadStillSuppressesTheStragglingTurn is the
+// regression guard for capturing deletionGen too late: loadConversation here
+// blocks until the test's own DELETE has already landed and bumped the
+// generation. A capture of deletionGen taken *after* the load returns (as
+// the code used to do) would read the already-bumped generation and wrongly
+// treat this turn as not predating the delete, letting it persist and
+// resurrect the conversation.
+func TestChatDeleteDuringInFlightLoadStillSuppressesTheStragglingTurn(t *testing.T) {
+	loadStarted := make(chan struct{})
+	deleteDone := make(chan struct{})
+	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
+		close(loadStarted)
+		<-deleteDone
+		return nil, nil
+	}
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		ch := make(chan agentEvent, 2)
+		ch <- agentEvent{Type: "message", Text: "hello"}
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	saveMessages := func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+		t.Error("a turn whose load raced a delete of its own conversation must not persist")
+		return false, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		loadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	<-loadStarted // deletionGen must already be captured by now
+
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/conversations/"+testConversationID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200", resp.StatusCode)
+	}
+	close(deleteDone) // let the load, and the turn behind it, proceed
+
+	var ev outboundEvent
+	for range 2 { // "token", then "done"
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // margin for finishTurn to run server-side
+}
+
+// TestChatCacheInvalidatesAfterADeleteRatherThanReusingStaleHistory is the
+// end-to-end regression guard for cache invalidation on delete: a
+// conversation this connection has already cached, then deleted out from
+// under it, must be reloaded (not served from cache) on its next message —
+// proven by loadConversation being called a second time, not just by
+// inspecting internal state.
+func TestChatCacheInvalidatesAfterADeleteRatherThanReusingStaleHistory(t *testing.T) {
+	var loadCalls atomic.Int32
+	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
+		loadCalls.Add(1)
+		return nil, nil
+	}
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		ch := make(chan agentEvent, 2)
+		ch <- agentEvent{Type: "message", Text: "ok"}
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		loadConversation, noopSaveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var ev outboundEvent
+	for range 2 {
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := loadCalls.Load(); got != 1 {
+		t.Fatalf("loadConversation called %d times, want 1 after the first message", got)
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/conversations/"+testConversationID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200", resp.StatusCode)
+	}
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t2", Text: "hi again", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := loadCalls.Load(); got != 2 {
+		t.Errorf("loadConversation called %d times, want 2 (the cache must invalidate after a delete, not be reused)", got)
+	}
+}
+
+// TestChatFailedReloadAfterADeleteEvictsTheStaleCacheEntryInsteadOfServingIt
+// is the regression guard for the histories-poisoning bug this fixes. A
+// delete correctly forces a reload (see
+// TestChatCacheInvalidatesAfterADeleteRatherThanReusingStaleHistory), but if
+// that reload itself fails, the connection's existing cache entry for the
+// conversation — recorded before the delete — must not be left in place: the
+// next turn dispatched against it would otherwise still be handed that
+// stale, pre-deletion history as agent context.
+func TestChatFailedReloadAfterADeleteEvictsTheStaleCacheEntryInsteadOfServingIt(t *testing.T) {
+	var loadCalls atomic.Int32
+	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
+		if loadCalls.Add(1) == 1 {
+			return []historyTurn{{Role: "user", Text: "before delete"}, {Role: "assistant", Text: "reply"}}, nil
+		}
+		return nil, errors.New("transient db error")
+	}
+	gotSecondReq := make(chan agentChatRequest, 1)
+	var callCount atomic.Int32
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		ch := make(chan agentEvent, 2)
+		ch <- agentEvent{Type: "message", Text: "ok"}
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		if callCount.Add(1) == 2 {
+			gotSecondReq <- req
+		}
+		return ch, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		loadConversation, noopSaveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var ev outboundEvent
+	for range 2 { // token, done
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/conversations/"+testConversationID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200", resp.StatusCode)
+	}
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t2", Text: "hi again", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case got := <-gotSecondReq:
+		if len(got.History) != 0 {
+			t.Errorf("History sent to the agent = %+v, want empty (the stale pre-deletion cache entry must have been evicted)", got.History)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the agent was never called for the second turn")
+	}
+}
+
+// --- conversation_created event ----------------------------------------------
+//
+// Findings traced to the sidebar-refresh signal being inferred client-side,
+// from turn-id bookkeeping and the "done" event's timing — neither of which
+// survives the dispatching ChatPanel unmounting, avoids racing finishTurn's
+// own persist, or fires when the stream drops before "done". These tests
+// cover the replacement: finishTurn sends "conversation_created" itself,
+// once, strictly after saveMessages reports it actually created the row.
+
+// TestChatConversationCreatedFiresOnceOnFirstSuccessfulPersist proves the
+// event fires exactly once, on the turn whose persist actually created the
+// conversation, and never again for a later turn on the same conversation.
+func TestChatConversationCreatedFiresOnceOnFirstSuccessfulPersist(t *testing.T) {
+	callAgent := fakeAgentEvents(
+		agentEvent{Type: "message", Text: "hello"},
+		agentEvent{Type: "done"},
+	)
+	var calls int
+	saveMessages := func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+		calls++
+		return calls == 1, nil // created only on the first call
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "t1", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for range 3 { // "token", "done", then the new event
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev.Type)
+	}
+	if want := []string{"token", "done", "conversation_created"}; !slices.Equal(got, want) {
+		t.Fatalf("first turn's events = %v, want %v", got, want)
+	}
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t2", Text: "t2", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	for range 2 { // "token", "done" — no repeat conversation_created
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev.Type)
+	}
+	if want := []string{"token", "done"}; !slices.Equal(got, want) {
+		t.Errorf("second turn's events = %v, want %v (no repeat conversation_created)", got, want)
+	}
+}
+
+// TestChatConversationCreatedFiresEvenWhenTheStreamDropsMidFlight is the
+// regression guard for the dropped-stream case: a turn that already produced
+// real content (rec.ok true from an earlier "message" event) but whose agent
+// stream then drops before "done" or "error" ever arrives is still persisted
+// by finishTurn (runTurn's dropped-stream fallback sends only "error") — and
+// must still tell the browser to refresh the sidebar, even though "done"
+// itself never fired.
+func TestChatConversationCreatedFiresEvenWhenTheStreamDropsMidFlight(t *testing.T) {
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		ch := make(chan agentEvent, 1)
+		ch <- agentEvent{Type: "message", Text: "partial answer"}
+		close(ch) // no "done", no "error" — the stream just stops
+		return ch, nil
+	}
+	saveMessages := func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+		return true, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for range 3 { // "token", the dropped-stream fallback "error", then the new event
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev.Type)
+	}
+	if want := []string{"token", "error", "conversation_created"}; !slices.Equal(got, want) {
+		t.Errorf("event types = %v, want %v", got, want)
+	}
+}
+
+// TestChatConversationCreatedIsNotSentWhenPersistFails proves finishTurn
+// never announces a conversation the database didn't actually end up with —
+// saveMessages' own error takes priority over its created return value.
+func TestChatConversationCreatedIsNotSentWhenPersistFails(t *testing.T) {
+	callAgent := fakeAgentEvents(
+		agentEvent{Type: "message", Text: "ok"},
+		agentEvent{Type: "done"},
+	)
+	saveMessages := func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+		return true, errors.New("db unavailable")
+	}
+	srv, token := newChatTestServerWithConversations(t, noopChatCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "hi", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for range 2 { // "token", "done" — never a conversation_created for a failed persist
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev.Type)
+	}
+	if want := []string{"token", "done"}; !slices.Equal(got, want) {
+		t.Errorf("event types = %v, want %v", got, want)
+	}
+
+	readCtx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	var ev outboundEvent
+	if err := wsjson.Read(readCtx, conn, &ev); err == nil {
+		t.Errorf("unexpected event after a failed persist: %+v", ev)
+	}
+}
+
+// TestFinishTurnSkipsTheWebSocketSendOnceItsEventContextIsDone is the
+// regression guard for the shutdown-drain path silently defeating
+// sendEvent's own cancellation guard: finishTurn must still persist via
+// dbCtx even when eventCtx is already done, but must not attempt the WS
+// send that eventCtx being done exists to suppress.
+func TestFinishTurnSkipsTheWebSocketSendOnceItsEventContextIsDone(t *testing.T) {
+	serverConnCh := make(chan *websocket.Conn, 1)
+	handlerDone := make(chan struct{})
+	t.Cleanup(func() { close(handlerDone) })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		serverConnCh <- conn
+		<-handlerDone // keep the handler alive; the test closes both ends
+	}))
+	defer srv.Close()
+
+	clientConn, _, err := websocket.Dial(t.Context(), strings.Replace(srv.URL, "http://", "ws://", 1), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.CloseNow()
+	serverConn := <-serverConnCh
+	defer serverConn.CloseNow()
+
+	var saveCalled bool
+	h := &Handler{
+		saveMessages: func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+			saveCalled = true
+			return true, nil // "created" — finishTurn would send conversation_created if allowed to
+		},
+		conversationDeletions: newConversationDeletions(),
+	}
+	cache := newConversationCache()
+	rec := turnRecord{turn: "t1", conversation: testConversationID, ok: true, userText: "hi", assistantText: "hello"}
+
+	eventCtx, cancel := context.WithCancel(t.Context())
+	cancel() // already done, as runChatConnection's shutdown drain leaves it
+
+	h.finishTurn(t.Context(), eventCtx, "user_1", cache, rec, serverConn)
+
+	if !saveCalled {
+		t.Error("finishTurn must still persist via dbCtx even when eventCtx is already done")
+	}
+
+	readCtx, readCancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer readCancel()
+	var ev outboundEvent
+	if err := wsjson.Read(readCtx, clientConn, &ev); err == nil {
+		t.Errorf("received an event despite an already-done event context: %+v", ev)
 	}
 }

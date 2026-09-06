@@ -41,6 +41,7 @@ func newWatchlistTestServer(t *testing.T,
 		noopLoadVerdicts, noopSaveVerdict,
 		loadWatchlistItems, callAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages,
+		noopLoadConversationSummaries, noopDeleteConversation,
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -6,11 +6,11 @@ import { useCallback, useEffect, useState } from "react"
 import { TitleCard } from "@/components/chat/title-card"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { useRowStatus } from "@/hooks/use-row-status"
 import type { AgentPick } from "@/lib/chat-socket"
 import {
   GATEWAY_CALL_TIMEOUT_MS,
-  GatewaySessionExpiredError,
-  SESSION_EXPIRED_TEXT,
+  gatewayErrorText,
   gatewayFetch,
   withTimeout,
 } from "@/lib/gateway"
@@ -24,11 +24,6 @@ import {
   type Verdict,
 } from "@/lib/verdicts"
 import { fetchWatchlist } from "@/lib/watchlist"
-
-interface RowStatus {
-  pending: boolean
-  error?: string
-}
 
 // A saved title whose base TMDB lookup failed or no longer resolves
 // (pick.unavailable — services/gateway/chat.go's agentPick.Unavailable).
@@ -63,7 +58,7 @@ export function WatchlistView() {
   const { getToken, isLoaded } = useAuth()
   const [items, setItems] = useState<AgentPick[] | null>(null)
   const [loadError, setLoadError] = useState(false)
-  const [rowStatus, setRowStatus] = useState<Record<string, RowStatus>>({})
+  const { status: rowStatus, setPending, setFailure } = useRowStatus<string>()
 
   useEffect(() => {
     if (!isLoaded) return
@@ -97,7 +92,7 @@ export function WatchlistView() {
   const removeItem = useCallback(
     async (tmdbId: number, mediaType: "movie" | "tv") => {
       const key = verdictKey(tmdbId, mediaType)
-      setRowStatus((prev) => ({ ...prev, [key]: { pending: true } }))
+      setPending(key)
       try {
         const signal = AbortSignal.timeout(GATEWAY_CALL_TIMEOUT_MS)
         const res = await withTimeout(
@@ -122,21 +117,18 @@ export function WatchlistView() {
             prev,
         )
       } catch (err) {
-        setRowStatus((prev) => ({
-          ...prev,
-          [key]: {
-            pending: false,
-            error:
-              err instanceof GatewaySessionExpiredError
-                ? SESSION_EXPIRED_TEXT
-                : err instanceof VerdictStaleError
-                  ? VERDICT_STALE_TEXT
-                  : "Couldn't remove that — try again",
-          },
-        }))
+        setFailure(
+          key,
+          gatewayErrorText(
+            err,
+            err instanceof VerdictStaleError
+              ? VERDICT_STALE_TEXT
+              : "Couldn't remove that — try again",
+          ),
+        )
       }
     },
-    [getToken],
+    [getToken, setPending, setFailure],
   )
 
   // Locks a judgment in place — the same write chat-panel.tsx's dropdown
@@ -146,7 +138,7 @@ export function WatchlistView() {
   const setJudgment = useCallback(
     async (tmdbId: number, mediaType: "movie" | "tv", verdict: Verdict) => {
       const key = verdictKey(tmdbId, mediaType)
-      setRowStatus((prev) => ({ ...prev, [key]: { pending: true } }))
+      setPending(key)
       try {
         const signal = AbortSignal.timeout(GATEWAY_CALL_TIMEOUT_MS)
         const res = await withTimeout(
@@ -173,21 +165,18 @@ export function WatchlistView() {
             prev,
         )
       } catch (err) {
-        setRowStatus((prev) => ({
-          ...prev,
-          [key]: {
-            pending: false,
-            error:
-              err instanceof GatewaySessionExpiredError
-                ? SESSION_EXPIRED_TEXT
-                : err instanceof VerdictLockedError
-                  ? VERDICT_LOCKED_TEXT
-                  : "Couldn't save that — try again",
-          },
-        }))
+        setFailure(
+          key,
+          gatewayErrorText(
+            err,
+            err instanceof VerdictLockedError
+              ? VERDICT_LOCKED_TEXT
+              : "Couldn't save that — try again",
+          ),
+        )
       }
     },
-    [getToken],
+    [getToken, setPending, setFailure],
   )
 
   if (loadError) {

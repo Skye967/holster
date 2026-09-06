@@ -117,11 +117,15 @@ type Handler struct {
 	// real database or agent process. rootCtx is the process's own
 	// SIGINT/SIGTERM-cancelled context (not any single request's), used to tie
 	// every open WebSocket's lifetime to server shutdown.
-	loadChatCtx    func(ctx context.Context, userID string) (chatContext, error)
-	callAgent      agentCaller
-	tickets        *chatTicketStore
-	originPatterns []string
-	rootCtx        context.Context
+	loadChatCtx func(ctx context.Context, userID string) (chatContext, error)
+	callAgent   agentCaller
+	tickets     *chatTicketStore
+	// chat.go: tracks conversations deleted while a turn was still in
+	// flight on them (TASKS.md T20.5's delete race) — same in-memory,
+	// single-instance shape as tickets above.
+	conversationDeletions *conversationDeletions
+	originPatterns        []string
+	rootCtx               context.Context
 
 	// providers.go (T15): the region catalog cache and the per-user
 	// subscription write, injected the same way as ensureUser/loadChatCtx
@@ -141,13 +145,16 @@ type Handler struct {
 	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error)
 	callAgentTitles    agentTitlesCaller
 
-	// conversations.go (T20): the caller's most recent conversation (id plus
-	// its history, for seeding a WS reconnect) and paired turns (for GET
-	// /api/chat/history), and the write that persists one completed turn —
-	// injected the same way as loadVerdicts/saveVerdict above.
-	loadConversation      func(ctx context.Context, userID string) (string, []historyTurn, error)
-	loadConversationTurns func(ctx context.Context, userID string) ([]conversationTurn, error)
-	saveMessages          func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (string, error)
+	// conversations.go (T20/T20.5): one conversation's history (for seeding a
+	// WS connection when the browser names it) and paired turns (for GET
+	// /api/chat/history/{conversationID}), the caller's conversation list and
+	// its delete, and the write that persists one completed turn — injected
+	// the same way as loadVerdicts/saveVerdict above.
+	loadConversation          func(ctx context.Context, userID, conversationID string) ([]historyTurn, error)
+	loadConversationTurns     func(ctx context.Context, userID, conversationID string) ([]conversationTurn, error)
+	saveMessages              func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error)
+	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error)
+	deleteConversation        func(ctx context.Context, userID, conversationID string) (bool, error)
 }
 
 // newHandler guards the keyfunc and rejects an empty origin allowlist, which
@@ -163,9 +170,11 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	saveVerdict func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error,
 	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error),
 	callAgentTitles agentTitlesCaller,
-	loadConversation func(ctx context.Context, userID string) (string, []historyTurn, error),
-	loadConversationTurns func(ctx context.Context, userID string) ([]conversationTurn, error),
-	saveMessages func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (string, error),
+	loadConversation func(ctx context.Context, userID, conversationID string) ([]historyTurn, error),
+	loadConversationTurns func(ctx context.Context, userID, conversationID string) ([]conversationTurn, error),
+	saveMessages func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error),
+	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error),
+	deleteConversation func(ctx context.Context, userID, conversationID string) (bool, error),
 ) (*Handler, error) {
 
 	if len(parties) == 0 {
@@ -213,6 +222,12 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	if saveMessages == nil {
 		return nil, errors.New("no message writer configured")
 	}
+	if loadConversationSummaries == nil {
+		return nil, errors.New("no conversation list loader configured")
+	}
+	if deleteConversation == nil {
+		return nil, errors.New("no conversation deleter configured")
+	}
 
 	origins := make([]string, 0, len(parties))
 	for p := range parties {
@@ -220,25 +235,28 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	}
 
 	return &Handler{
-		keyfunc:               requireKID(kf),
-		issuer:                issuer,
-		audience:              audience,
-		parties:               parties,
-		ensureUser:            ensureUser,
-		loadChatCtx:           loadChatCtx,
-		callAgent:             callAgent,
-		tickets:               newChatTicketStore(),
-		originPatterns:        origins,
-		rootCtx:               rootCtx,
-		loadProviders:         loadProviders,
-		saveSubscription:      saveSubscription,
-		loadVerdicts:          loadVerdicts,
-		saveVerdict:           saveVerdict,
-		loadWatchlistItems:    loadWatchlistItems,
-		callAgentTitles:       callAgentTitles,
-		loadConversation:      loadConversation,
-		loadConversationTurns: loadConversationTurns,
-		saveMessages:          saveMessages,
+		keyfunc:                   requireKID(kf),
+		issuer:                    issuer,
+		audience:                  audience,
+		parties:                   parties,
+		ensureUser:                ensureUser,
+		loadChatCtx:               loadChatCtx,
+		callAgent:                 callAgent,
+		tickets:                   newChatTicketStore(),
+		conversationDeletions:     newConversationDeletions(),
+		originPatterns:            origins,
+		rootCtx:                   rootCtx,
+		loadProviders:             loadProviders,
+		saveSubscription:          saveSubscription,
+		loadVerdicts:              loadVerdicts,
+		saveVerdict:               saveVerdict,
+		loadWatchlistItems:        loadWatchlistItems,
+		callAgentTitles:           callAgentTitles,
+		loadConversation:          loadConversation,
+		loadConversationTurns:     loadConversationTurns,
+		saveMessages:              saveMessages,
+		loadConversationSummaries: loadConversationSummaries,
+		deleteConversation:        deleteConversation,
 	}, nil
 }
 
@@ -509,7 +527,9 @@ func (h *Handler) routes() http.Handler {
 	register("PUT /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
 	register("DELETE /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
 	register("GET /api/watchlist", h.watchlist)
-	register("GET /api/chat/history", h.chatHistory)
+	register("GET /api/chat/history/{conversationID}", h.chatHistory)
+	register("GET /api/conversations", h.conversations)
+	register("DELETE /api/conversations/{id}", h.deleteConversationHandler)
 
 	allowMethods := make([]string, 0, len(methods))
 	for m := range methods {
@@ -643,7 +663,8 @@ func main() {
 		loadProviders(db, newAgentProviderCaller(agentClient, agentURL)), saveSubscription(db),
 		loadVerdicts(db), saveVerdict(db),
 		loadWatchlistItems(db), newAgentTitlesCaller(agentClient, agentURL),
-		loadConversation(db), loadConversationTurns(db), saveMessages(db))
+		loadConversation(db), loadConversationTurns(db), saveMessages(db),
+		loadConversationSummaries(db), deleteConversation(db))
 	if err != nil {
 		log.Fatalf("handler: %v", err)
 	}

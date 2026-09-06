@@ -17,6 +17,18 @@ export const GATEWAY_CALL_TIMEOUT_MS = 10000
 // can't drift between call sites (streaming-picker.tsx, chat-socket.ts).
 export const SESSION_EXPIRED_TEXT = "Your session ended — reload the page"
 
+// Shared fallback for a gatewayFetch call's catch block: every call site
+// needs the same session-expired text for GatewaySessionExpiredError and its
+// own fallback for everything else. Not a general error-to-text mapper — a
+// call site with its own typed errors (VerdictLockedError, VerdictStaleError
+// in chat-panel.tsx/watchlist-view.tsx) still checks those separately and
+// passes the result in as fallback.
+export function gatewayErrorText(err: unknown, fallback: string): string {
+  return err instanceof GatewaySessionExpiredError
+    ? SESSION_EXPIRED_TEXT
+    : fallback
+}
+
 export type GetToken = (opts: {
   template: string
   skipCache?: boolean

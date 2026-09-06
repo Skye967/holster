@@ -12,16 +12,18 @@ export interface ConversationTurn {
   assistant_text: string
 }
 
-// One round trip for the caller's stored conversation, so chat-panel.tsx can
-// re-render the last exchanges on mount instead of starting blank on a page
-// reload (TASKS.md T20). Picks aren't part of this shape — only text is
-// persisted for reload today, so a rehydrated turn renders as plain text.
+// One round trip for one conversation's stored messages, so chat-panel.tsx
+// can re-render its last exchanges on mount instead of starting blank —
+// on a page reload (TASKS.md T20) or a switch to a different conversation
+// (TASKS.md T20.5). Picks aren't part of this shape — only text is persisted
+// for reload today, so a rehydrated turn renders as plain text.
 export async function fetchChatHistory(
   getToken: GetToken,
+  conversationId: string,
 ): Promise<ConversationTurn[]> {
   const res = await withTimeout(
     gatewayFetch(
-      "/api/chat/history",
+      `/api/chat/history/${conversationId}`,
       { signal: AbortSignal.timeout(GATEWAY_CALL_TIMEOUT_MS) },
       getToken,
     ),

@@ -85,6 +85,7 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages,
+		noopLoadConversationSummaries, noopDeleteConversation,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -123,15 +124,21 @@ func noopCallAgentTitles(context.Context, agentTitlesRequest) ([]agentPick, erro
 
 // conversations.go's own dependencies, for the same reason — chat_test.go
 // covers loadConversation/saveMessages for real, conversations_test.go
-// covers loadConversationTurns.
-func noopLoadConversation(context.Context, string) (string, []historyTurn, error) {
-	return "", nil, nil
-}
-func noopLoadConversationTurns(context.Context, string) ([]conversationTurn, error) {
+// covers loadConversationTurns/loadConversationSummaries/deleteConversation.
+func noopLoadConversation(context.Context, string, string) ([]historyTurn, error) {
 	return nil, nil
 }
-func noopSaveMessages(context.Context, string, string, string, string, []agentTitleRef) (string, error) {
-	return "", nil
+func noopLoadConversationTurns(context.Context, string, string) ([]conversationTurn, error) {
+	return nil, nil
+}
+func noopSaveMessages(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+	return false, nil
+}
+func noopLoadConversationSummaries(context.Context, string) ([]conversationSummary, error) {
+	return nil, nil
+}
+func noopDeleteConversation(context.Context, string, string) (bool, error) {
+	return true, nil
 }
 
 func TestVerifyTokenAcceptsValidToken(t *testing.T) {
@@ -324,7 +331,7 @@ func TestProvisioningReceivesTokenIdentity(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +379,7 @@ func TestProvisioningFailureBlocksRequest(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +418,7 @@ func TestClientDisconnectIsNotAProvisioningFailure(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +474,7 @@ func TestProvisioningDeadlineReturns503(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +509,7 @@ func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
 	if err == nil {
 		t.Error("built a Handler with no authorized parties, which would reject every request")
 	}
@@ -862,7 +869,7 @@ func TestKeyRotationSelfHeals(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -896,7 +903,7 @@ func TestUnknownKidDoesNotAmplify(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
 	if err != nil {
 		t.Fatal(err)
 	}

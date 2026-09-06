@@ -18,6 +18,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -48,12 +49,11 @@ type chatTicket struct {
 }
 
 type chatTicketStore struct {
-	mu      sync.Mutex
-	tickets map[string]chatTicket
+	tickets *expiringMap[chatTicket]
 }
 
 func newChatTicketStore() *chatTicketStore {
-	return &chatTicketStore{tickets: make(map[string]chatTicket)}
+	return &chatTicketStore{tickets: newExpiringMap[chatTicket](chatTicketTTL)}
 }
 
 func (s *chatTicketStore) mint(userID string) (string, error) {
@@ -62,19 +62,7 @@ func (s *chatTicketStore) mint(userID string) (string, error) {
 		return "", err
 	}
 	id := base64.RawURLEncoding.EncodeToString(buf)
-
-	s.mu.Lock()
-	s.tickets[id] = chatTicket{userID: userID}
-	s.mu.Unlock()
-
-	// Self-expiring rather than a swept ticker: tickets are low-volume (one per
-	// WS connect) and short-lived, so a timer per ticket is cheap and needs no
-	// background loop to shut down on server exit.
-	time.AfterFunc(chatTicketTTL, func() {
-		s.mu.Lock()
-		delete(s.tickets, id)
-		s.mu.Unlock()
-	})
+	s.tickets.set(id, chatTicket{userID: userID})
 	return id, nil
 }
 
@@ -84,13 +72,7 @@ func (s *chatTicketStore) consume(id string) (chatTicket, bool) {
 	if id == "" {
 		return chatTicket{}, false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.tickets[id]
-	if ok {
-		delete(s.tickets, id)
-	}
-	return t, ok
+	return s.tickets.take(id)
 }
 
 func (h *Handler) chatTicket(w http.ResponseWriter, r *http.Request) {
@@ -104,6 +86,149 @@ func (h *Handler) chatTicket(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"ticket": id})
 }
 
+// --- expiringMap -------------------------------------------------------------
+//
+// A mutex-protected map whose entries remove themselves after ttl —
+// chatTicketStore's mint-and-expire, single-use-consume shape. (An earlier
+// version of conversationDeletions was also built on this, which is why
+// scheduleExpiry defends against a key being written more than once before
+// it expires; conversationDeletions has since moved to its own
+// never-expiring map — see that type's doc comment for why.)
+//
+// Each entry tracks its own expiry deadline rather than being deleted
+// unconditionally by whichever timer fires first: set schedules a fresh
+// removal on every write, so a key written twice in quick succession has two
+// scheduled removals outstanding. Without the deadline check in
+// scheduleExpiry, the earlier (shorter-lived) one would delete the second
+// write's value out from under it before the second write's own, later
+// deadline ever arrives — silently shortening its effective TTL.
+type expiringMap[V any] struct {
+	mu    sync.Mutex
+	ttl   time.Duration
+	items map[string]expiringEntry[V]
+}
+
+type expiringEntry[V any] struct {
+	value    V
+	expireAt time.Time
+}
+
+func newExpiringMap[V any](ttl time.Duration) *expiringMap[V] {
+	return &expiringMap[V]{ttl: ttl, items: make(map[string]expiringEntry[V])}
+}
+
+// set stores value under key, replacing anything there and resetting its
+// TTL — chatTicketStore.mint's shape, where every key is freshly minted and
+// never reused.
+func (m *expiringMap[V]) set(key string, value V) {
+	m.mu.Lock()
+	m.items[key] = expiringEntry[V]{value: value, expireAt: time.Now().Add(m.ttl)}
+	m.mu.Unlock()
+	m.scheduleExpiry(key)
+}
+
+// take returns and removes key's current value in one step (delete-on-read)
+// — chatTicketStore.consume's single-use shape.
+func (m *expiringMap[V]) take(key string) (V, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.items[key]
+	if ok {
+		delete(m.items, key)
+	}
+	return entry.value, ok
+}
+
+// scheduleExpiry arranges for key to be removed after ttl, but only if
+// nothing has refreshed it since — see the type's doc comment. Self-expiring
+// rather than a swept ticker: entries here are low-volume and short-lived,
+// so a timer per write is cheap and needs no background loop to shut down on
+// server exit.
+func (m *expiringMap[V]) scheduleExpiry(key string) {
+	time.AfterFunc(m.ttl, func() {
+		m.mu.Lock()
+		if entry, ok := m.items[key]; ok && !time.Now().Before(entry.expireAt) {
+			delete(m.items, key)
+		}
+		m.mu.Unlock()
+	})
+}
+
+// --- Tracking conversations deleted mid-turn --------------------------------
+//
+// Deleting a conversation (conversations.go's deleteConversationHandler) is a
+// plain HTTP request, racing whatever WS turn might still be in flight on
+// that same conversation id. Without this, a straggling turn's own persist
+// (finishTurn, via saveMessages) can land after the delete and silently
+// recreate the conversation row through saveMessages' own
+// on-conflict-do-nothing insert — that insert can't tell "already exists
+// because it's ongoing" from "already exists because it was just deleted."
+//
+// A boolean "was this deleted recently" tombstone can't make that
+// distinction from "a brand-new, legitimate turn was dispatched after the
+// delete, against the same conversation id" (e.g. the browser's back button
+// reopening a since-deleted conversation's URL and sending a fresh message
+// to it) — both look identical to a plain within-TTL check, and the second
+// case would be wrongly dropped. A monotonic per-conversation generation
+// counter fixes that: dispatch captures the conversation's current
+// generation (runChatConnection), and finishTurn only suppresses persistence
+// if the generation has moved on since — i.e. a delete actually happened
+// strictly after this turn was dispatched, not merely at some point within
+// the TTL window.
+//
+// Deliberately never expired. An earlier version wrapped an expiringMap and
+// aged each id's generation out after a 40s TTL, sized to outlast a
+// straggling turn's own finishTurn call. That was fine for finishTurn's own
+// use (a turn can only still be in flight for roughly
+// turnDeadline+provisionTimeout after dispatch, comfortably under 40s), but
+// conversationCache (below) also reads this same generation to decide
+// whether its own in-memory entry is still trustworthy — and a per-connection
+// cache entry can live for the life of a long chat session, far past 40
+// seconds. Once the TTL passed with no message on that id in between to
+// notice the gap, generation() reverted to 0 ("never deleted"), and a cache
+// entry stamped at generation 0 compared clean again — silently serving
+// pre-deletion history as agent context indefinitely. A real delete must
+// stay remembered for as long as anything might still hold pre-delete data,
+// which has no fixed bound, so this is a plain, permanent map rather than an
+// expiringMap. Growth is bounded by how many conversations are ever actually
+// deleted across the app's whole lifetime — a low-volume, user-driven event,
+// not a per-message or per-connection cost — so an unbounded map is the
+// simpler, correct choice at this app's scale.
+//
+// In-memory, single-instance — same limitation as chatTicketStore: if this
+// ever runs more than one gateway replica, a delete landing on one instance
+// while a straggler or a cache entry lives on another would miss this check
+// entirely.
+type conversationDeletions struct {
+	mu   sync.Mutex
+	gens map[string]int
+}
+
+func newConversationDeletions() *conversationDeletions {
+	return &conversationDeletions{gens: make(map[string]int)}
+}
+
+// bump records a real delete of id, advancing its generation. Only ever
+// called after a delete that actually removed a row (deleteConversationHandler
+// checks RowsAffected first) — an idempotent no-op delete, including one
+// attempted against another user's conversation id (rejected by RLS/the
+// WHERE clause, matching zero rows), must never reach here.
+func (c *conversationDeletions) bump(id string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gens[id]++
+	return c.gens[id]
+}
+
+// generation returns id's current generation: 0 if it has never been
+// deleted. Never decreases and never forgotten — see this type's doc
+// comment.
+func (c *conversationDeletions) generation(id string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gens[id]
+}
+
 // --- WebSocket upgrade and per-connection turn loop -------------------------
 //
 // One socket per session (../../DECISIONS.md): messages up, curated events
@@ -111,16 +236,29 @@ func (h *Handler) chatTicket(w http.ResponseWriter, r *http.Request) {
 // notices. The gateway owns conversation state for the life of the
 // connection, seeded and persisted via conversations.go (TASKS.md T20).
 
-// inboundMessage is what the browser sends up the socket.
+// inboundMessage is what the browser sends up the socket. Conversation is
+// required on every "message" frame (TASKS.md T20.5) — the client generates
+// each conversation's id itself (see web/src/lib/chat-socket.ts), so a
+// connection may carry turns for more than one conversation over its
+// lifetime as the user switches between them.
 type inboundMessage struct {
-	Type string `json:"type"`
-	Turn string `json:"turn"`
-	Text string `json:"text,omitempty"`
+	Type         string `json:"type"`
+	Turn         string `json:"turn"`
+	Text         string `json:"text,omitempty"`
+	Conversation string `json:"conversation,omitempty"`
 }
 
 // outboundEvent is the gateway's curated, public vocabulary — never the
 // agent's internal event shape. See chat.go's translation in runTurn and
 // agent/chat.py's module docstring on why the two protocols differ.
+//
+// "conversation_created" is the one type not translated from an agent event
+// at all — see finishTurn — sent once persistence of a turn's first message
+// on a conversation has actually completed, so the browser has a
+// server-confirmed reason to refetch the sidebar's list rather than
+// inferring one from "done" (which can arrive before the persist finishes)
+// or from client-side turn-id bookkeeping (which can't survive the
+// dispatching ChatPanel unmounting first).
 type outboundEvent struct {
 	Type    string      `json:"type"`
 	Turn    string      `json:"turn"`
@@ -141,7 +279,22 @@ type historyTurn struct {
 // coordinator goroutine, which is the sole owner of history and the
 // currently-active turn — see runChatConnection.
 type turnRecord struct {
-	turn          string
+	turn string
+	// The conversation this turn was actually dispatched for — fixed at
+	// dispatch (see runTurn), independent of whichever conversation the
+	// coordinator considers current by the time this reports back. A user
+	// may switch conversations (TASKS.md T20.5) while a turn on the old one
+	// is still finishing; finishTurn uses this, not the coordinator's
+	// current pointer, to decide what to persist and whether to merge into
+	// the in-memory history window.
+	conversation string
+	// The conversation's deletion generation captured at dispatch time
+	// (conversationDeletions.generation) — compared in finishTurn against
+	// the *current* generation to tell "this turn predates a delete of its
+	// own conversation" (suppress) from "this turn is a legitimate new
+	// message to a conversation id that happens to have been deleted at
+	// some earlier point" (persist normally). See finishTurn.
+	deletionGen   int
 	ok            bool // false on error/cancel: nothing worth remembering happened
 	userText      string
 	assistantText string
@@ -208,13 +361,167 @@ func (h *Handler) chatWS(w http.ResponseWriter, r *http.Request) {
 	h.runChatConnection(connCtx, conn, t.userID)
 }
 
+// maxCachedConversations bounds how many conversations one connection keeps
+// resident at once. A single browser tab realistically visits a handful of
+// conversations per session via the sidebar; this is generous headroom
+// above that, not a hard usage limit — past it, a switch back just costs one
+// extra DB read instead of a cache hit, the same degrade a failed load
+// already produces.
+const maxCachedConversations = 20
+
+// conversationCacheEntry is one cached conversation: its most recent history
+// window and the deletion generation observed when it was loaded. A
+// conversation present in conversationCache.entries has always been
+// successfully loaded — there is no separate "loaded" bit to track, since
+// store/touch's eviction always keep entries and order in lockstep.
+type conversationCacheEntry struct {
+	history []historyTurn
+	genAt   int
+}
+
+// conversationCache is runChatConnection's per-connection memory of the
+// conversations it has visited. It replaces a bare map[string][]historyTurn
+// because that type conflated two different things under one map key:
+// "this conversation was successfully loaded from the database" and "this
+// conversation has *some* entry, however it got there." Writing into the map
+// unconditionally after every completed turn, regardless of whether the
+// earlier load for that conversation had failed, meant a failed load
+// followed by one completed turn would insert a map entry for that
+// conversation id — and every later message would then see it as "already
+// seen" and never retry the load. isLoaded/store/merge below keep those two
+// concepts separate: merge no-ops if the conversation was never actually
+// loaded, so a failed load keeps being retried on the next message no
+// matter what happens to a turn dispatched against it in the meantime.
+//
+// Owned exclusively by runChatConnection's single coordinator goroutine, so
+// — like the map it replaces — this needs no mutex of its own.
+//
+// Bounded by maxCachedConversations; eviction is oldest-touched-first via
+// order.
+//
+// genAt records, for each loaded id, the conversation's deletion generation
+// (conversationDeletions.generation) observed at the moment it was loaded.
+// isLoaded compares this against the *live* generation on every use, not
+// just at first dispatch: a delete that lands on a conversation this
+// connection already has cached (e.g. the browser's back button reopening a
+// since-deleted conversation's URL) must invalidate that entry, or the
+// straggling in-memory history would be handed to the agent as context even
+// though the database now has nothing for that id. This only works because
+// conversationDeletions' generation is never forgotten (see its own doc
+// comment) — this cache has no bound of its own on how long an entry might
+// sit unused before the conversation is revisited, so the generation it
+// compares against can't be allowed to quietly reset to "never deleted"
+// after some fixed window.
+type conversationCache struct {
+	entries map[string]conversationCacheEntry
+	order   []string // oldest-touched first
+}
+
+func newConversationCache() *conversationCache {
+	return &conversationCache{entries: make(map[string]conversationCacheEntry)}
+}
+
+// isLoaded reports whether id has a cached entry that is both present and
+// still fresh: currentGen is id's live deletion generation, captured by the
+// caller at the same dispatch-time point turnRecord.deletionGen is (see
+// runChatConnection's "message" case). An entry whose live generation has
+// advanced past what was recorded when it was stored belongs to a
+// conversation deleted after this connection last loaded it, and must be
+// treated as absent so the caller reloads instead of reusing it.
+func (c *conversationCache) isLoaded(id string, currentGen int) bool {
+	entry, ok := c.entries[id]
+	return ok && currentGen <= entry.genAt
+}
+
+// snapshot returns a copy of id's cached history — safe for a turn
+// goroutine to read while this cache keeps changing under the coordinator's
+// feet, same as the copy runChatConnection took directly before this type
+// existed.
+func (c *conversationCache) snapshot(id string) []historyTurn {
+	return append([]historyTurn(nil), c.entries[id].history...)
+}
+
+// store records history as id's loaded content — the result of a successful
+// loadConversation — stamping it with gen (the generation observed at
+// dispatch, immediately before the load that produced history), and touching
+// it as most-recently-used.
+func (c *conversationCache) store(id string, gen int, history []historyTurn) {
+	c.touch(id)
+	c.entries[id] = conversationCacheEntry{history: history, genAt: gen}
+}
+
+// merge appends rec into id's history, then re-applies windowHistory's cap
+// — the same cap store's caller (loadConversation) already applies at
+// initial load, reapplied here so a long-lived connection's cache entry
+// doesn't grow without bound turn after turn. A no-op if id was never
+// successfully loaded: finishTurn already skips calling this for a
+// suppressed (since-deleted) turn, so the case left here is a turn whose
+// conversation's own load failed, or was evicted, before this turn
+// finished. Either way the next switch to id will simply reload from the
+// database — which by then already reflects this turn's own persist
+// (finishTurn saves before it merges) — rather than risk seeding an
+// in-memory window from only this one exchange while claiming the
+// conversation is "loaded."
+func (c *conversationCache) merge(id string, rec turnRecord) {
+	entry, ok := c.entries[id]
+	if !ok {
+		return
+	}
+	c.touch(id)
+	entry.history = windowHistory(appendHistory(entry.history, rec))
+	c.entries[id] = entry
+}
+
+// removeFromOrder removes id from c.order if present — shared by evict and
+// touch, which both need to drop any existing occurrence of id from the
+// recency list before doing their own thing with it.
+func (c *conversationCache) removeFromOrder(id string) {
+	for i, existing := range c.order {
+		if existing == id {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			return
+		}
+	}
+}
+
+// evict removes id's cached entry entirely, if present — a no-op if id was
+// never cached. Used when a reload attempt for id fails: leaving a stale
+// entry in place would let cache.snapshot go on serving its pre-reload
+// content (which, for a conversation invalidated by a delete, means
+// pre-deletion history) as though the reload had succeeded. Safe to call
+// unconditionally from both a "never cached" and a "cached but now stale"
+// failure, since the former is already a no-op here.
+func (c *conversationCache) evict(id string) {
+	if _, ok := c.entries[id]; !ok {
+		return
+	}
+	delete(c.entries, id)
+	c.removeFromOrder(id)
+}
+
+// touch marks id most-recently-used, evicting the single least-recently-used
+// entry if id is new and the cache is already at its cap. Removes any
+// existing occurrence of id first — without that, a conversation visited
+// repeatedly would accumulate duplicate entries in order, corrupting both
+// the recency ordering and the eviction count.
+func (c *conversationCache) touch(id string) {
+	c.removeFromOrder(id)
+	c.order = append(c.order, id)
+	if len(c.order) > maxCachedConversations {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		delete(c.entries, oldest)
+	}
+}
+
 // runChatConnection is the single coordinator for one connection: it alone
-// mutates history and tracks the active turn, so neither needs a mutex. A
-// dedicated goroutine does the blocking wsjson.Read loop and hands messages
-// over a channel; turn goroutines (runTurn) run concurrently and report back
-// over `done` — writes to conn are safe from multiple goroutines (coder/
-// websocket handles that internally), but only one goroutine may ever call
-// Read, which is why the read loop is separate and singular.
+// mutates the conversation cache and tracks the active turn, so neither
+// needs a mutex. A dedicated goroutine does the blocking wsjson.Read loop
+// and hands messages over a channel; turn goroutines (runTurn) run
+// concurrently and report back over `done` — writes to conn are safe from
+// multiple goroutines (coder/websocket handles that internally), but only
+// one goroutine may ever call Read, which is why the read loop is separate
+// and singular.
 func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, userID string) {
 	inbound := make(chan inboundMessage)
 	go func() {
@@ -232,22 +539,12 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 		}
 	}()
 
-	// Seeds this connection's history from the caller's conversation (TASKS.md
-	// T20), so a reconnect or reload picks the thread back up. Bounded like
-	// every DB call in this package — unbounded would block the coordinator
-	// loop below from ever starting. Best-effort on error: unlike runTurn's
-	// verdicts load (which fails the turn outright to avoid a wrong answer),
-	// this only costs the in-memory seed — the next save still finds the
-	// caller's real conversation via its upsert (`unique (user_id)`, see
-	// conversations.go's saveMessages).
-	loadCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
-	conversationID, history, err := h.loadConversation(loadCtx, userID)
-	cancel()
-	if err != nil {
-		slog.ErrorContext(ctx, "conversation load failed", "error", dbError(err))
-		conversationID = ""
-		history = nil
-	}
+	// Keyed by conversation id, not a single slice/pointer pair: a switch
+	// back to a conversation this connection has already visited is then a
+	// cache hit against this connection's own consistent state instead of a
+	// fresh DB read racing a still-in-flight turn's own persist (TASKS.md
+	// T20.5's switch-then-switch-back hazard) — see the "message" case below.
+	cache := newConversationCache()
 	var cancelCurrent context.CancelFunc
 	var currentTurn string
 	// How many dispatched turns haven't yet reported to `done` — a
@@ -279,12 +576,17 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 			// gets persisted; anything not yet delivered is an accepted,
 			// bounded loss (one turn, self-healing on the user's next
 			// message) rather than a reason to give the two cases separate
-			// signals. context.Background(), not ctx: ctx is what just
-			// fired, so a save derived from it would fail immediately.
+			// signals. context.Background() for the save: ctx is what just
+			// fired, so a save derived from it would fail immediately. ctx
+			// itself (not Background()) for the event context: finishTurn's
+			// WS send must see this connection's own context as already
+			// done, or sendEvent's cancellation guard would fire a stale
+			// conversation_created down a socket that's already being torn
+			// down by this same shutdown.
 			for {
 				select {
 				case rec := <-done:
-					history, conversationID = h.finishTurn(context.Background(), userID, history, conversationID, rec)
+					h.finishTurn(context.Background(), ctx, userID, cache, rec, conn)
 				default:
 					return
 				}
@@ -308,7 +610,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				for outstanding > 0 {
 					select {
 					case rec := <-done:
-						history, conversationID = h.finishTurn(ctx, userID, history, conversationID, rec)
+						h.finishTurn(ctx, ctx, userID, cache, rec, conn)
 						outstanding--
 					case <-ctx.Done():
 						outstanding = 0
@@ -318,6 +620,43 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 			}
 			switch msg.Type {
 			case "message":
+				parsedConv, err := uuid.Parse(msg.Conversation)
+				if err != nil {
+					// Malformed frame — every real client always supplies a
+					// well-formed uuid (TASKS.md T20.5); conversations.id is
+					// a uuid column, so letting anything else reach a query
+					// would surface as a database type-cast error rather
+					// than a clean signal. Reachable today via /chat/[id]'s
+					// route param — now also checked server-side before
+					// ChatPanel ever mounts, but this is defence in depth,
+					// not the only guard.
+					h.sendEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
+					continue
+				}
+				// Canonicalized once, here, and used for every reference to
+				// this conversation below. conversationDeletions and
+				// conversationCache are both keyed by Go's case-sensitive
+				// string equality, unlike Postgres's uuid column — without
+				// this, "Abc...1" and "abc...1" collide at the database but
+				// silently miss each other in these in-memory maps, so a
+				// delete recorded under one casing would never be seen by a
+				// generation() check or cache lookup keyed under the other.
+				conversationID := parsedConv.String()
+
+				// Captured immediately on receipt, before the conditional
+				// load below — not after it returns. Reading this after the
+				// load would let a delete that lands while the load is still
+				// in flight get captured as though it predated this
+				// dispatch, so finishTurn's `>` comparison would fail to
+				// suppress the persist and silently resurrect the
+				// conversation the delete just removed. This one value also
+				// decides whether this connection's own cache for
+				// conversationID is still trustworthy (cache.isLoaded) — a
+				// delete that landed on an already-cached conversation must
+				// force a reload the same way, not just protect the DB
+				// write.
+				deletionGen := h.conversationDeletions.generation(conversationID)
+
 				// A new message supersedes whatever is in flight — belt and
 				// suspenders alongside the client disabling send while
 				// streaming (TASKS.md T14): the gateway never trusts the
@@ -325,15 +664,34 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				if cancelCurrent != nil {
 					cancelCurrent()
 				}
+				if !cache.isLoaded(conversationID, deletionGen) {
+					loadCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
+					loaded, err := h.loadConversation(loadCtx, userID, conversationID)
+					cancel()
+					if err != nil {
+						slog.ErrorContext(ctx, "conversation load failed", "error", dbError(err))
+						// Evict rather than leave any existing entry in place:
+						// this branch is reached both for a conversation never
+						// cached before (evict is then a no-op) and for one
+						// this connection cached earlier but whose generation
+						// has since advanced (a delete landed on it) — leaving
+						// that second case's entry untouched would let the
+						// snapshot below go on serving its stale, pre-delete
+						// history as though this reload had succeeded. A
+						// transient failure here must not permanently blank
+						// the conversation, though: the next switch to it
+						// retries, same as before.
+						cache.evict(conversationID)
+					} else {
+						cache.store(conversationID, deletionGen, loaded)
+					}
+				}
 				turnCtx, cancel := context.WithTimeout(ctx, turnDeadline)
 				cancelCurrent = cancel
 				currentTurn = msg.Turn
-				// Copy: history is about to keep changing under the
-				// coordinator's feet; the turn goroutine must see a stable
-				// snapshot of what existed when it started.
-				snapshot := append([]historyTurn(nil), history...)
+				snapshot := cache.snapshot(conversationID)
 				outstanding++
-				go h.runTurn(turnCtx, ctx, conn, userID, msg.Turn, msg.Text, snapshot, done)
+				go h.runTurn(turnCtx, ctx, conn, userID, msg.Turn, conversationID, msg.Text, snapshot, deletionGen, done)
 			case "cancel":
 				if cancelCurrent != nil && currentTurn == msg.Turn {
 					cancelCurrent()
@@ -350,33 +708,70 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				cancelCurrent = nil
 				currentTurn = ""
 			}
-			history, conversationID = h.finishTurn(ctx, userID, history, conversationID, rec)
+			h.finishTurn(ctx, ctx, userID, cache, rec, conn)
 		}
 	}
 }
 
-// finishTurn records rec into history and, if it succeeded, persists it —
-// the two steps a completed turn needs regardless of whether it arrived via
-// the normal `done` case or the disconnect drain above.
-func (h *Handler) finishTurn(ctx context.Context, userID string, history []historyTurn, conversationID string, rec turnRecord) ([]historyTurn, string) {
-	history = appendHistory(history, rec)
-	if !rec.ok {
-		return history, conversationID
+// finishTurn persists rec (if it succeeded) against the conversation it was
+// actually run against, rec.conversation — never whatever the coordinator
+// considers current now, since the user may have switched to a different
+// conversation (TASKS.md T20.5) while this turn was still finishing — and
+// merges it into that conversation's own cache entry, regardless of which
+// conversation is current, so a later switch back to it sees the merge
+// without a DB round trip.
+//
+// Skips persisting and merging when rec.conversation's generation has moved
+// on since this turn was dispatched (rec.deletionGen) — meaning a real
+// delete landed strictly after dispatch, so this turn's own persist would
+// otherwise resurrect the conversation the delete just removed via
+// saveMessages' on-conflict-do-nothing insert. A turn dispatched *after* a
+// delete captures the post-delete generation itself, so this comparison
+// never suppresses it — only a genuine straggler that predates the delete
+// has a strictly smaller captured generation than the current one.
+//
+// Takes two contexts, same split as runTurn's turnCtx/connCtx: dbCtx governs
+// the save to the database, and eventCtx gates the "conversation_created"
+// send via sendEvent's own cancellation guard. They're the same context at
+// every call site except runChatConnection's shutdown drain, where dbCtx is
+// context.Background() (ctx has already fired, so a save derived from it
+// would fail immediately) but eventCtx stays ctx — deliberately already
+// Done, so sendEvent's guard skips writing a stale event down a connection
+// that's already being torn down by that same shutdown.
+func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, cache *conversationCache, rec turnRecord, conn *websocket.Conn) {
+	if rec.ok {
+		if h.conversationDeletions.generation(rec.conversation) > rec.deletionGen {
+			slog.InfoContext(dbCtx, "dropped a turn for a since-deleted conversation", "turn", rec.turn, "conversation", rec.conversation)
+			return
+		}
+		// Blocking, not backgrounded: a two-row insert, not a TMDB round trip
+		// — DECISIONS.md's bar for this file ("shipping the simpler design
+		// cleanly beats the complex one badly").
+		saveCtx, cancel := context.WithTimeout(dbCtx, provisionTimeout)
+		created, err := h.saveMessages(saveCtx, userID, rec.conversation, rec.userText, rec.assistantText, rec.titleRefs)
+		cancel()
+		if err != nil {
+			// Logged, not shown to the browser: what the user already saw
+			// stays on screen. The next message on this conversation
+			// self-heals through saveMessages' own conflict handling either
+			// way.
+			slog.ErrorContext(dbCtx, "message persist failed", "turn", rec.turn, "conversation", rec.conversation, "error", dbError(err))
+		} else if created {
+			// Tells the sidebar a brand-new conversation now exists, straight
+			// from the write that actually created it — not a client guess
+			// about which turn was "its own" (that guess can't survive the
+			// dispatching panel unmounting: a conversation switch, or an
+			// abandoned "New chat") and not tied to the browser ever seeing a
+			// "done" event (a dropped stream sends only "error" — see
+			// runTurn's post-loop fallback — even though the turn still
+			// persisted here). Gated on err == nil, not just created: a
+			// failed messages insert rolls back the whole transaction,
+			// including the conversations insert that set created, so
+			// nothing was actually committed.
+			h.sendEvent(eventCtx, conn, rec.turn, outboundEvent{Type: "conversation_created"})
+		}
 	}
-	// Blocking, not backgrounded: a two-row insert, not a TMDB round trip —
-	// DECISIONS.md's bar for this file ("shipping the simpler design
-	// cleanly beats the complex one badly").
-	saveCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
-	newID, err := h.saveMessages(saveCtx, userID, conversationID, rec.userText, rec.assistantText, rec.titleRefs)
-	cancel()
-	if err != nil {
-		// Logged, not shown to the browser: what the user already saw
-		// stays on screen. "" rather than the old id: the next attempt
-		// self-heals through saveMessages' upsert either way.
-		slog.ErrorContext(ctx, "message persist failed", "turn", rec.turn, "error", dbError(err))
-		return history, ""
-	}
-	return history, newID
+	cache.merge(rec.conversation, rec)
 }
 
 // sendEvent writes one curated event down the socket, tagged with turn. It
@@ -384,9 +779,12 @@ func (h *Handler) finishTurn(ctx context.Context, userID string, history []histo
 // timed out never writes a stale event after the fact — see
 // runChatConnection for the full set of reasons turnCtx becomes Done. This
 // check is both necessary and sufficient; no shared "is this still current"
-// state is needed beyond it.
+// state is needed beyond it. conn == nil is a second, defensive guard: the
+// three real call sites always pass a live connection, but finishTurn is
+// also called directly (with no connection) from unit tests, where safety
+// shouldn't depend on every test fake correctly returning created == false.
 func (h *Handler) sendEvent(turnCtx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) {
-	if turnCtx.Err() != nil {
+	if turnCtx.Err() != nil || conn == nil {
 		return
 	}
 	ev.Turn = turn
@@ -448,11 +846,12 @@ func (h *Handler) runTurn(
 	turnCtx context.Context,
 	connCtx context.Context,
 	conn *websocket.Conn,
-	userID, turnID, text string,
+	userID, turnID, conversationID, text string,
 	history []historyTurn,
+	deletionGen int,
 	done chan<- turnRecord,
 ) {
-	rec := turnRecord{turn: turnID}
+	rec := turnRecord{turn: turnID, conversation: conversationID, deletionGen: deletionGen}
 	defer func() {
 		// done is unbuffered, and runChatConnection stops reading it once the
 		// connection dies — without an escape hatch, this send blocks forever

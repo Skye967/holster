@@ -1,30 +1,36 @@
 import { auth } from "@clerk/nextjs/server"
-import Link from "next/link"
+import { redirect } from "next/navigation"
 
-import { ChatPanel } from "@/components/chat/chat-panel"
-import { needsOnboarding } from "@/lib/subscriptions"
+import { ChatListUnavailableNotice } from "@/components/chat/chat-list-unavailable-notice"
+import { fetchConversations } from "@/lib/conversations"
+import { GatewaySessionExpiredError } from "@/lib/gateway"
 
-export default async function ChatPage() {
+// The bare /chat route resolves "where was I" from the conversations table
+// itself (TASKS.md T15.5's "no new flag, derive it" precedent) rather than
+// storing a separate pointer: the most recent conversation if one exists,
+// otherwise a fresh id — the sidebar's "New chat" button generates the id
+// client-side, so a brand-new account gets the identical URL shape either
+// way. needsOnboarding is chat/layout.tsx's job now, not this page's — it
+// runs before this page ever does.
+export default async function ChatIndexPage() {
   const { getToken } = await auth.protect()
-  const missingServices = await needsOnboarding(getToken)
 
-  if (missingServices) {
+  // A failed list load is not the same as "zero conversations" — silently
+  // minting a fresh id on failure would strand a user away from
+  // conversations that do exist, with nothing to explain why.
+  let conversations
+  try {
+    conversations = await fetchConversations(getToken)
+  } catch (err) {
     return (
-      <div className="p-6">
-        <h1 className="text-lg font-semibold tracking-tight">Chat</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          You haven&apos;t picked any streaming services yet —{" "}
-          <Link
-            href="/connections"
-            className="text-primary underline underline-offset-4"
-          >
-            add some in Connections
-          </Link>{" "}
-          to get useful recommendations here.
-        </p>
-      </div>
+      <ChatListUnavailableNotice
+        sessionExpired={err instanceof GatewaySessionExpiredError}
+      />
     )
   }
-
-  return <ChatPanel />
+  // Known limitation: two racing requests for a zero-conversation account
+  // (two tabs, or two quick reloads before the first message) can each mint
+  // a different id here, forking that account's history. Accepted for now —
+  // narrow window, brand-new accounts only.
+  redirect(`/chat/${conversations[0]?.id ?? crypto.randomUUID()}`)
 }
