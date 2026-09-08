@@ -143,6 +143,20 @@ detail — `TitleVerdict` carries no timestamp, so the agent cannot re-sort, or 
 notice if the order is lost. `services/gateway/verdicts.go` explains where that
 ordering is itself only a proxy.
 
+**Cold start (`TASKS.md` T21):** a brand-new account has `verdicts == []` and
+`history == []`. Both are no-ops at that length — `_with_taste`/`_with_history` return
+the message unchanged — so `interpret()` and `rank()` see exactly what the caller typed,
+nothing folded in. There is no special-cased "new user" code path; the cold-start answer
+comes entirely from how well `interpret()`'s prompt extracts mood signal from a short,
+colloquial first message, which is why `DiscoverIntent.keywords`'s field description in
+`catalog_tool.py` explicitly tells the model to infer a mood-driven value rather than
+leaving it empty on a vague-sounding request. It's the one field `_INTERPRET_SYSTEM_PROMPT`
+names as an exception to its own "leave empty when unmentioned" rule — deliberately
+keywords only, not genres: an unresolved keyword is dropped harmlessly, but `genres` has no
+relaxation rung (`RelaxedConstraint` in `catalog_tool.py` never includes it), so a wrong
+genre guess can zero out a cold-start user's first results entirely. The `genres` field's
+own description carries a stricter "only when unambiguous" caveat instead.
+
 ## Tests
 
 ```sh

@@ -94,7 +94,13 @@ class DiscoverIntent(BaseModel):
         default_factory=list,
         description=(
             "Specific mood/theme/plot terms, e.g. 'heist', 'slow burn'. This is "
-            "how a mood becomes a filter — genres alone are too blunt."
+            "how a mood becomes a filter — genres alone are too blunt. Infer "
+            "these from tone even when no theme word is stated outright — "
+            "'something funny for tonight' -> 'feel-good'; 'need something "
+            "intense' -> 'tense'. Skip it when there's no mood to read — "
+            "'movies with Tom Hanks from the 90s' has no mood to infer, just "
+            "cast and year. An unresolved keyword is simply dropped, so a "
+            "guess costs nothing."
         ),
     )
     without_keywords: list[str] = Field(
@@ -103,7 +109,14 @@ class DiscoverIntent(BaseModel):
     )
     genres: list[str] = Field(
         default_factory=list,
-        description="Genres to require, from the valid genre lists given below.",
+        description=(
+            "Genres to require, from the valid genre lists given below. Only "
+            "set this when the message names the genre itself or an "
+            "unambiguous synonym for it — 'a horror movie', 'documentaries' "
+            "— never as a guess inferred from mood or tone alone. Unlike "
+            "keywords, genres are never relaxed, so a wrong guess can rule "
+            "out every candidate instead of just being ignored."
+        ),
     )
     without_genres: list[str] = Field(
         default_factory=list,
@@ -829,7 +842,8 @@ _INTERPRET_SYSTEM_PROMPT = (
     "exclusions, a runtime ceiling, a year range, cast/crew names, and how "
     "many results to return. Never name a specific film or show yourself — "
     "you are describing what to search for, not recalling titles from "
-    "memory. Leave a field empty when the message does not mention it. "
+    "memory. Leave a field empty when the message does not mention it, "
+    "except keywords. "
     "Set is_capability_question only for an explicit question about you, the "
     "assistant, itself — 'what can you do', 'how does this work', a bare "
     "'help'. Anything that is still asking for a title, however vague — "

@@ -271,6 +271,35 @@ def test_history_is_folded_into_the_message_text() -> None:
     assert message.endswith("Current message: anything shorter?")
 
 
+def test_cold_start_sends_interpret_the_bare_first_message() -> None:
+    """T21: a brand-new account has no verdicts and no history — both default
+    to []. _with_history is a no-op on an empty list, so interpret() must see
+    exactly what the user typed, with nothing folded in. Same minimal shape as
+    test_history_is_folded_into_the_message_text above — an empty discover()
+    page means rank() is never reached, so there's nothing to stub there."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": []})
+    req = ChatRequest(
+        message="something funny for tonight", watch_region="US", watch_providers=[8]
+    )
+    seen: list[str] = []
+
+    async def capturing_interpret(message: str) -> DiscoverIntent:
+        seen.append(message)
+        return make_intent()
+
+    asyncio.run(
+        _collect(
+            req,
+            fake_tmdb.client(),
+            capturing_interpret,
+            rank_must_not_run(NO_CANDIDATES),
+        )
+    )
+
+    assert seen == ["something funny for tonight"]
+
+
 def test_early_disconnect_cancels_the_background_search() -> None:
     """Simulates the caller (main.py's StreamingResponse) stopping iteration
     early, as it does on client disconnect — see chat.py's module docstring
