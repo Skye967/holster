@@ -1266,6 +1266,24 @@ def test_search_drops_only_the_bad_taste_line_not_the_whole_hint() -> None:
     assert TASTE_HEADER in rank_saw[0]
 
 
+# --- cold start (T21) --------------------------------------------------------
+
+
+def test_search_with_no_verdicts_sends_rank_the_bare_message() -> None:
+    """A brand-new account has no verdicts at all. That must not merely fail
+    to inject a taste hint — with zero liked titles, taste is [] and
+    _with_taste is a no-op, so rank() sees exactly the caller's message and
+    nothing else. This is what "leans on what the user typed" rests on."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
+    rank_saw: list[str] = []
+
+    _search_with_verdicts(fake_tmdb, [], _capture_message(rank_saw, pick=101))
+
+    assert rank_saw[0] == "something good"
+    assert TASTE_HEADER not in rank_saw[0]
+
+
 def test_enrich_watchlist_degrades_on_an_unusable_tmdb_body() -> None:
     """TASKS.md's "degrade rather than fail wherever there is stored data" at
     the endpoint that owes it. A 2xx carrying an error envelope is truthy, so

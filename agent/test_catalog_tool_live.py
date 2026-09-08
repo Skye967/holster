@@ -76,6 +76,51 @@ def test_interpret_does_not_flag_a_vague_search_as_a_capability_question() -> No
     asyncio.run(go())
 
 
+def test_interpret_pulls_signal_from_a_colloquial_cold_start_message() -> None:
+    """T21: proves the mood-inference instruction generalizes, against a
+    phrase absent from the prompt's own worked examples. 'cozy'/'easy' name
+    a mood with no matching genre at all, unlike 'funny'/'scary' — so a
+    genre showing up here would mean the model over-reached genres' own
+    stricter description."""
+
+    async def go() -> None:
+        call = anthropic_interpreter(_model())
+        intent = await call("I'm exhausted, put on something easy and cozy tonight")
+        assert intent.keywords
+        assert not intent.genres
+
+    asyncio.run(go())
+
+
+def test_interpret_treats_a_mood_word_that_doubles_as_a_genre_as_a_keyword() -> None:
+    """The sharpest version of the risk this whole task guards against:
+    'scary' is a mood word but also a plausible genre synonym. The genres
+    field description permits genres for "an unambiguous synonym" — this
+    proves the model reads that narrowly, not broadly."""
+
+    async def go() -> None:
+        call = anthropic_interpreter(_model())
+        intent = await call("something scary tonight")
+        assert not intent.genres
+        assert intent.keywords
+
+    asyncio.run(go())
+
+
+def test_interpret_leaves_mood_fields_empty_with_no_mood_to_infer() -> None:
+    """The negative side: cast-only, no genre or mood word, has nothing to
+    infer. A mixed-genre actor, so world knowledge of one famous film can't
+    justify a genre guess either."""
+
+    async def go() -> None:
+        call = anthropic_interpreter(_model())
+        intent = await call("a Meryl Streep movie")
+        assert not intent.genres
+        assert not intent.keywords
+
+    asyncio.run(go())
+
+
 def test_rank_picks_only_from_the_real_candidates() -> None:
     candidates: list[Title] = [
         Title(
