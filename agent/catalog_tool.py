@@ -33,7 +33,7 @@ caller from the user's real subscriptions and country. That is what makes
 "results only include services the user ticked" a code guarantee rather than
 a prompt hope.
 
-LangChain is confined to anthropic_interpreter()/anthropic_ranker() at the
+LangChain is confined to google_interpreter()/google_ranker() at the
 bottom of this file. Everything else depends on the plain Interpreter/Ranker
 callables — the same dependency-injection shape as TMDBClient's ``transport``
 seam — so tests fake an async function, not a framework.
@@ -48,8 +48,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 
 from tmdb import (
@@ -113,9 +113,13 @@ class DiscoverIntent(BaseModel):
             "Genres to require, from the valid genre lists given below. Only "
             "set this when the message names the genre itself or an "
             "unambiguous synonym for it — 'a horror movie', 'documentaries' "
-            "— never as a guess inferred from mood or tone alone. Unlike "
-            "keywords, genres are never relaxed, so a wrong guess can rule "
-            "out every candidate instead of just being ignored."
+            "— never as a guess inferred from mood or tone alone, even when "
+            "a mood word happens to share a name with a genre: 'scary', "
+            "'creepy', 'spooky' describe a mood, not a genre — treat them "
+            "as keywords, never as genres, unless the message ALSO names "
+            "the genre explicitly. When in doubt, leave genres empty. "
+            "Unlike keywords, genres are never relaxed, so a wrong guess "
+            "can rule out every candidate instead of just being ignored."
         ),
     )
     without_genres: list[str] = Field(
@@ -606,7 +610,7 @@ def _with_taste(message: str, taste: list[str]) -> str:
     """Fold the taste hint into the text handed to rank(), mirroring how
     chat.py's _with_history folds recent turns in — this is now the second
     such site. Done here rather than by widening the Ranker callable so
-    anthropic_ranker and every test fake stay as they are.
+    google_ranker and every test fake stay as they are.
 
     Prepended, not appended: chat.py may already have shaped `message` to end
     with "Current message: ...", and appending would bury the live request
@@ -822,7 +826,7 @@ async def search(
 # LangChain wiring — the only part of this module that knows LangChain exists.
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 # Given to the model so genres/without_genres land on names tmdb.py's frozen
 # tables actually recognize — the two tables use different vocabularies
@@ -844,6 +848,10 @@ _INTERPRET_SYSTEM_PROMPT = (
     "you are describing what to search for, not recalling titles from "
     "memory. Leave a field empty when the message does not mention it, "
     "except keywords. "
+    "Only set genres when the message explicitly names a genre (e.g. 'a "
+    "horror movie', 'documentaries'). Mood words like 'scary', 'funny', or "
+    "'intense' go in keywords, never in genres, even if a mood word happens "
+    "to match a genre name (e.g. 'scary' is NOT 'horror'). "
     "Set is_capability_question only for an explicit question about you, the "
     "assistant, itself — 'what can you do', 'how does this work', a bare "
     "'help'. Anything that is still asking for a title, however vague — "
@@ -890,7 +898,7 @@ def _format_candidates(candidates: list[Title]) -> str:
     return json.dumps(rows)
 
 
-def anthropic_interpreter(model: ChatAnthropic) -> Interpreter:
+def google_interpreter(model: ChatGoogleGenerativeAI) -> Interpreter:
     """Bind DiscoverIntent's schema to ``model``. Swap this function, not
     catalog_tool's internals, to change how interpret() is powered."""
     bound = model.with_structured_output(DiscoverIntent)
@@ -904,7 +912,7 @@ def anthropic_interpreter(model: ChatAnthropic) -> Interpreter:
     return call
 
 
-def anthropic_ranker(model: ChatAnthropic) -> Ranker:
+def google_ranker(model: ChatGoogleGenerativeAI) -> Ranker:
     bound = model.with_structured_output(RankResult)
 
     async def call(message: str, candidates: list[Title]) -> RankResult:

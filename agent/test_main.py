@@ -204,15 +204,15 @@ async def _run_lifespan(test_app: FastAPI) -> None:
         pass
 
 
-def test_lifespan_requires_anthropic_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+def test_lifespan_requires_google_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("TMDB_API_KEY", "t")
-    with pytest.raises(SystemExit, match="ANTHROPIC_API_KEY"):
+    with pytest.raises(SystemExit, match="GOOGLE_API_KEY"):
         asyncio.run(_run_lifespan(FastAPI(lifespan=lifespan)))
 
 
 def test_lifespan_requires_tmdb_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+    monkeypatch.setenv("GOOGLE_API_KEY", "a")
     monkeypatch.delenv("TMDB_API_KEY", raising=False)
     with pytest.raises(SystemExit, match="TMDB_API_KEY"):
         asyncio.run(_run_lifespan(FastAPI(lifespan=lifespan)))

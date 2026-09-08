@@ -4,7 +4,7 @@ import here: interpret()/rank()/search() depend on plain callables, so a
 fake is just an ``async def``, matching TMDBClient's ``transport=`` seam.
 
 The live LLM path is in test_catalog_tool_live.py, which skips without
-ANTHROPIC_API_KEY — same shape as test_tmdb_live.py.
+GOOGLE_API_KEY — same shape as test_tmdb_live.py.
 """
 
 from __future__ import annotations
@@ -194,7 +194,7 @@ def test_search_wraps_interpret_failure_as_catalog_tool_error() -> None:
     fake_tmdb = FakeTMDB()
 
     async def fake_interpret(message: str) -> DiscoverIntent:
-        raise RuntimeError("anthropic timed out")
+        raise RuntimeError("model call timed out")
 
     with pytest.raises(CatalogToolError):
         run(
@@ -1225,7 +1225,7 @@ def test_search_does_not_report_all_judged_when_the_query_found_nothing() -> Non
 
 def test_format_candidates_escapes_third_party_text() -> None:
     """_format_candidates has no other coverage - every test fakes the Ranker,
-    so anthropic_ranker never runs and this is the only thing exercising it.
+    so google_ranker never runs and this is the only thing exercising it.
     Overviews are arbitrary third-party text, so the fixture carries what a
     hostile one would: a separator, a quote and a lone surrogate. All three
     have to come back escaped, and the result has to survive encoding - that

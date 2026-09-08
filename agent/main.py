@@ -21,7 +21,7 @@ from typing import Any, cast
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
-from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from catalog_tool import (
@@ -29,9 +29,9 @@ from catalog_tool import (
     Interpreter,
     Ranker,
     TitlesRequest,
-    anthropic_interpreter,
-    anthropic_ranker,
     enrich_watchlist,
+    google_interpreter,
+    google_ranker,
 )
 from chat import ChatRequest, stream_chat
 from tmdb import RegionProvider, TMDBClient
@@ -145,16 +145,26 @@ def _require_env(key: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # ANTHROPIC_API_KEY is read by ChatAnthropic itself, not passed explicitly —
-    # checked here anyway so a missing key stops startup rather than the first
-    # /chat request. See TASKS.md T13's note on "app-level keys."
-    _require_env("ANTHROPIC_API_KEY")
+    # GOOGLE_API_KEY is read by ChatGoogleGenerativeAI itself, not passed
+    # explicitly — checked here anyway so a missing key stops startup rather
+    # than the first /chat request. See TASKS.md T13's note on "app-level keys."
+    _require_env("GOOGLE_API_KEY")
     app.state.tmdb_client = TMDBClient(_require_env("TMDB_API_KEY"))
-    model = ChatAnthropic(
-        model_name=DEFAULT_MODEL, timeout=15.0, max_retries=2, stop=None
+    # max_retries counts differently than it did for the old ChatAnthropic
+    # config this value was carried over from: here it's total attempts
+    # (2 = one retry), not retries-beyond-initial. The one retry also can't
+    # actually help against a free-tier rate limit — the SDK's fixed
+    # exponential backoff doesn't read Gemini's Retry-After header (a known
+    # upstream issue), so it just retries too soon. Still worth keeping for
+    # genuine transient 5xx/network errors, which it does help.
+    # `or`, not getenv's own default: docker-compose's ${GOOGLE_MODEL}
+    # substitutes an empty string when unset in .env, not an absent key, so
+    # getenv's default would never fire under compose.
+    model = ChatGoogleGenerativeAI(
+        model=os.getenv("GOOGLE_MODEL") or DEFAULT_MODEL, timeout=15.0, max_retries=2
     )
-    app.state.interpret_model = anthropic_interpreter(model)
-    app.state.rank_model = anthropic_ranker(model)
+    app.state.interpret_model = google_interpreter(model)
+    app.state.rank_model = google_ranker(model)
     try:
         yield
     finally:

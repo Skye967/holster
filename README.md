@@ -10,14 +10,16 @@ tonight, on a service you already have.
 
 ## Status
 
-Early. Scaffolding is in place; services are being built one at a time.
+MVP complete — chat, taste (verdicts), watchlist, and attribution are all built. Each
+service has its own Dockerfile; wiring `web/` into `docker-compose.yml` (so a single
+`docker compose up` starts everything) is the one piece still outstanding.
 
 | Component | Stack | Status |
 |---|---|---|
-| `web/` | Next.js, TypeScript, Tailwind, shadcn/ui | Shell + auth done |
-| `services/gateway/` | Go | Not started |
-| `agent/` | Python, FastAPI, LangChain | Not started |
-| `db/` | Supabase (PostgreSQL) | Initial schema |
+| `web/` | Next.js, TypeScript, Tailwind, shadcn/ui | Built — run separately, see below |
+| `services/gateway/` | Go | Built — in `docker-compose.yml` |
+| `agent/` | Python, FastAPI, LangChain | Built — in `docker-compose.yml` |
+| `db/` | Supabase (PostgreSQL) | Schema + RLS in place |
 
 ## Scope
 
@@ -78,11 +80,15 @@ holds no real values. Never commit a filled-in `.env`.
 git clone https://github.com/Skye967/holster.git
 cd holster
 cp .env.example .env    # fill in your own keys
-docker compose up
+docker compose up       # starts services/gateway, agent, and postgres
 ```
 
-> Services come online as they're built — see the status table above for what
-> currently runs.
+`web/` isn't wired into `docker-compose.yml` yet, so start it separately:
+
+```bash
+cd web
+bun run dev             # serves the frontend at localhost:3000
+```
 
 ## Layout
 

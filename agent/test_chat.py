@@ -221,7 +221,7 @@ def test_interpret_failure_maps_to_model_unavailable() -> None:
     req = ChatRequest(message="something", watch_region="US", watch_providers=[8])
 
     async def failing_interpret(message: str) -> DiscoverIntent:
-        raise RuntimeError("anthropic timed out")
+        raise RuntimeError("model call timed out")
 
     events = asyncio.run(
         _collect(req, fake_tmdb.client(), failing_interpret, ok_interpret)
