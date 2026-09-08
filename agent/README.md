@@ -56,8 +56,8 @@ CLI above is the same thing with reload for local work.
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `TMDB_API_KEY` | yes | — | The v4 Read Access Token, sent as `Authorization: Bearer`. Read when the TMDB client is constructed. |
-| `ANTHROPIC_API_KEY` | yes | — | Read when the catalog tool's model is constructed. |
-| `ANTHROPIC_MODEL` | no | `claude-haiku-4-5-20251001` | Powers both catalog_tool steps — interpreting a message and ranking candidates. |
+| `GOOGLE_API_KEY` | yes | — | Read when the catalog tool's model is constructed. |
+| `GOOGLE_MODEL` | no | `gemini-3.5-flash-lite` | Powers both catalog_tool steps — interpreting a message and ranking candidates. |
 | `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
 
 Both keys are app-level: neither opens any user's account, so losing one costs a
@@ -93,7 +93,7 @@ dropped in a fixed order — runtime, then year, then mood keywords — never th
 user's services, region, or exclusions, and records what it dropped in
 `CatalogResult.relaxed` for the chat layer to explain ("nothing under 90 minutes
 — here are the closest").
-LangChain is confined to `anthropic_interpreter()`/`anthropic_ranker()`; everything
+LangChain is confined to `google_interpreter()`/`google_ranker()`; everything
 else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`.
 
 ## Chat pipeline
@@ -166,5 +166,5 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy .
 
 `test_tmdb.py` and `test_catalog_tool.py` run offline, against a mock transport and
 fake models respectively. `test_tmdb_live.py` and `test_catalog_tool_live.py` make
-real calls and skip unless `TMDB_API_KEY`/`ANTHROPIC_API_KEY` is set — the same
+real calls and skip unless `TMDB_API_KEY`/`GOOGLE_API_KEY` is set — the same
 pattern as the gateway's `TEST_DATABASE_URL` tests.

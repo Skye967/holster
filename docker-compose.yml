@@ -56,7 +56,12 @@ services:
       # service fails fast on startup if either is missing (see agent/main.py's
       # lifespan), the same way the gateway checks its own required env.
       TMDB_API_KEY: ${TMDB_API_KEY}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      # Optional; falls back to the agent's own default when unset. Left
+      # without a compose-level default so that fallback stays defined in
+      # one place (agent/catalog_tool.py's DEFAULT_MODEL), not duplicated
+      # here — see agent/main.py's lifespan for how an empty value resolves.
+      GOOGLE_MODEL: ${GOOGLE_MODEL}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
       interval: 10s
