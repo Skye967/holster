@@ -36,9 +36,10 @@ const (
 const clockLeeway = 5 * time.Second
 
 // Ceiling on a small, per-connection DB operation — the provisioning upsert
-// here, and chat.go's conversation load/save (a couple of statements each,
-// still generous even to Supabase). A var, not a const, so a test can
-// shorten it without waiting the full two seconds.
+// here, chat.go's conversation load/save, and webhooks.go's delete/email
+// update (a couple of statements each, still generous even to Supabase). A
+// var, not a const, so a test can shorten it without waiting the full two
+// seconds.
 var provisionTimeout = 2 * time.Second
 
 type Claims struct {
@@ -110,6 +111,10 @@ type Handler struct {
 	parties  map[string]struct{}
 	// Injected so the auth path is testable without a database. Production
 	// wiring is upsertUser; the SQL itself is covered by its own test.
+	// Same signature as updateUserEmail below (webhooks.go) but not
+	// interchangeable with it — ensureUser upserts (creates on first
+	// sight), updateUserEmail only ever updates an existing row. newHandler
+	// takes both positionally; double-check the call site if either moves.
 	ensureUser func(ctx context.Context, id, email string) error
 
 	// The chat socket — see chat.go. loadChatCtx and callAgent follow
@@ -155,6 +160,14 @@ type Handler struct {
 	saveMessages              func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error)
 	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error)
 	deleteConversation        func(ctx context.Context, userID, conversationID string) (bool, error)
+
+	// webhooks.go (T22.5): the Clerk/Svix signing secret and the user
+	// delete/email-update writes it triggers, injected the same way as
+	// every other DB write above. updateUserEmail shares ensureUser's
+	// signature above — see that comment.
+	webhookSecret   []byte
+	deleteUser      func(ctx context.Context, id string) error
+	updateUserEmail func(ctx context.Context, id, email string) error
 }
 
 // newHandler guards the keyfunc and rejects an empty origin allowlist, which
@@ -175,6 +188,9 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	saveMessages func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error),
 	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error),
 	deleteConversation func(ctx context.Context, userID, conversationID string) (bool, error),
+	webhookSecret []byte,
+	deleteUser func(ctx context.Context, id string) error,
+	updateUserEmail func(ctx context.Context, id, email string) error,
 ) (*Handler, error) {
 
 	if len(parties) == 0 {
@@ -228,6 +244,15 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	if deleteConversation == nil {
 		return nil, errors.New("no conversation deleter configured")
 	}
+	if len(webhookSecret) == 0 {
+		return nil, errors.New("no webhook secret configured")
+	}
+	if deleteUser == nil {
+		return nil, errors.New("no user deleter configured")
+	}
+	if updateUserEmail == nil {
+		return nil, errors.New("no user email updater configured")
+	}
 
 	origins := make([]string, 0, len(parties))
 	for p := range parties {
@@ -257,6 +282,9 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 		saveMessages:              saveMessages,
 		loadConversationSummaries: loadConversationSummaries,
 		deleteConversation:        deleteConversation,
+		webhookSecret:             webhookSecret,
+		deleteUser:                deleteUser,
+		updateUserEmail:           updateUserEmail,
 	}, nil
 }
 
@@ -314,10 +342,14 @@ func (h *Handler) verifyToken(tokenString string) (*Claims, error) {
 	return claims, nil
 }
 
-// withUser runs fn inside a transaction with holster.user_id bound to the
-// caller's Clerk ID, so the RLS policies from 20260831233121_rls_roles.sql scope
-// every statement fn issues. This is the shape every user-scoped database
-// operation follows — see ../../DECISIONS.md and TASKS.md T10.
+// withUser runs fn inside a transaction with holster.user_id bound to id, so
+// the RLS policies from 20260831233121_rls_roles.sql scope every statement fn
+// issues. id is the authenticated caller's own Clerk ID on every
+// request-scoped path; the one exception is webhooks.go's deleteUser/
+// updateUserEmail, where there is no HTTP caller and id instead names the
+// account a signature-verified Clerk webhook payload is about. This is the
+// shape every user-scoped database operation follows — see
+// ../../DECISIONS.md and TASKS.md T10.
 //
 // The transaction is not optional. The gateway connects as gateway_app, a
 // non-owner role subject to row-level security. set_config with is_local => true
@@ -540,6 +572,10 @@ func (h *Handler) routes() http.Handler {
 	root := http.NewServeMux()
 	root.HandleFunc("GET /health", h.health)
 	root.HandleFunc("GET /ws/chat", h.chatWS)
+	// Authenticates by Svix signature (webhooks.go), not a Bearer session
+	// token, so it cannot sit behind authMiddleware — and it isn't
+	// browser-originated, so it needs no CORS headers either.
+	root.HandleFunc("POST /webhooks/clerk", h.clerkWebhook)
 	root.Handle("/api/", h.corsMiddleware(strings.Join(allowMethods, ", "), h.authMiddleware(api)))
 
 	return correlationID(root)
@@ -588,6 +624,11 @@ func main() {
 	parties := authorizedParties(mustEnv("CLERK_AUTHORIZED_PARTIES"))
 	databaseURL := mustEnv("DATABASE_URL")
 	agentURL := mustEnv("AGENT_SERVICE_URL")
+
+	webhookSecret, err := decodeWebhookSecret(mustEnv("CLERK_WEBHOOK_SECRET"))
+	if err != nil {
+		log.Fatalf("CLERK_WEBHOOK_SECRET: %v", err)
+	}
 
 	port := os.Getenv("GATEWAY_PORT")
 	if port == "" {
@@ -664,7 +705,8 @@ func main() {
 		loadVerdicts(db), saveVerdict(db),
 		loadWatchlistItems(db), newAgentTitlesCaller(agentClient, agentURL),
 		loadConversation(db), loadConversationTurns(db), saveMessages(db),
-		loadConversationSummaries(db), deleteConversation(db))
+		loadConversationSummaries(db), deleteConversation(db),
+		webhookSecret, deleteUser(db), updateUserEmail(db))
 	if err != nil {
 		log.Fatalf("handler: %v", err)
 	}

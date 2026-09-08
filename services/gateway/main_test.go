@@ -29,7 +29,20 @@ const (
 	testIssuer   = "https://holster.clerk.accounts.dev"
 	testOrigin   = "https://holster.app"
 	testAudience = "holster-gateway"
+
+	// testWebhookSecret is a valid Clerk/Svix-shaped signing secret shared by
+	// every test that constructs a Handler; webhooks_test.go signs test
+	// payloads against the same decoded bytes.
+	testWebhookSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
 )
+
+var testWebhookSecretBytes = func() []byte {
+	b, err := decodeWebhookSecret(testWebhookSecret)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}()
 
 func jwksJSON(kid string, key *rsa.PrivateKey) []byte {
 	b, err := json.Marshal(map[string]any{"keys": []map[string]string{{
@@ -86,6 +99,7 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages,
 		noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -140,6 +154,11 @@ func noopLoadConversationSummaries(context.Context, string) ([]conversationSumma
 func noopDeleteConversation(context.Context, string, string) (bool, error) {
 	return true, nil
 }
+
+// webhooks.go's own dependencies, for the same reason — webhooks_test.go
+// covers deleteUser/updateUserEmail for real.
+func noopDeleteUser(context.Context, string) error              { return nil }
+func noopUpdateUserEmail(context.Context, string, string) error { return nil }
 
 func TestVerifyTokenAcceptsValidToken(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -331,7 +350,8 @@ func TestProvisioningReceivesTokenIdentity(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +399,8 @@ func TestProvisioningFailureBlocksRequest(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +439,8 @@ func TestClientDisconnectIsNotAProvisioningFailure(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +496,8 @@ func TestProvisioningDeadlineReturns503(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,7 +532,8 @@ func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail)
 	if err == nil {
 		t.Error("built a Handler with no authorized parties, which would reject every request")
 	}
@@ -869,7 +893,8 @@ func TestKeyRotationSelfHeals(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -903,7 +928,8 @@ func TestUnknownKidDoesNotAmplify(t *testing.T) {
 		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation)
+		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail)
 	if err != nil {
 		t.Fatal(err)
 	}

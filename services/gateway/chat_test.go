@@ -359,6 +359,7 @@ func newChatTestServerWithConversations(
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		loadConversation, noopLoadConversationTurns, saveMessages,
 		noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail,
 	)
 	if err != nil {
 		t.Fatal(err)
