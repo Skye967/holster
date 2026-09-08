@@ -1,7 +1,8 @@
 "use client"
 
 import { useClerk, useUser } from "@clerk/nextjs"
-import { ChevronsUpDown, LogOut } from "lucide-react"
+import { ChevronsUpDown, Info, LogOut } from "lucide-react"
+import Link from "next/link"
 
 import {
   DropdownMenu,
@@ -61,6 +62,10 @@ export function UserMenu() {
                 ) : null}
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
+              <DropdownMenuItem render={<Link href="/credits" />}>
+                <Info />
+                Credits
+              </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => signOut({ redirectUrl: "/sign-in" })}
               >
