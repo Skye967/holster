@@ -692,6 +692,63 @@ func TestGatewayRoleDeniesWithoutUserContext(t *testing.T) {
 	})
 }
 
+// TestGatewayRoleEnforcesIsolationOnDeleteAndUpdate closes the coverage gap
+// TestGatewayRoleEnforcesUserIsolation leaves: deleteUser/updateUserEmail
+// (webhooks.go, T22.5) lean on this same user_isolation policy as their only
+// backstop against a webhook payload naming the wrong id -- unlike every
+// other withUser caller, id there comes from a Clerk webhook payload, not a
+// verified JWT subject.
+//
+// UPDATE/DELETE aren't WITH CHECK's job here -- that clause only gates the
+// row a write would produce, and neither of these statements changes id, so
+// it never comes into play. USING is what matters: it filters which rows
+// UPDATE/DELETE can even see, so a cross-user attempt matches zero rows
+// silently rather than erroring -- the same shape deleteUser's own
+// idempotent "already gone" retries already depend on.
+func TestGatewayRoleEnforcesIsolationOnDeleteAndUpdate(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const uA, uB = "rls_write_a", "rls_write_b"
+	newTestUser(t, pool, ctx, uA)
+	newTestUser(t, pool, ctx, uB)
+
+	// Everything below runs inside one rolled-back transaction (asRole never
+	// commits), so uA's own-row delete near the end doesn't need its own
+	// undo and both rows are still there for t.Cleanup afterward.
+	asRole(t, pool, "gateway_app", func(ctx context.Context, tx pgx.Tx) {
+		if _, err := tx.Exec(ctx, `select set_config('holster.user_id', $1, true)`, uA); err != nil {
+			t.Fatalf("set_config: %v", err)
+		}
+
+		tag, err := tx.Exec(ctx, `delete from users where id = $1`, uB)
+		if err != nil {
+			t.Errorf("delete attempt on %s while acting as %s: %v", uB, uA, err)
+		}
+		if tag.RowsAffected() != 0 {
+			t.Errorf("deleting %s's row while acting as %s affected %d rows, want 0", uB, uA, tag.RowsAffected())
+		}
+
+		tag, err = tx.Exec(ctx, `update users set email = 'hijacked@example.com' where id = $1`, uB)
+		if err != nil {
+			t.Errorf("update attempt on %s while acting as %s: %v", uB, uA, err)
+		}
+		if tag.RowsAffected() != 0 {
+			t.Errorf("updating %s's row while acting as %s affected %d rows, want 0", uB, uA, tag.RowsAffected())
+		}
+
+		// The positive case deleteUser/updateUserEmail depend on: acting as
+		// its own id succeeds.
+		tag, err = tx.Exec(ctx, `delete from users where id = $1`, uA)
+		if err != nil {
+			t.Errorf("deleting its own row while acting as %s: %v", uA, err)
+		}
+		if tag.RowsAffected() != 1 {
+			t.Errorf("deleting its own row while acting as %s affected %d rows, want 1", uA, tag.RowsAffected())
+		}
+	})
+}
+
 // currentVerdict reads one title's stored verdict, or false if no row
 // exists — shared by every saveVerdict test below rather than each defining
 // its own copy of the same lookup.
@@ -1624,4 +1681,115 @@ func TestMessagePolicyEnforcesUserIsolation(t *testing.T) {
 			t.Errorf("writing into %s's conversation while acting as %s: err = %v, want SQLSTATE 42501", uA, uB, err)
 		}
 	})
+}
+
+// --- webhooks.go (T22.5) -----------------------------------------------------
+
+// TestDeleteUser proves the task's done-when line directly: removing the
+// users row takes every dependent table with it via ON DELETE CASCADE, and a
+// second call against an already-deleted id (Clerk retries webhook delivery)
+// is a no-op, not an error.
+func TestDeleteUser(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	remove := deleteUser(pool)
+
+	const id = "webhook_delete_test"
+	newTestUser(t, pool, ctx, id)
+
+	if _, err := pool.Exec(ctx,
+		`insert into streaming_subscriptions (user_id, tmdb_provider_id) values ($1, 8)
+		 on conflict do nothing`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`insert into title_verdicts (user_id, tmdb_id, media_type, verdict) values ($1, 550, 'movie', 'liked')
+		 on conflict do nothing`, id); err != nil {
+		t.Fatal(err)
+	}
+	convID := uuid.NewString()
+	if _, err := pool.Exec(ctx,
+		`insert into conversations (id, user_id) values ($1, $2)`, convID, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`insert into messages (conversation_id, role, content) values ($1, 'user', 'hi')`, convID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := remove(ctx, id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	counts := map[string]string{
+		"users":                   `select count(*) from users where id = $1`,
+		"streaming_subscriptions": `select count(*) from streaming_subscriptions where user_id = $1`,
+		"title_verdicts":          `select count(*) from title_verdicts where user_id = $1`,
+		"conversations":           `select count(*) from conversations where user_id = $1`,
+	}
+	for table, query := range counts {
+		var n int
+		if err := pool.QueryRow(ctx, query, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Errorf("%s rows for %s after delete = %d, want 0", table, id, n)
+		}
+	}
+	var msgCount int
+	if err := pool.QueryRow(ctx, `select count(*) from messages where conversation_id = $1`, convID).
+		Scan(&msgCount); err != nil {
+		t.Fatal(err)
+	}
+	if msgCount != 0 {
+		t.Errorf("messages for %s after delete = %d, want 0", convID, msgCount)
+	}
+
+	// Idempotent: a second call against a user already gone must not error.
+	if err := remove(ctx, id); err != nil {
+		t.Errorf("repeat delete on an already-gone user: %v", err)
+	}
+}
+
+// TestUpdateUserEmail proves user.updated's write: a changed email is
+// stored, and a same-email call and a call for a nonexistent id are both
+// silent no-ops.
+func TestUpdateUserEmail(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	update := updateUserEmail(pool)
+
+	const id = "webhook_email_test"
+	newTestUser(t, pool, ctx, id)
+
+	email := func() string {
+		var e string
+		if err := pool.QueryRow(ctx, `select email from users where id = $1`, id).Scan(&e); err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		return e
+	}
+
+	if got := email(); got != id+"@example.com" {
+		t.Fatalf("seed email = %q, want %q", got, id+"@example.com")
+	}
+
+	if err := update(ctx, id, "updated@example.com"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := email(); got != "updated@example.com" {
+		t.Errorf("email = %q, want %q", got, "updated@example.com")
+	}
+
+	// Same email again is a no-op, not an error.
+	if err := update(ctx, id, "updated@example.com"); err != nil {
+		t.Errorf("idempotent re-update: %v", err)
+	}
+
+	// A user who has never hit the gateway has no row -- silently doing
+	// nothing here is deliberate (see updateUserEmail's doc comment):
+	// upsertUser provisions the row on their first real request.
+	if err := update(ctx, "webhook_email_nonexistent", "new@example.com"); err != nil {
+		t.Errorf("update for a nonexistent id: %v", err)
+	}
 }

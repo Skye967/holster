@@ -42,6 +42,7 @@ func newProvidersTestServer(t *testing.T,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages,
 		noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail,
 	)
 	if err != nil {
 		t.Fatal(err)

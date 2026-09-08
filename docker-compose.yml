@@ -25,6 +25,7 @@ services:
       CLERK_ISSUER: ${CLERK_ISSUER}
       CLERK_AUTHORIZED_PARTIES: ${CLERK_AUTHORIZED_PARTIES}
       CLERK_AUDIENCE: ${CLERK_AUDIENCE}
+      CLERK_WEBHOOK_SECRET: ${CLERK_WEBHOOK_SECRET}
       # Defaults to the compose-network Postgres, as gateway_app — the
       # least-privilege role RLS applies to (T10). `localhost` in DATABASE_URL
       # means the gateway's own container, not the database — set the host to

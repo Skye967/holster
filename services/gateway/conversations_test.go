@@ -46,6 +46,7 @@ func newConversationsTestServer(t *testing.T,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, loadConversationTurns, noopSaveMessages,
 		loadConversationSummaries, deleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail,
 	)
 	if err != nil {
 		t.Fatal(err)

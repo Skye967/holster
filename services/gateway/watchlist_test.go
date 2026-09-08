@@ -42,6 +42,7 @@ func newWatchlistTestServer(t *testing.T,
 		loadWatchlistItems, callAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages,
 		noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail,
 	)
 	if err != nil {
 		t.Fatal(err)
