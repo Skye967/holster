@@ -1,0 +1,9 @@
+# Keep the build context to source only.
+node_modules
+.next
+.env
+.env.*
+.git
+README.md
+*.tsbuildinfo
+.DS_Store
