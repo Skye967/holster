@@ -76,6 +76,59 @@ def test_interpret_does_not_flag_a_vague_search_as_a_capability_question() -> No
     asyncio.run(go())
 
 
+def test_interpret_asks_a_clarifying_question_for_a_bare_opener() -> None:
+    async def go() -> None:
+        call = google_interpreter(_model())
+        intent = await call("recommend something")
+        assert intent.clarifying_question
+
+    asyncio.run(go())
+
+
+def test_interpret_does_not_ask_when_a_message_has_real_signal() -> None:
+    """The false-positive risk this field creates, same shape as the
+    capability-question check above: a message with any concrete signal
+    (here, a genre) must search, not stall on a question."""
+
+    async def go() -> None:
+        call = google_interpreter(_model())
+        intent = await call("a funny movie")
+        assert not intent.clarifying_question
+
+    asyncio.run(go())
+
+
+def test_interpret_does_not_ask_on_an_explicit_blind_request() -> None:
+    """The sharpest version of that risk: 'surprise me' reads as vague on
+    its surface but is actually a complete instruction — search on it
+    instead of stalling."""
+
+    async def go() -> None:
+        call = google_interpreter(_model())
+        intent = await call("surprise me")
+        assert not intent.clarifying_question
+
+    asyncio.run(go())
+
+
+def test_interpret_does_not_ask_twice_in_a_row() -> None:
+    """Mirrors the conversation shape chat.py's _with_history actually
+    builds: once the assistant's last turn was already a clarifying
+    question, a still-vague reply must not trigger a second one."""
+
+    async def go() -> None:
+        call = google_interpreter(_model())
+        folded = (
+            "Recent conversation:\n"
+            "Assistant: What are you in the mood for tonight?\n\n"
+            "Current message: I don't know, anything really"
+        )
+        intent = await call(folded)
+        assert not intent.clarifying_question
+
+    asyncio.run(go())
+
+
 def test_interpret_pulls_signal_from_a_colloquial_cold_start_message() -> None:
     """T21: proves the mood-inference instruction generalizes, against a
     phrase absent from the prompt's own worked examples. 'cozy'/'easy' name
@@ -103,6 +156,37 @@ def test_interpret_treats_a_mood_word_as_a_keyword() -> None:
         call = google_interpreter(_model())
         intent = await call("something scary tonight")
         assert intent.keywords
+
+    asyncio.run(go())
+
+
+def test_interpret_extracts_a_plural_theme_keyword_in_singular_form() -> None:
+    """TMDB's real, heavily-tagged keyword vocabulary is almost always
+    singular ('pirate', not 'pirates') — a plural often resolves to a
+    near-unused duplicate tag and returns nothing. Confirmed against the
+    live TMDB catalog during development: 'pirates' alone returned 0
+    discover() results where 'pirate' returned 20, including Pirates of
+    the Caribbean."""
+
+    async def go() -> None:
+        call = google_interpreter(_model())
+        intent = await call("a movie about pirates")
+        assert "pirates" not in intent.keywords
+        assert intent.keywords
+
+    asyncio.run(go())
+
+
+def test_interpret_does_not_duplicate_a_keyword_as_a_near_synonym() -> None:
+    """The compounding half of the same bug: 'the sea' must not become both
+    'sea' and 'ocean' — discover() ANDs multiple keywords together, so two
+    near-synonyms for one idea can return nothing even when either alone
+    would have real results."""
+
+    async def go() -> None:
+        call = google_interpreter(_model())
+        intent = await call("a movie about the sea")
+        assert len(intent.keywords) == 1
 
     asyncio.run(go())
 

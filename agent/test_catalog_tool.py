@@ -46,6 +46,7 @@ from testutil import (
     DISCOVER_RAISED,
     INTERPRET_RAISED,
     MOVIE_A,
+    NEEDS_CLARIFICATION,
     NO_CANDIDATES,
     NO_PROVIDERS,
     FakeTMDB,
@@ -369,6 +370,66 @@ def test_search_short_circuits_on_capability_question() -> None:
     # No "interpreting" line for a question that isn't a search.
     assert on_intent_calls == []
     assert fake_tmdb.requests == []
+
+
+def test_search_short_circuits_on_clarifying_question() -> None:
+    fake_tmdb = FakeTMDB()
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(clarifying_question="What are you in the mood for?")
+
+    on_intent_calls: list[DiscoverIntent] = []
+
+    async def on_intent(intent: DiscoverIntent) -> None:
+        on_intent_calls.append(intent)
+
+    result = run(
+        search(
+            "recommend something",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(NEEDS_CLARIFICATION),
+            on_intent=on_intent,
+        )
+    )
+
+    assert result.intent is not None
+    assert result.intent.clarifying_question == "What are you in the mood for?"
+    assert result.picks == []
+    assert result.relaxed == []
+    # No "interpreting" line, same reasoning as the capability-question case:
+    # there is no search to narrate.
+    assert on_intent_calls == []
+    assert fake_tmdb.requests == []
+
+
+def test_search_treats_a_whitespace_only_clarifying_question_as_none() -> None:
+    """A whitespace-only clarifying_question must not short-circuit the
+    search or reach the user as a blank reply — see the strip() in
+    search() right after interpret() returns."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(keywords=["heist"], clarifying_question="  ")
+
+    result = run(
+        search(
+            "a heist movie",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=_rank_first,
+        )
+    )
+
+    assert result.intent is not None
+    assert result.intent.clarifying_question == ""
+    assert len(result.picks) == 1
+    assert fake_tmdb.count("/discover/movie") == 1
 
 
 # --- relaxation ladder -----------------------------------------------------

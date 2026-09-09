@@ -27,6 +27,7 @@ from testutil import (
     ALL_JUDGED,
     CAPABILITY_QUESTION,
     MOVIE_A,
+    NEEDS_CLARIFICATION,
     NO_CANDIDATES,
     FakeTMDB,
     make_intent,
@@ -122,6 +123,67 @@ def test_capability_question_degrades_gracefully_with_uncached_provider_names() 
     assert [e["type"] for e in events] == ["message", "done"]
     assert "Connections" not in events[0]["text"]
     assert "haven't picked" not in events[0]["text"]
+
+
+def test_capability_question_takes_precedence_over_clarifying_question() -> None:
+    """Nothing stops the model from setting both on the same response (the
+    two fields are independent). Pins the deliberate elif ordering in
+    stream_chat's run(): a capability question is a more specific signal
+    than a clarifying nudge, so it wins and the clarifying text is dropped
+    — not asserted anywhere else, so a future reordering could flip this
+    silently without this test."""
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="help?",
+        watch_region="US",
+        watch_providers=[8],
+        watch_provider_names=["Netflix"],
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(
+            is_capability_question=True,
+            clarifying_question="What are you in the mood for?",
+        )
+
+    events = asyncio.run(
+        _collect(
+            req,
+            fake_tmdb.client(),
+            fake_interpret,
+            rank_must_not_run(CAPABILITY_QUESTION),
+        )
+    )
+
+    assert [e["type"] for e in events] == ["message", "done"]
+    assert "Netflix" in events[0]["text"]
+    assert events[0]["text"] != "What are you in the mood for?"
+
+
+def test_clarifying_question_short_circuits_with_the_models_question() -> None:
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="recommend something", watch_region="US", watch_providers=[8]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(clarifying_question="What are you in the mood for tonight?")
+
+    events = asyncio.run(
+        _collect(
+            req,
+            fake_tmdb.client(),
+            fake_interpret,
+            rank_must_not_run(NEEDS_CLARIFICATION),
+        )
+    )
+
+    # No "intent" event either — on_intent never fires when search() short-
+    # circuits for clarification (catalog_tool.py), same as a capability
+    # question.
+    assert [e["type"] for e in events] == ["message", "done"]
+    assert events[0]["text"] == "What are you in the mood for tonight?"
+    assert fake_tmdb.requests == []
 
 
 def test_successful_search_emits_intent_then_results_then_done() -> None:

@@ -25,6 +25,7 @@ DISCOVER_RAISED = "discover() raised"
 NO_CANDIDATES = "no candidates came back"
 ALL_JUDGED = "every candidate was judged"
 CAPABILITY_QUESTION = "on a capability question"
+NEEDS_CLARIFICATION = "on a message that needs clarification"
 INTERPRET_RAISED = "interpret() raised"
 NO_PROVIDERS = "no providers ticked"
 

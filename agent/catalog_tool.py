@@ -72,11 +72,12 @@ logger = logging.getLogger("holster.catalog_tool")
 
 class DiscoverIntent(BaseModel):
     """interpret()'s output — tmdb.discover()'s creative parameters, none of
-    its identity parameters, plus one field that isn't a search parameter at
-    all: is_capability_question, search()'s signal to skip discover()/rank()
-    entirely (TASKS.md T16.5). watch_region and watch_providers are
-    deliberately absent: the model must never be able to choose which
-    streaming services results come from (TASKS.md T13, CLAUDE.md)."""
+    its identity parameters, plus two fields that aren't search parameters at
+    all: is_capability_question and clarifying_question, search()'s signal to
+    skip discover()/rank() entirely (TASKS.md T16.5). watch_region and
+    watch_providers are deliberately absent: the model must never be able to
+    choose which streaming services results come from (TASKS.md T13,
+    CLAUDE.md)."""
 
     media_type: MediaType = Field(description="'movie' for films, 'tv' for series.")
     is_capability_question: bool = Field(
@@ -90,6 +91,23 @@ class DiscoverIntent(BaseModel):
             "not this."
         ),
     )
+    clarifying_question: str = Field(
+        default="",
+        description=(
+            "One short, natural question fishing for what they want to watch "
+            "— a genre, a mood, a favorite film or show to riff on, who "
+            "they're watching with — the way a person would ask, not a form. "
+            "Set it only when there's no real signal to search on yet, "
+            "anywhere in the conversation: no genre, mood, actor, director, "
+            "decade, or title-to-compare-to. Leave it empty the instant any "
+            "of those appears, however small, and also for an explicit "
+            "blind request ('surprise me', 'just pick something') — that is "
+            "a real instruction, not vagueness. Never set it twice in a "
+            "row: if the assistant's last message was already a clarifying "
+            "question, treat whatever the user says next as enough to "
+            "search on, however thin."
+        ),
+    )
     keywords: list[str] = Field(
         default_factory=list,
         description=(
@@ -100,12 +118,20 @@ class DiscoverIntent(BaseModel):
             "intense' -> 'tense'. Skip it when there's no mood to read — "
             "'movies with Tom Hanks from the 90s' has no mood to infer, just "
             "cast and year. An unresolved keyword is simply dropped, so a "
-            "guess costs nothing."
+            "guess costs nothing. Use singular noun form ('pirate' not "
+            "'pirates', 'car' not 'cars') — TMDB's real tags are almost "
+            "always singular, and a plural often matches nothing. One "
+            "keyword per distinct idea — never add a near-synonym for the "
+            "same thing (e.g. 'sea' alone, not 'sea' and 'ocean' together), "
+            "since multiple keywords must all match at once."
         ),
     )
     without_keywords: list[str] = Field(
         default_factory=list,
-        description="Mood/theme terms to exclude, e.g. 'nothing bleak' -> 'bleak'.",
+        description=(
+            "Mood/theme terms to exclude, e.g. 'nothing bleak' -> 'bleak'. "
+            "Singular noun form, same reason as keywords."
+        ),
     )
     genres: list[str] = Field(
         default_factory=list,
@@ -675,10 +701,13 @@ async def search(
 
     Also returns picks-less (this time with ``intent`` set) when interpret()
     flags the message as a capability question rather than a title request
-    (TASKS.md T16.5) — discover()/rank() never run, and ``on_intent`` never
-    fires, since there is no search to narrate an "interpreting" line for.
-    The caller (chat.py's stream_chat) is the one that turns that into a
-    reply naming what the caller can actually do.
+    (TASKS.md T16.5), or sets ``intent.clarifying_question`` because neither
+    the message nor the conversation so far gives anything to search on —
+    discover()/rank() never run either way, and ``on_intent`` never fires,
+    since there is no search to narrate an "interpreting" line for. The
+    caller (chat.py's stream_chat) is the one that turns either case into a
+    reply: what the caller can actually do for a capability question,
+    ``intent.clarifying_question`` itself for the other.
 
     Raises CatalogToolError if interpret() or rank() fails (a network/API
     error, or a response that didn't satisfy its schema — see
@@ -695,10 +724,19 @@ async def search(
 
     verdicts = verdicts or []
     intent = await interpret(message, model=interpret_model)
-    if intent.is_capability_question:
-        # Before on_intent: an "interpreting: looking for movies on Netflix"
-        # line would contradict the capability answer that's about to follow
-        # it. Nothing to search for, so discover()/rank() never run either.
+    # Normalized here, the one place the model's raw output is consumed: a
+    # whitespace-only clarifying_question must not read as a real question
+    # below (chat.py sends it to the user verbatim) or as a truthy
+    # short-circuit signal here.
+    intent.clarifying_question = intent.clarifying_question.strip()
+    if intent.is_capability_question or intent.clarifying_question:
+        # Nothing to search for either way — an explicit question about the
+        # assistant, or too little signal yet to search on. Before on_intent:
+        # an "interpreting: looking for movies on Netflix" line would
+        # contradict the reply that's about to follow it, so discover()/
+        # rank() never run and on_intent never fires. The caller (chat.py's
+        # stream_chat) turns this into what the assistant can do, or
+        # intent.clarifying_question itself.
         return CatalogResult(intent=intent, picks=[], relaxed=[])
     if on_intent is not None:
         await on_intent(intent)
@@ -858,6 +896,9 @@ _INTERPRET_SYSTEM_PROMPT = (
     "'what movies do you have', 'surprise me', 'help me find something to "
     "watch' — is a search, not this; leave it false and fill in the fields "
     "above as best you can. "
+    "Set clarifying_question, per its own field description, whenever "
+    "there's truly nothing to search on yet — never guess at fields "
+    "instead, and never ask twice in a row. "
     + _GENRE_VOCABULARY
 )
 

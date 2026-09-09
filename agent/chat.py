@@ -18,7 +18,9 @@ Event shapes on the wire (one JSON object per line):
            failed, distinct from [] (confirmed available nowhere the caller
            subscribes) — see catalog_tool.py's _safe_availability
     {"type": "message", "text": str}   -- a plain reply with no candidates
-                                           (no subscriptions, or nothing found)
+                                           (no subscriptions, capability
+                                           question, clarifying question, or
+                                           nothing found)
     {"type": "error", "reason": str}   -- one of a fixed set, see _error_reason
     {"type": "done"}
 
@@ -209,14 +211,16 @@ async def stream_chat(
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
     async def on_intent(intent: DiscoverIntent) -> None:
-        # is_capability_question never reaches here in practice (search()
-        # returns early for it — catalog_tool.py) but excluded on principle:
-        # not a search parameter, meaningless in the gateway's template.
+        # is_capability_question/clarifying_question never reach here in
+        # practice (search() returns early for both — see catalog_tool.py)
+        # but excluded on principle: neither is a search parameter,
+        # meaningless in the gateway's template.
         await queue.put(
             {
                 "type": "intent",
                 "intent": intent.model_dump(
-                    exclude_none=True, exclude={"is_capability_question"}
+                    exclude_none=True,
+                    exclude={"is_capability_question", "clarifying_question"},
                 ),
             }
         )
@@ -245,12 +249,20 @@ async def stream_chat(
             await queue.put(None)
             return
 
+        # is_capability_question checked first, deliberately: the two fields
+        # are independent (nothing stops the model setting both), and a
+        # capability question is the more specific signal when it happens —
+        # see test_capability_question_takes_precedence_over_clarifying_question.
         if result.intent is not None and result.intent.is_capability_question:
             await queue.put(
                 {
                     "type": "message",
                     "text": _capability_message(req.watch_provider_names),
                 }
+            )
+        elif result.intent is not None and result.intent.clarifying_question:
+            await queue.put(
+                {"type": "message", "text": result.intent.clarifying_question}
             )
         elif result.picks:
             await queue.put(
