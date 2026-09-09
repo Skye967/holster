@@ -11,10 +11,22 @@ import { Switch } from "@/components/ui/switch"
 import { useRowStatus } from "@/hooks/use-row-status"
 import { gatewayErrorText, gatewayFetch } from "@/lib/gateway"
 
-// Always-visible providers, ranked by TMDB's own display_priority — everything
-// past this is reachable only through search. TASKS.md T15: "surface the
-// common providers and put the long tail behind search."
-const TOP_PROVIDER_COUNT = 8
+// Always-visible providers, picked by hand rather than TMDB's display_priority
+// — that ranking surfaces channel add-ons and split paid tiers (Paramount+ and
+// Peacock each list as separate "Essential"/"Premium" entries with no plain
+// "Paramount Plus" or "Peacock" of their own). Everything else is reachable
+// only through search. TASKS.md T15: "surface the common providers and put
+// the long tail behind search."
+const DEFAULT_PROVIDER_IDS = [
+  8, // Netflix
+  15, // Hulu
+  9, // Amazon Prime Video
+  350, // Apple TV
+  2616, // Paramount Plus Essential
+  1899, // HBO Max
+  337, // Disney Plus
+  386, // Peacock Premium
+]
 
 interface ProviderEntry {
   provider_id: number
@@ -22,6 +34,25 @@ interface ProviderEntry {
   logo_url: string | null
   display_priority: number
   subscribed: boolean
+}
+
+// Hand-picked defaults in DEFAULT_PROVIDER_IDS order, plus anything else the
+// user has subscribed to via search — otherwise a service added through
+// search vanishes the moment the search box is cleared. Split out of the
+// component body so the ternary that calls it only pays for this when
+// there's no search term.
+function defaultProviders(
+  providers: ProviderEntry[],
+  sorted: ProviderEntry[],
+): ProviderEntry[] {
+  const byId = new Map(providers.map((p) => [p.provider_id, p]))
+  const defaults = DEFAULT_PROVIDER_IDS.map((id) => byId.get(id)).filter(
+    (p): p is ProviderEntry => p !== undefined,
+  )
+  const extras = sorted.filter(
+    (p) => p.subscribed && !DEFAULT_PROVIDER_IDS.includes(p.provider_id),
+  )
+  return [...defaults, ...extras]
 }
 
 export function StreamingPicker() {
@@ -126,7 +157,7 @@ export function StreamingPicker() {
   )
   const visible = term
     ? sorted.filter((p) => p.provider_name.toLowerCase().includes(term))
-    : sorted.slice(0, TOP_PROVIDER_COUNT)
+    : defaultProviders(providers, sorted)
 
   return (
     <div className="space-y-4">
@@ -143,15 +174,17 @@ export function StreamingPicker() {
       {visible.length === 0 ? (
         term ? (
           <p className="text-sm text-muted-foreground">No matches.</p>
-        ) : (
-          // Nothing was searched — an empty list here means the region has no
-          // cached catalog and the agent couldn't fetch one, not "0 results
-          // for your search." Must not read as the latter (TASKS.md's
-          // cross-cutting rule: "nothing matched" vs "something broke").
+        ) : providers.length === 0 ? (
+          // Nothing was searched and the catalog itself is empty — the
+          // region has no cached catalog and the agent couldn't fetch one.
+          // Gated on providers.length, not visible.length, so it can't fire
+          // just because none of the 8 defaults matched a loaded catalog
+          // (TASKS.md's cross-cutting rule: "nothing matched" vs "something
+          // broke").
           <p className="text-sm text-muted-foreground">
             Can&apos;t reach your streaming services right now — try reloading.
           </p>
-        )
+        ) : null
       ) : (
         <ul className="divide-y divide-border">
           {visible.map((p) => (
