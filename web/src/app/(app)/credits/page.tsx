@@ -1,9 +1,8 @@
-import { auth } from "@clerk/nextjs/server"
 import Image from "next/image"
 
-export default async function CreditsPage() {
-  await auth.protect()
-
+// Public on purpose: TMDB and JustWatch attribution is a shipping
+// requirement (CLAUDE.md), so it must be reachable by a guest too.
+export default function CreditsPage() {
   return (
     <div className="p-6">
       <h1 className="text-lg font-semibold tracking-tight">Credits</h1>
@@ -26,8 +25,8 @@ export default async function CreditsPage() {
             />
           </a>
           <p className="mt-2 text-sm text-muted-foreground">
-            This product uses the TMDb API but is not endorsed or certified
-            by TMDb.
+            This product uses the TMDb API but is not endorsed or certified by
+            TMDb.
           </p>
         </div>
         <p className="text-sm text-muted-foreground">

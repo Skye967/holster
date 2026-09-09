@@ -67,6 +67,15 @@ and only app-level keys.
 `insert`, `update` or `delete` grant. A bug or an injected instruction hits a
 permission error rather than a modified row.
 
+**A guest — a browser with no session — reaches only the catalog cache and the agent.**
+`GET /guest/providers` and `/ws/chat?guest=1` are the whole browser-facing guest
+surface; a socket with neither a ticket nor that flag is refused. (`GET /health` and
+the Svix-signed `POST /webhooks/clerk` are also unauthenticated, but neither is
+something a guest's browser calls.) A guest turn takes its streaming
+services from the message, keeps history in memory for the life of the socket, and
+persists nothing: there is no `users` row, so no user-scoped table is ever read or
+written for it.
+
 ## Two classes of tool
 
 **Catalog tools** — TMDB. One app-level key, no user connection, no per-user secret.

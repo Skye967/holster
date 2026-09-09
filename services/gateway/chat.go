@@ -68,6 +68,11 @@ func newChatTicketStore() *chatTicketStore {
 }
 
 func (s *chatTicketStore) mint(userID string) (string, error) {
+	// "" is the guest sentinel inside a connection (see "Guests" below); a
+	// ticket must never be able to carry it.
+	if userID == "" {
+		return "", errNoUserID
+	}
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -117,6 +122,80 @@ func (h *Handler) chatTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"ticket": id})
+}
+
+// --- Guests ------------------------------------------------------------------
+//
+// Why guests exist and what they cost: DECISIONS.md "Optional sign-in".
+//
+// What this file enforces: a guest has no users row, so nothing user-scoped is
+// read or written for it; ?guest=1 declares a guest and a ticket declares an
+// account, while neither is a 401 — an absent credential never silently
+// becomes a different mode; within a connection userID == "" is the guest, and
+// mint above refuses to ever issue that value.
+//
+// No rate limit here, per-IP or global: a model 429 already reaches the user as
+// "try again in a moment" (friendlyError), so throttling would only move the
+// refusal without bounding the shared quota.
+
+// Every account is provisioned into users.country's default
+// (20260831230634_streaming.sql), so a guest hard-wired to the same value sees
+// the same catalog an account does today. Revisit alongside any real country
+// setting.
+const guestRegion = "US"
+
+// Bounds one message's providers list — the picker offers a few dozen per
+// region, so anything past this is a malformed frame, not a real selection.
+const maxGuestProviders = 50
+
+// Mirrors web/src/lib/guest.ts's MAX_PROVIDER_ID. TMDB's ids are four digits;
+// the ceiling only has to be low enough to keep a nonsense id out of a frame.
+const maxProviderID = 1_000_000
+
+// Turns one guest socket may send to the model before it's nudged to sign in.
+// Per-socket, and a reconnect starts a fresh one — a nudge in the funnel, not a
+// quota control; nothing here bounds the shared LLM spend (see the note above).
+const defaultGuestTurnCap = 20
+
+// No number in the copy, so it can't drift from the cap.
+const guestTurnCapText = "You've reached the guest limit for this session — sign in to keep chatting."
+
+// validGuestProviders rejects a frame whose providers list can't have come
+// from the picker — a set of switches, so no duplicates, and the same
+// positive-id posture as setSubscription's providerID check.
+func validGuestProviders(ids []int) bool {
+	if len(ids) > maxGuestProviders {
+		return false
+	}
+	seen := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		if id <= 0 || id > maxProviderID || seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	return true
+}
+
+// loadGuestChatContext is loadChatContext's guest counterpart, injected the
+// same way: region fixed, providers from the message, names from the same
+// cached row — never loadProviders, whose stale-cache refresh path belongs to
+// the picker's page load, not inside a turn's deadline.
+func loadGuestChatContext(db *pgxpool.Pool) func(ctx context.Context, providers []int) (chatContext, error) {
+	return func(ctx context.Context, providers []int) (chatContext, error) {
+		cc := chatContext{Region: guestRegion, Providers: providers, ProviderNames: []string{}}
+		// Nothing to resolve, and the agent answers this case from a template
+		// without ever reading names — no reason to touch the database.
+		if len(providers) == 0 {
+			return cc, nil
+		}
+		names, err := cachedProviderNames(ctx, db, guestRegion, providers)
+		if err != nil {
+			return cc, err
+		}
+		cc.ProviderNames = names
+		return cc, nil
+	}
 }
 
 // --- Tracking conversations deleted mid-turn --------------------------------
@@ -210,6 +289,10 @@ type inboundMessage struct {
 	Turn         string `json:"turn"`
 	Text         string `json:"text,omitempty"`
 	Conversation string `json:"conversation,omitempty"`
+	// A guest's ticked services, sent on every "message" frame since it has
+	// no streaming_subscriptions rows to load. Ignored on an authenticated
+	// socket: an account's turn always reads its own rows, never the client.
+	Providers []int `json:"providers,omitempty"`
 }
 
 // outboundEvent is the gateway's curated, public vocabulary — never the
@@ -280,6 +363,15 @@ const maxHistoryExchanges = 2
 // documented 4-8s normal case so it only ever fires on a genuinely stuck call.
 const turnDeadline = 30 * time.Second
 
+// Comfortably inside the 60s idle timeout common to proxies and load
+// balancers, so a socket between turns is never quiet long enough to be
+// reaped. pingTimeout only has to outlast a round trip — a peer that cannot
+// answer in ten seconds is gone, not slow.
+const (
+	pingInterval = 30 * time.Second
+	pingTimeout  = 10 * time.Second
+)
+
 func windowHistory(history []historyTurn) []historyTurn {
 	n := maxHistoryExchanges * 2
 	if len(history) <= n {
@@ -289,9 +381,20 @@ func windowHistory(history []historyTurn) []historyTurn {
 }
 
 func (h *Handler) chatWS(w http.ResponseWriter, r *http.Request) {
-	t, ok := h.tickets.consume(r.URL.Query().Get("ticket"))
-	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired ticket"})
+	// Ticket → account, ?guest=1 → guest, neither → 401 (see "Guests" above).
+	// A ticket that's present but bad is a rejection, never a downgrade, and
+	// a request carrying both is an account — a credential is never ignored
+	// in favour of a weaker mode.
+	var userID string
+	if ticket := r.URL.Query().Get("ticket"); ticket != "" {
+		t, ok := h.tickets.consume(ticket)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired ticket"})
+			return
+		}
+		userID = t.userID
+	} else if r.URL.Query().Get("guest") != "1" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing ticket"})
 		return
 	}
 
@@ -312,7 +415,7 @@ func (h *Handler) chatWS(w http.ResponseWriter, r *http.Request) {
 	connCtx, cancel := context.WithCancel(h.rootCtx)
 	defer cancel()
 
-	h.runChatConnection(connCtx, conn, t.userID)
+	h.runChatConnection(connCtx, conn, userID)
 }
 
 // runChatConnection is the single coordinator for one connection: it alone
@@ -323,6 +426,81 @@ func (h *Handler) chatWS(w http.ResponseWriter, r *http.Request) {
 // handles that internally), but only one goroutine may ever call Read, which
 // is why the read loop is separate and singular.
 func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, userID string) {
+	guest := userID == ""
+
+	// Keepalive. A chat socket is idle between turns for as long as the user
+	// takes to type, and intermediaries drop a connection that goes quiet.
+	// Reconnecting costs an account nothing — loadConversation re-reads every
+	// message — but a guest's history lives only in this stack frame, so a
+	// silent drop is the one way it can be lost while the panel still shows
+	// the thread on screen. Browsers answer a ping frame themselves, so this
+	// needs no client half. Its own goroutine because Read is single-threaded
+	// below; Ping is safe to call concurrently with it.
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+				err := conn.Ping(pingCtx)
+				cancel()
+				if err != nil {
+					// Not proof the peer is gone: Ping waits for a Reader to
+					// read the pong (coder/websocket's own contract), and the
+					// read loop is outside Read whenever it is handing a
+					// message to the coordinator below — so a busy connection
+					// can miss one on a healthy socket. Returning here would
+					// leave the socket unpinged for the rest of its life,
+					// which is the idle-drop this exists to prevent. Retry on
+					// the next tick; the read loop still owns teardown.
+					continue
+				}
+			}
+		}
+	}()
+
+	// A guest's history is this connection's alone — held here, never on the
+	// Handler, or two guests naming the same client-minted UUID would read
+	// each other's turns. It dies with the socket, which is the whole of a
+	// guest's persistence story.
+	//
+	// One conversation, not a map keyed by conversation id: the id is chosen
+	// by the client, so a map has no bound on its number of keys and one
+	// socket could grow the heap indefinitely. A guest drives one thread at a
+	// time (the panel is keyed by conversation id and remounts on a switch),
+	// and this way the gateway forgets exactly what the panel forgets — going
+	// back to an earlier conversation shows an empty thread and the model has
+	// no memory of it either, rather than answering from turns the guest can
+	// no longer see. Windowed on write, so the live thread stays bounded too.
+	var guestConv string
+	var guestHistory []historyTurn
+	var guestTurns int
+	// The one place a finished turn is handled, so the guest branch can't be
+	// missed at any of the three sites below: an account persists via
+	// finishTurn, a guest only remembers.
+	finish := func(dbCtx, eventCtx context.Context, rec turnRecord) {
+		if !guest {
+			h.finishTurn(dbCtx, eventCtx, userID, rec, conn)
+			return
+		}
+		if !rec.ok {
+			return
+		}
+		// Keyed on the turn's own conversation, not the coordinator's current
+		// one: a turn that finishes after the guest has moved on belongs to
+		// the thread it was dispatched for.
+		if rec.conversation != guestConv {
+			guestConv = rec.conversation
+			guestHistory = nil
+		}
+		guestHistory = windowHistory(append(guestHistory,
+			historyTurn{Role: "user", Text: rec.userText},
+			historyTurn{Role: "assistant", Text: rec.assistantText}))
+	}
+
 	inbound := make(chan inboundMessage)
 	go func() {
 		defer close(inbound)
@@ -380,7 +558,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 			for {
 				select {
 				case rec := <-done:
-					h.finishTurn(context.Background(), ctx, userID, rec, conn)
+					finish(context.Background(), ctx, rec)
 				default:
 					return
 				}
@@ -404,7 +582,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				for outstanding > 0 {
 					select {
 					case rec := <-done:
-						h.finishTurn(ctx, ctx, userID, rec, conn)
+						finish(ctx, ctx, rec)
 						outstanding--
 					case <-ctx.Done():
 						outstanding = 0
@@ -437,6 +615,41 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				// the other.
 				conversationID := parsedConv.String()
 
+				// Before the supersede below, like the uuid check above: a
+				// frame rejected here must not have cancelled the turn it
+				// failed to replace. An account sending providers is the
+				// same kind of malformed frame — its services come from its
+				// own rows, never the client — rejected so a client bug
+				// fails loudly instead of being silently ignored.
+				var history []historyTurn
+				var providers []int
+				if guest {
+					if !validGuestProviders(msg.Providers) {
+						h.sendEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
+						continue
+					}
+					// Only a turn that can reach the model counts: with no
+					// services picked the agent answers from a template
+					// (agent/chat.py's NO_PROVIDERS_MESSAGE), and that nudge
+					// toward Connections must never turn into a sign-in wall.
+					// Counts attempts, not answers: a turn that fails before
+					// or at the model still spent a slot; a reload resets it.
+					if len(msg.Providers) > 0 {
+						if guestTurns >= h.guestTurnCap {
+							h.sendEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: guestTurnCapText})
+							continue
+						}
+						guestTurns++
+					}
+					providers = msg.Providers
+					if conversationID == guestConv {
+						history = guestHistory
+					}
+				} else if len(msg.Providers) > 0 {
+					h.sendEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
+					continue
+				}
+
 				// Captured immediately on receipt, before the load below —
 				// not after it returns. Reading this after the load would
 				// let a delete that lands while the load is still in flight
@@ -455,30 +668,34 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 					cancelCurrent()
 				}
 
-				// Loaded fresh on every message rather than cached: a
-				// per-connection history cache used to live here, but its
-				// invalidation rules were the source of most of this
-				// feature's bugs, for a database read cheap enough to just
-				// repeat.
-				loadCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
-				history, err := h.loadConversation(loadCtx, userID, conversationID)
-				cancel()
-				if err != nil {
-					// Logged, not fatal to the turn: loadConversation's own
-					// contract already treats "nothing saved yet" as a
-					// normal nil result, so a transient read failure
-					// degrades to an empty history window instead of
-					// blocking the turn — the next message on this
-					// conversation simply retries the load.
-					slog.ErrorContext(ctx, "conversation load failed", "error", dbError(err))
-					history = nil
+				if !guest {
+					// Loaded fresh on every message rather than cached: a
+					// per-connection history cache used to live here, but
+					// its invalidation rules were the source of most of
+					// this feature's bugs, for a database read cheap enough
+					// to just repeat. (guestHistory above is that cache's
+					// shape again, but with no database to fall out of sync
+					// with, none of those rules apply to it.)
+					loadCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
+					history, err = h.loadConversation(loadCtx, userID, conversationID)
+					cancel()
+					if err != nil {
+						// Logged, not fatal to the turn: loadConversation's
+						// own contract already treats "nothing saved yet"
+						// as a normal nil result, so a transient read
+						// failure degrades to an empty history window
+						// instead of blocking the turn — the next message
+						// on this conversation simply retries the load.
+						slog.ErrorContext(ctx, "conversation load failed", "error", dbError(err))
+						history = nil
+					}
 				}
 
 				turnCtx, cancel := context.WithTimeout(ctx, turnDeadline)
 				cancelCurrent = cancel
 				currentTurn = msg.Turn
 				outstanding++
-				go h.runTurn(turnCtx, ctx, conn, userID, msg.Turn, conversationID, msg.Text, history, deletionGen, done)
+				go h.runTurn(turnCtx, ctx, conn, userID, msg.Turn, conversationID, msg.Text, providers, history, deletionGen, done)
 			case "cancel":
 				if cancelCurrent != nil && currentTurn == msg.Turn {
 					cancelCurrent()
@@ -495,7 +712,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				cancelCurrent = nil
 				currentTurn = ""
 			}
-			h.finishTurn(ctx, ctx, userID, rec, conn)
+			finish(ctx, ctx, rec)
 		}
 	}
 }
@@ -633,6 +850,7 @@ func (h *Handler) runTurn(
 	connCtx context.Context,
 	conn *websocket.Conn,
 	userID, turnID, conversationID, text string,
+	guestProviders []int,
 	history []historyTurn,
 	deletionGen int,
 	done chan<- turnRecord,
@@ -657,7 +875,17 @@ func (h *Handler) runTurn(
 		}
 	}()
 
-	chatCtx, err := h.loadChatCtx(turnCtx, userID)
+	// A guest (userID == "", see "Guests" above) loads from the message, an
+	// account from its rows; both fail the turn the same way. These two
+	// branches are the only ones on userID in the turn — everything from
+	// callAgent down is identical.
+	var chatCtx chatContext
+	var err error
+	if userID == "" {
+		chatCtx, err = h.loadGuestChatCtx(turnCtx, guestProviders)
+	} else {
+		chatCtx, err = h.loadChatCtx(turnCtx, userID)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
@@ -683,8 +911,9 @@ func (h *Handler) runTurn(
 	// (agent/chat.py's stream_chat), so loading them is work whose result is
 	// unused - and a title_verdicts problem must not be the thing that stops a
 	// brand-new user, who has no verdicts anyway, from being told to pick some.
+	// A guest has no verdicts to load at all.
 	var verdicts []Verdict
-	if len(chatCtx.Providers) > 0 {
+	if userID != "" && len(chatCtx.Providers) > 0 {
 		verdicts, err = h.loadVerdicts(turnCtx, userID)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -897,6 +1126,28 @@ func parseProviderNames(raw []byte, wanted []int) []string {
 	return names
 }
 
+// cachedProviderNames resolves wanted ids to names from the country's cached
+// streaming_providers row — the one read both loadChatContext (inside its
+// transaction) and loadGuestChatContext (straight off the pool) share, so
+// the interface is what pgx.Tx and *pgxpool.Pool have in common. No cached
+// row yet (T15 populates it lazily on read) degrades to no names, never an
+// error: the interpreting line drops its "on …" clause, the turn goes on.
+func cachedProviderNames(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, country string, wanted []int) ([]string, error) {
+	var providersJSON []byte
+	err := q.QueryRow(ctx,
+		`select providers from streaming_providers where country = $1`, country).
+		Scan(&providersJSON)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return []string{}, nil
+	case err != nil:
+		return nil, err
+	}
+	return parseProviderNames(providersJSON, wanted), nil
+}
+
 // loadChatContext mirrors upsertUser's shape in main.go: a plain function
 // closed over the pool, run inside withUser so streaming_subscriptions' and
 // users' RLS policies apply. streaming_providers has no per-user policy (it's
@@ -928,19 +1179,11 @@ func loadChatContext(db *pgxpool.Pool) func(ctx context.Context, userID string) 
 				return err
 			}
 
-			var providersJSON []byte
-			err = tx.QueryRow(ctx,
-				`select providers from streaming_providers where country = $1`, cc.Region).
-				Scan(&providersJSON)
-			switch {
-			case errors.Is(err, pgx.ErrNoRows):
-				// No cached row for this country yet (T15 populates it lazily
-				// on read) — degrade the interpreting line, don't fail the turn.
-			case err != nil:
+			names, err := cachedProviderNames(ctx, tx, cc.Region, cc.Providers)
+			if err != nil {
 				return err
-			default:
-				cc.ProviderNames = parseProviderNames(providersJSON, cc.Providers)
 			}
+			cc.ProviderNames = names
 			return nil
 		})
 		return cc, err

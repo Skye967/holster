@@ -1,8 +1,10 @@
 import Link from "next/link"
 
-// Shown in place of the chat panel for a caller with zero subscriptions —
+// Shown in place of the chat panel for an *account* with zero subscriptions —
 // chat/layout.tsx's needsOnboarding check renders this for both the index
-// route and every conversation route before either page's own body runs.
+// route and every conversation route before either page's own body runs. A
+// guest never sees it: it has nothing to reload the picks from, so the nudge
+// belongs in the turn itself (agent/chat.py's NO_PROVIDERS_MESSAGE).
 export function MissingServicesNotice() {
   return (
     <div className="p-6">

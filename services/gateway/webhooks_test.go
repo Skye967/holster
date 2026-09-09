@@ -153,7 +153,7 @@ func newWebhookTestServer(t *testing.T,
 
 	h, err := newHandler(nil, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context(),
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,

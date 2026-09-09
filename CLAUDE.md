@@ -46,10 +46,15 @@ survivable.
   service, for any user. There is no encryption layer because there is nothing to
   encrypt — do not reintroduce one without reintroducing the thing it protects.
 - **`proxy.ts` is not an authorization boundary.** It only attaches auth state. Every
-  page, route handler, and server action that touches protected data calls
-  `await auth.protect()` itself. Do not reintroduce `createRouteMatcher` — it is
-  deprecated, and path matching can diverge from how Next routes requests, leaving
-  protected resources reachable.
+  page, route handler, and server action that touches user-scoped data calls
+  `await auth.protect()` itself, or branches on `auth()` and touches none of it on
+  the guest branch. Do not reintroduce `createRouteMatcher` — it is deprecated, and
+  path matching can diverge from how Next routes requests, leaving protected
+  resources reachable.
+- **A guest is a browser with no session, and the gateway is what keeps it honest.**
+  Guests get Connections (a cookie) and Chat (`/ws/chat?guest=1`, nothing persisted);
+  everything user-scoped is a sign-in prompt. The gateway's `/guest/` prefix and the
+  guest socket may never touch a user-scoped table — see `ARCHITECTURE.md`.
 
 ## Scope
 

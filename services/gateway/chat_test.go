@@ -353,7 +353,7 @@ func newChatTestServerWithConversations(
 
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		loadCtx, callAgent, t.Context(),
+		loadCtx, noopLoadGuestChatCtx, callAgent, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
 		loadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
@@ -406,18 +406,6 @@ func dialChat(t *testing.T, srv *httptest.Server, ticket string) *websocket.Conn
 	}
 	t.Cleanup(func() { conn.CloseNow() })
 	return conn
-}
-
-func TestChatTicketIsRequiredToOpenTheSocket(t *testing.T) {
-	srv, _ := newChatTestServer(t, noopChatCtx, noopAgentCaller, noopLoadVerdicts)
-	url := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ws/chat?ticket=bogus"
-	_, resp, err := websocket.Dial(t.Context(), url, nil)
-	if err == nil {
-		t.Fatal("connected with an invalid ticket")
-	}
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("status = %+v, want 401", resp)
-	}
 }
 
 func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
@@ -638,7 +626,7 @@ func TestRunTurnDoesNotBlockSendingToAnUnreadDoneChannel(t *testing.T) {
 
 	finished := make(chan struct{})
 	go func() {
-		h.runTurn(turnCtx, connCtx, nil, "user_1", "t1", testConversationID, "hi", nil, 0, done)
+		h.runTurn(turnCtx, connCtx, nil, "user_1", "t1", testConversationID, "hi", nil, nil, 0, done)
 		close(finished)
 	}()
 
@@ -1879,5 +1867,360 @@ func TestFinishTurnSkipsTheWebSocketSendOnceItsEventContextIsDone(t *testing.T) 
 	var ev outboundEvent
 	if err := wsjson.Read(readCtx, clientConn, &ev); err == nil {
 		t.Errorf("received an event despite an already-done event context: %+v", ev)
+	}
+}
+
+// --- guests (TASKS.md T27) ---------------------------------------------------
+
+// newGuestTestServer wires a full Handler where every user-scoped dependency
+// fails the test if it is ever called — that, not any single assertion, is
+// what proves a guest turn reaches its own loader and the agent and nothing
+// else.
+// opts tweak the handler before it starts serving — the guest turn cap is the
+// only one so far, set per handler rather than on a package var so these tests
+// stay independent of each other.
+func newGuestTestServer(t *testing.T, callAgent agentCaller, loadGuestChatCtx func(context.Context, []int) (chatContext, error), opts ...func(*Handler)) *httptest.Server {
+	t.Helper()
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(jwksJSON("kid_A", key))
+	}))
+	t.Cleanup(jwksSrv.Close)
+	jwks, err := keyfunc.NewDefaultCtx(t.Context(), []string{jwksSrv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	forbid := func(name string) {
+		t.Errorf("%s was called on a guest socket — guests must never touch a user-scoped table", name)
+	}
+	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
+		func(context.Context, string, string) error { forbid("ensureUser"); return nil },
+		func(context.Context, string) (chatContext, error) {
+			forbid("loadChatCtx")
+			return newChatContext(), nil
+		},
+		loadGuestChatCtx, callAgent, t.Context(),
+		func(context.Context, string) ([]Provider, error) {
+			forbid("loadProviders")
+			return nil, nil
+		},
+		noopSaveSubscription,
+		func(context.Context, string) ([]Verdict, error) { forbid("loadVerdicts"); return nil, nil },
+		noopSaveVerdict,
+		noopLoadWatchlistItems, noopCallAgentTitles,
+		func(context.Context, string, string) ([]historyTurn, error) {
+			forbid("loadConversation")
+			return nil, nil
+		},
+		noopLoadConversationTurns,
+		func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+			forbid("saveMessages")
+			return false, nil
+		},
+		noopLoadConversationSummaries, noopDeleteConversation,
+		testWebhookSecretBytes, noopDeleteUser, noopUpdateUserEmail,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	srv := httptest.NewServer(h.routes())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func dialGuest(t *testing.T, srv *httptest.Server) *websocket.Conn {
+	t.Helper()
+	url := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ws/chat?guest=1"
+	conn, _, err := websocket.Dial(t.Context(), url, nil)
+	if err != nil {
+		t.Fatalf("guest dial: %v", err)
+	}
+	t.Cleanup(func() { conn.CloseNow() })
+	return conn
+}
+
+// captureAgentRequests records what the agent was asked, in order, and
+// answers every turn with the given events followed by "done".
+func captureAgentRequests(reply ...agentEvent) (agentCaller, func() []agentChatRequest) {
+	var mu sync.Mutex
+	var got []agentChatRequest
+	caller := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		mu.Lock()
+		got = append(got, req)
+		mu.Unlock()
+		ch := make(chan agentEvent, len(reply)+1)
+		for _, ev := range reply {
+			ch <- ev
+		}
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	return caller, func() []agentChatRequest {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(got)
+	}
+}
+
+func readEvent(t *testing.T, conn *websocket.Conn) outboundEvent {
+	t.Helper()
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// sendAndDrain writes one message frame and reads events until the turn's
+// "done", returning them all.
+func sendAndDrain(t *testing.T, conn *websocket.Conn, msg inboundMessage) []outboundEvent {
+	t.Helper()
+	if err := wsjson.Write(t.Context(), conn, msg); err != nil {
+		t.Fatal(err)
+	}
+	var events []outboundEvent
+	for {
+		ev := readEvent(t, conn)
+		events = append(events, ev)
+		if ev.Type == "done" || ev.Type == "error" {
+			return events
+		}
+	}
+}
+
+func guestMessage(turn, text string, providers []int) inboundMessage {
+	return inboundMessage{Type: "message", Turn: turn, Text: text, Conversation: testConversationID, Providers: providers}
+}
+
+func TestGuestSocketTouchesNoUserTables(t *testing.T) {
+	callAgent, requests := captureAgentRequests()
+	loadGuest := func(_ context.Context, providers []int) (chatContext, error) {
+		return chatContext{Region: guestRegion, Providers: providers, ProviderNames: []string{"Netflix"}}, nil
+	}
+	srv := newGuestTestServer(t, callAgent, loadGuest)
+	conn := dialGuest(t, srv)
+
+	events := sendAndDrain(t, conn, guestMessage("t1", "a heist", []int{8}))
+	if last := events[len(events)-1]; last.Type != "done" {
+		t.Fatalf("events = %+v, want to end in done", events)
+	}
+
+	got := requests()
+	if len(got) != 1 {
+		t.Fatalf("agent called %d times, want 1", len(got))
+	}
+	if got[0].WatchRegion != guestRegion {
+		t.Errorf("WatchRegion = %q, want %q", got[0].WatchRegion, guestRegion)
+	}
+	if want := []int{8}; !slices.Equal(got[0].WatchProviders, want) {
+		t.Errorf("WatchProviders = %v, want %v", got[0].WatchProviders, want)
+	}
+	if want := []string{"Netflix"}; !slices.Equal(got[0].WatchProviderNames, want) {
+		t.Errorf("WatchProviderNames = %v, want %v", got[0].WatchProviderNames, want)
+	}
+	if len(got[0].Verdicts) != 0 {
+		t.Errorf("Verdicts = %v, want none for a guest", got[0].Verdicts)
+	}
+}
+
+// A guest's loader fails the turn the same way an account's does — no
+// special-case degrade path to keep in sync with runTurn's error handling.
+func TestGuestContextLoadFailureFailsTheTurn(t *testing.T) {
+	callAgent, requests := captureAgentRequests()
+	failing := func(context.Context, []int) (chatContext, error) { return chatContext{}, errUnauthorizedParty }
+	srv := newGuestTestServer(t, callAgent, failing)
+	conn := dialGuest(t, srv)
+
+	events := sendAndDrain(t, conn, guestMessage("t1", "a heist", []int{8}))
+	if len(events) != 1 || events[0].Type != "error" || events[0].Text != genericErrorText {
+		t.Errorf("events = %+v, want one generic error", events)
+	}
+	if n := len(requests()); n != 0 {
+		t.Errorf("agent called %d times after a failed context load, want 0", n)
+	}
+}
+
+// Ticket → account, ?guest=1 → guest, neither → 401. A bad ticket is a
+// rejection, never a downgrade; a missing one is never a guest by default.
+func TestChatSocketRefusesAnythingButATicketOrTheGuestFlag(t *testing.T) {
+	srv := newGuestTestServer(t, noopAgentCaller, noopLoadGuestChatCtx)
+	base := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ws/chat"
+	for name, query := range map[string]string{"no ticket, no flag": "", "bogus ticket": "?ticket=bogus", "wrong flag value": "?guest=yes"} {
+		_, resp, err := websocket.Dial(t.Context(), base+query, nil)
+		if err == nil {
+			t.Fatalf("%s: connected", name)
+		}
+		if resp == nil {
+			t.Errorf("%s: dial failed with no HTTP response: %v", name, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", name, resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("%s: content-type = %q, want application/json", name, ct)
+		}
+	}
+}
+
+func TestMintRefusesAnEmptyUserID(t *testing.T) {
+	s := newChatTicketStore()
+	if _, err := s.mint(""); !errors.Is(err, errNoUserID) {
+		t.Errorf("mint(\"\") error = %v, want errNoUserID", err)
+	}
+	if len(s.tickets) != 0 {
+		t.Error("a ticket was stored for an empty user id")
+	}
+}
+
+// The guest loader's own logic needs no database: with nothing picked it
+// never queries, so a nil pool proves that path stays offline. The shared
+// cached-row read is db_test.go's TestCachedProviderNames.
+func TestLoadGuestChatContextWithNothingPickedNeverQueries(t *testing.T) {
+	cc, err := loadGuestChatContext(nil)(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.Region != guestRegion || len(cc.Providers) != 0 || cc.ProviderNames == nil || len(cc.ProviderNames) != 0 {
+		t.Errorf("cc = %+v, want Region=%s, no providers, non-nil empty names", cc, guestRegion)
+	}
+}
+
+func TestAccountSocketRejectsAProvidersFrame(t *testing.T) {
+	var agentCalls atomic.Int32
+	callAgent := func(context.Context, agentChatRequest) (<-chan agentEvent, error) {
+		agentCalls.Add(1)
+		ch := make(chan agentEvent, 1)
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	events := sendAndDrain(t, conn, guestMessage("t1", "hi", []int{8}))
+	if len(events) != 1 || events[0].Type != "error" || events[0].Turn != "t1" {
+		t.Errorf("events = %+v, want one error for a providers frame on an account socket", events)
+	}
+	if n := agentCalls.Load(); n != 0 {
+		t.Errorf("agent called %d times, want 0", n)
+	}
+}
+
+func TestGuestHistoryIsPerConnection(t *testing.T) {
+	// A "message"-type agent event is what makes a turn worth remembering
+	// (rec.ok) — "done" alone records nothing, exactly as for an account.
+	callAgent, requests := captureAgentRequests(agentEvent{Type: "message", Text: "a reply"})
+	srv := newGuestTestServer(t, callAgent, noopLoadGuestChatCtx)
+
+	first := dialGuest(t, srv)
+	sendAndDrain(t, first, guestMessage("one", "one", []int{8}))
+	sendAndDrain(t, first, guestMessage("two", "two", []int{8}))
+
+	second := dialGuest(t, srv)
+	sendAndDrain(t, second, guestMessage("three", "three", []int{8}))
+
+	got := requests()
+	if len(got) != 3 {
+		t.Fatalf("agent called %d times, want 3", len(got))
+	}
+	if len(got[0].History) != 0 {
+		t.Errorf("first turn history = %+v, want empty", got[0].History)
+	}
+	want := []historyTurn{{Role: "user", Text: "one"}, {Role: "assistant", Text: "a reply"}}
+	if !slices.Equal(got[1].History, want) {
+		t.Errorf("second turn history = %+v, want %+v", got[1].History, want)
+	}
+	if len(got[2].History) != 0 {
+		t.Errorf("a second socket naming the same conversation saw history %+v — guest history leaked across connections", got[2].History)
+	}
+}
+
+// One guest socket holds one conversation's history, not a map keyed by the
+// client's conversation id — that id is chosen by the browser, so a map has
+// no bound on its key count. Switching threads drops the old one, which is
+// also what the panel does: it is keyed by conversation id and remounts
+// empty, so the model never answers from turns the guest can no longer see.
+func TestGuestHistoryFollowsOnlyTheCurrentConversation(t *testing.T) {
+	callAgent, requests := captureAgentRequests(agentEvent{Type: "message", Text: "a reply"})
+	srv := newGuestTestServer(t, callAgent, noopLoadGuestChatCtx)
+	conn := dialGuest(t, srv)
+
+	other := inboundMessage{
+		Type: "message", Turn: "two", Text: "two",
+		Conversation: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", Providers: []int{8},
+	}
+	sendAndDrain(t, conn, guestMessage("one", "one", []int{8}))
+	sendAndDrain(t, conn, other)
+	sendAndDrain(t, conn, guestMessage("three", "three", []int{8}))
+
+	got := requests()
+	if len(got) != 3 {
+		t.Fatalf("agent called %d times, want 3", len(got))
+	}
+	if len(got[1].History) != 0 {
+		t.Errorf("a different conversation saw history %+v, want empty", got[1].History)
+	}
+	if len(got[2].History) != 0 {
+		t.Errorf("returning to the first conversation saw history %+v — a guest's dropped thread came back", got[2].History)
+	}
+}
+
+func TestGuestTurnCapCountsOnlyTurnsThatReachTheModel(t *testing.T) {
+	callAgent, requests := captureAgentRequests()
+	srv := newGuestTestServer(t, callAgent, noopLoadGuestChatCtx,
+		func(h *Handler) { h.guestTurnCap = 2 })
+	conn := dialGuest(t, srv)
+
+	// Nothing picked: the agent's canned nudge, never a turn against the cap
+	// — three of these must not consume a single slot.
+	for _, turn := range []string{"n1", "n2", "n3"} {
+		if events := sendAndDrain(t, conn, guestMessage(turn, "hi", nil)); events[len(events)-1].Type != "done" {
+			t.Fatalf("turn %s with no providers: events = %+v, want done", turn, events)
+		}
+	}
+	for _, turn := range []string{"t1", "t2"} {
+		if events := sendAndDrain(t, conn, guestMessage(turn, "hi", []int{8})); events[len(events)-1].Type != "done" {
+			t.Fatalf("turn %s: events = %+v, want done", turn, events)
+		}
+	}
+	events := sendAndDrain(t, conn, guestMessage("t3", "hi", []int{8}))
+	if len(events) != 1 || events[0].Type != "error" || events[0].Turn != "t3" || events[0].Text != guestTurnCapText {
+		t.Errorf("capped turn events = %+v, want one error with guestTurnCapText", events)
+	}
+	if n := len(requests()); n != 5 {
+		t.Errorf("agent called %d times, want 5 — the capped turn must never reach it", n)
+	}
+}
+
+func TestGuestRejectsAMalformedProvidersList(t *testing.T) {
+	callAgent, requests := captureAgentRequests()
+	srv := newGuestTestServer(t, callAgent, noopLoadGuestChatCtx)
+	conn := dialGuest(t, srv)
+
+	tooMany := make([]int, maxGuestProviders+1)
+	for i := range tooMany {
+		tooMany[i] = i + 1
+	}
+	for name, providers := range map[string][]int{
+		"non-positive": {8, 0},
+		"duplicate":    {8, 15, 8},
+		"too many":     tooMany,
+		// The ceiling web/src/lib/guest.ts mirrors: a cookie parser that
+		// accepted 1e21 as an integer could otherwise put one on the wire.
+		"above the id ceiling": {8, maxProviderID + 1},
+	} {
+		events := sendAndDrain(t, conn, guestMessage(name, "hi", providers))
+		if len(events) != 1 || events[0].Type != "error" || events[0].Turn != name {
+			t.Errorf("%s: events = %+v, want one error", name, events)
+		}
+	}
+	if n := len(requests()); n != 0 {
+		t.Errorf("agent called %d times for malformed frames, want 0", n)
 	}
 }

@@ -3,13 +3,26 @@
 import { useAuth } from "@clerk/nextjs"
 import { Search } from "lucide-react"
 import Image from "next/image"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { useRowStatus } from "@/hooks/use-row-status"
 import { gatewayErrorText, gatewayFetch } from "@/lib/gateway"
+import { MAX_GUEST_PROVIDERS } from "@/lib/guest"
+import { setGuestProvider } from "@/lib/guest-actions"
+import { setSubscription } from "@/lib/subscriptions"
+
+const GUEST_CAP_TEXT = `Guests can pick up to ${MAX_GUEST_PROVIDERS} services — sign in to add more`
+
+// setGuestProvider reports a refusal as a value, not a throw, so this carries
+// it into the shared catch below where every other write failure is handled.
+class GuestWriteError extends Error {
+  constructor(readonly reason: string) {
+    super(reason)
+  }
+}
 
 // Always-visible providers, picked by hand rather than TMDB's display_priority
 // — that ranking surfaces channel add-ons and split paid tiers (Paramount+ and
@@ -55,8 +68,23 @@ function defaultProviders(
   return [...defaults, ...extras]
 }
 
-export function StreamingPicker() {
+// guestProviders is null for an account (picks live in
+// streaming_subscriptions) and the cookie's ids for a guest (lib/guest.ts),
+// as the server read them — the same shape ChatSessionProvider takes.
+export function StreamingPicker({
+  guestProviders,
+}: {
+  guestProviders: number[] | null
+}) {
   const { getToken, isLoaded } = useAuth()
+  const guest = guestProviders !== null
+  // Read once, when the catalog lands, to seed each row's switch. A ref rather
+  // than the prop directly because setGuestProvider revalidates this layout on
+  // every toggle: as a dependency of the load effect below, the fresh prop
+  // would refetch the catalog and rebuild the list under an in-flight toggle.
+  // Never written — the cookie is the source of truth for a guest's picks, and
+  // it is maintained server-side.
+  const initialGuestIds = useRef(guestProviders)
   const [providers, setProviders] = useState<ProviderEntry[] | null>(null)
   const [loadError, setLoadError] = useState(false)
   const [search, setSearch] = useState("")
@@ -70,16 +98,42 @@ export function StreamingPicker() {
     setFailure,
   } = useRowStatus<number>()
 
+  // A guest needs nothing from Clerk — waiting on its script here would make
+  // "no account needed" depend on that script loading. Derived rather than
+  // tested in the body: isLoaded still flips false->true underneath a guest,
+  // and as a dependency that re-ran the load, refetching the catalog and
+  // rebuilding the list out from under an in-flight toggle.
+  const ready = guest || isLoaded
+
+  // Only used for the cap message below, so the rendered rows are close enough
+  // — the cookie, not this, is what the cap is actually enforced against.
+  const subscribedCount =
+    providers?.reduce((n, p) => (p.subscribed ? n + 1 : n), 0) ?? 0
+
   useEffect(() => {
-    if (!isLoaded) return
+    if (!ready) return
     let cancelled = false
 
     async function load() {
       try {
-        const res = await gatewayFetch("/api/providers", {}, getToken)
+        // /guest/providers carries no subscribed flag — the browser is the
+        // only thing that knows a guest's picks, so it merges them here.
+        const res = guest
+          ? await gatewayFetch("/guest/providers", {}, null)
+          : await gatewayFetch("/api/providers", {}, getToken)
         if (!res.ok) throw new Error(`status ${res.status}`)
         const data: ProviderEntry[] = await res.json()
-        if (!cancelled) setProviders(data)
+        if (cancelled) return
+        setProviders(
+          guest
+            ? data.map((p) => ({
+                ...p,
+                subscribed: (initialGuestIds.current ?? []).includes(
+                  p.provider_id,
+                ),
+              }))
+            : data,
+        )
       } catch {
         if (!cancelled) setLoadError(true)
       }
@@ -89,7 +143,7 @@ export function StreamingPicker() {
     return () => {
       cancelled = true
     }
-  }, [isLoaded, getToken])
+  }, [ready, getToken, guest])
 
   const toggle = useCallback(
     async (providerId: number, subscribed: boolean) => {
@@ -97,6 +151,14 @@ export function StreamingPicker() {
       // a previous failed attempt on this row — set before the optimistic
       // update / first await so a second click is already disabled by the
       // time React re-renders.
+      // Refused up front so the switch never flips on only to bounce back.
+      // Counted from the rendered rows, which can lag a write still in flight;
+      // that only costs a redundant round trip, since setGuestProvider enforces
+      // the same cap server-side and its "cap" result lands on the same copy.
+      if (guest && subscribed && subscribedCount >= MAX_GUEST_PROVIDERS) {
+        setFailure(providerId, GUEST_CAP_TEXT)
+        return
+      }
       setPending(providerId)
       // Optimistic: flip immediately, revert with an inline message if the
       // write fails (TASKS.md's cross-cutting rule — never show a status code).
@@ -108,12 +170,16 @@ export function StreamingPicker() {
       )
 
       try {
-        const res = await gatewayFetch(
-          `/api/subscriptions/${providerId}`,
-          { method: subscribed ? "PUT" : "DELETE" },
-          getToken,
-        )
-        if (!res.ok) throw new Error(`status ${res.status}`)
+        if (guest) {
+          // A Server Function can fail like a fetch, so it gets the same
+          // optimistic-then-revert treatment as the account path. One provider
+          // per call: the cookie is read and rewritten server-side, so nothing
+          // here holds a set that could go stale against it.
+          const result = await setGuestProvider(providerId, subscribed)
+          if (!result.ok) throw new GuestWriteError(result.reason)
+        } else {
+          await setSubscription(getToken, providerId, subscribed)
+        }
         setSuccess(providerId)
       } catch (err) {
         setProviders(
@@ -126,11 +192,13 @@ export function StreamingPicker() {
         )
         setFailure(
           providerId,
-          gatewayErrorText(err, "Couldn't save that — try again"),
+          err instanceof GuestWriteError && err.reason === "cap"
+            ? GUEST_CAP_TEXT
+            : gatewayErrorText(err, "Couldn't save that — try again"),
         )
       }
     },
-    [getToken, setPending, setSuccess, setFailure],
+    [getToken, guest, subscribedCount, setPending, setSuccess, setFailure],
   )
 
   if (loadError) {

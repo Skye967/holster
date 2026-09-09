@@ -2,6 +2,8 @@
 
 import { useAuth } from "@clerk/nextjs"
 import { Send } from "lucide-react"
+import Link from "next/link"
+import { usePathname, useRouter } from "next/navigation"
 import { useCallback, useEffect, useRef, useState } from "react"
 
 import { useChatSession } from "@/components/chat/chat-session-provider"
@@ -17,6 +19,7 @@ import {
   gatewayFetch,
   withTimeout,
 } from "@/lib/gateway"
+import { signInHref } from "@/lib/guest"
 import {
   VERDICT_LOCKED_TEXT,
   VERDICT_STALE_TEXT,
@@ -178,6 +181,10 @@ function TurnView({
 
 export function ChatPanel({ conversationId }: { conversationId: string }) {
   const { getToken, isLoaded } = useAuth()
+  const { send, setListener, clearListener, guest, guestContextLost } =
+    useChatSession()
+  const router = useRouter()
+  const pathname = usePathname()
   const [turns, setTurns] = useState<Turn[]>([])
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null)
   const [inputValue, setInputValue] = useState("")
@@ -212,8 +219,10 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
   // "not yet touched," so this tracks touches explicitly.
   const touchedVerdictsRef = useRef<Set<string>>(new Set())
 
+  // Both hydration effects skip a guest: it has no verdicts and nothing
+  // persisted to reload, and either fetch would just 401 at the gateway.
   useEffect(() => {
-    if (!isLoaded) return
+    if (!isLoaded || guest) return
     let cancelled = false
     fetchVerdicts(getToken)
       .then((entries) => {
@@ -234,7 +243,7 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
     return () => {
       cancelled = true
     }
-  }, [isLoaded, getToken])
+  }, [isLoaded, getToken, guest])
 
   // Rehydrates conversationId's last exchanges on mount, so a page reload
   // keeps the conversation (TASKS.md T20). A switch to a different
@@ -245,7 +254,7 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
   // picks/interpreting on a rehydrated turn — only text is persisted, so
   // it renders as chat-panel.tsx's plain tokenText case.
   useEffect(() => {
-    if (!isLoaded) return
+    if (!isLoaded || guest) return
     let cancelled = false
     fetchChatHistory(getToken, conversationId)
       .then((history) => {
@@ -267,7 +276,7 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
     return () => {
       cancelled = true
     }
-  }, [isLoaded, getToken, conversationId])
+  }, [isLoaded, getToken, conversationId, guest])
 
   // Shared by setVerdict/clearVerdict: optimistic update, then the write,
   // reverting on failure — streaming-picker.tsx's toggle() pattern (TASKS.md's
@@ -295,6 +304,13 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
         throw new Error(
           "writeVerdict: expectedVerdict is required to clear a verdict",
         )
+      }
+      // The card's save/rate icons stay visible for a guest — they're the
+      // reason to sign in — and a tap goes to sign-in and back here, rather
+      // than a disabled control with a tooltip nobody can hover on a phone.
+      if (guest) {
+        router.push(signInHref(pathname))
+        return
       }
       const key = verdictKey(tmdbId, mediaType)
       touchedVerdictsRef.current.add(key)
@@ -377,7 +393,15 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
         )
       }
     },
-    [getToken, setVerdictPending, setVerdictSuccess, setVerdictFailure],
+    [
+      getToken,
+      guest,
+      router,
+      pathname,
+      setVerdictPending,
+      setVerdictSuccess,
+      setVerdictFailure,
+    ],
   )
 
   const handleSetVerdict = useCallback(
@@ -420,8 +444,6 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
     [handleEvent],
   )
 
-  const { send, setListener, clearListener } = useChatSession()
-
   // Registers this mounted panel as the shared socket's current listener —
   // ChatSessionProvider forwards every event/disconnect to whichever
   // ChatPanel last called this, which is always the one for the
@@ -462,6 +484,41 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
 
   const disabled = activeTurnId !== null
 
+  // One line, not a banner or a modal: the only thing a guest gives up in
+  // chat is persistence, and this says so where the input is.
+  //
+  // After a drop it says the sharper version of the same thing. The turns
+  // above are still on screen but nothing holds them any more, so a follow-up
+  // like "more like the second one" would be answered blind — better to say
+  // so than to let the model appear to have forgotten.
+  const guestNotice = guest && (
+    <p className="mt-2 text-xs text-muted-foreground">
+      {guestContextLost ? (
+        <>
+          Disconnected — I&apos;ve lost track of this chat so far.{" "}
+          <Link
+            href={signInHref(pathname)}
+            className="text-primary underline underline-offset-4"
+          >
+            Sign in
+          </Link>{" "}
+          to save future chats.
+        </>
+      ) : (
+        <>
+          Chats aren&apos;t saved until you{" "}
+          <Link
+            href={signInHref(pathname)}
+            className="text-primary underline underline-offset-4"
+          >
+            sign in
+          </Link>
+          .
+        </>
+      )}
+    </p>
+  )
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       {/* sr-only: the empty-state and populated layouts below are visually
@@ -478,6 +535,7 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
               disabled={disabled}
               autoFocus
             />
+            {guestNotice}
           </div>
         </div>
       ) : (
@@ -504,6 +562,7 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
               onSubmit={handleSubmit}
               disabled={disabled}
             />
+            {guestNotice}
           </div>
         </>
       )}

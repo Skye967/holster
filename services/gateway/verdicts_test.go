@@ -36,7 +36,7 @@ func newVerdictsTestServer(t *testing.T,
 
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context(),
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
 		loadVerdicts, saveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,

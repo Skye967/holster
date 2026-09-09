@@ -1,9 +1,9 @@
-import { auth } from "@clerk/nextjs/server"
 import { redirect } from "next/navigation"
 
+import { getSession } from "@/lib/session"
 import { needsOnboarding } from "@/lib/subscriptions"
 
 export default async function Home() {
-  const { getToken } = await auth.protect()
-  redirect((await needsOnboarding(getToken)) ? "/onboarding" : "/chat")
+  const session = await getSession()
+  redirect((await needsOnboarding(session)) ? "/onboarding" : "/chat")
 }

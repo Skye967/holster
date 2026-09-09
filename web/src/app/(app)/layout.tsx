@@ -1,4 +1,3 @@
-import { auth } from "@clerk/nextjs/server"
 import { cookies } from "next/headers"
 
 import { AppSidebar } from "@/components/app-sidebar"
@@ -7,9 +6,13 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar"
+import { getSession } from "@/lib/session"
 
+// Guest-visible by default, on purpose: the shell touches no user data, and
+// each page that reads user-scoped data decides for itself. The gateway is the
+// boundary. Why: DECISIONS.md "Optional sign-in".
 export default async function AppLayout({ children }: LayoutProps<"/">) {
-  await auth.protect()
+  const { userId } = await getSession()
 
   // SidebarProvider writes this cookie on toggle — read it back so a collapsed
   // sidebar survives a reload.
@@ -18,7 +21,7 @@ export default async function AppLayout({ children }: LayoutProps<"/">) {
 
   return (
     <SidebarProvider defaultOpen={defaultOpen}>
-      <AppSidebar />
+      <AppSidebar guest={!userId} />
       <SidebarInset>
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger />

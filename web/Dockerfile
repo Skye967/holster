@@ -32,11 +32,11 @@ RUN [ -n "$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY" ] || (echo "NEXT_PUBLIC_CLERK_PUBL
 RUN [ -n "$NEXT_PUBLIC_GATEWAY_URL" ] || (echo "NEXT_PUBLIC_GATEWAY_URL not set" >&2 && exit 1)
 
 # Clerk's own custom-page routing — same values as ../.env.example. Defaulted
-# since they're static app routes, not deployment-specific config.
+# since they're static app routes, not deployment-specific config. Where a
+# sign-in lands is no longer one of these: both components set
+# fallbackRedirectUrl to /signed-in in code (app/signed-in/route.ts).
 ARG NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
 ARG NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
-ARG NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/
-ARG NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/
 
 RUN bun run build
 

@@ -4,7 +4,7 @@
 // the only way the connection gets authenticated (services/gateway/chat.go).
 
 import { useAuth } from "@clerk/nextjs"
-import { useCallback, useEffect, useRef } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import {
   GATEWAY_CALL_TIMEOUT_MS,
@@ -64,10 +64,12 @@ export type ChatEvent =
   | { type: "done"; turn: string }
   | { type: "conversation_created"; turn: string }
 
-function wsURL(ticket: string): string {
+// A ticket opens an account socket; `guest=1` opens a guest one
+// (services/gateway/chat.go's "Guests"); the gateway refuses anything else.
+function wsURL(query: string): string {
   const base = process.env.NEXT_PUBLIC_GATEWAY_URL
   if (!base) throw new Error("NEXT_PUBLIC_GATEWAY_URL is not set")
-  return `${base.replace(/^http/, "ws")}/ws/chat?ticket=${encodeURIComponent(ticket)}`
+  return `${base.replace(/^http/, "ws")}/ws/chat?${query}`
 }
 
 async function mintTicket(getToken: GetToken): Promise<string> {
@@ -93,15 +95,23 @@ const UNREACHABLE_TEXT = "Can't reach the server right now — try again"
 // so it gets its own constant rather than borrowing that one's semantics.
 const SOCKET_OPEN_TIMEOUT_MS = 10000
 
-async function connect(getToken: GetToken): Promise<ConnectResult> {
-  let ticket: string
-  try {
-    ticket = await mintTicket(getToken)
-  } catch (err) {
-    return { error: gatewayErrorText(err, UNREACHABLE_TEXT) }
+// guest is decided by the server (chat/layout.tsx's auth()) and passed down —
+// never inferred here from a failed ticket mint, which must stay a visible
+// error for an account rather than a silent downgrade to a guest socket.
+async function connect(
+  getToken: GetToken,
+  guest: boolean,
+): Promise<ConnectResult> {
+  let query = "guest=1"
+  if (!guest) {
+    try {
+      query = `ticket=${encodeURIComponent(await mintTicket(getToken))}`
+    } catch (err) {
+      return { error: gatewayErrorText(err, UNREACHABLE_TEXT) }
+    }
   }
 
-  const socket = new WebSocket(wsURL(ticket))
+  const socket = new WebSocket(wsURL(query))
   const opened = await new Promise<boolean>((resolve) => {
     // Without this, a connection attempt the browser silently black-holes
     // (TCP succeeds, the WS upgrade never completes) leaves this promise —
@@ -139,23 +149,38 @@ async function connect(getToken: GetToken): Promise<ConnectResult> {
 // mirrors gateway.ts's own reasoning for an expired auth token ("an idle
 // tab's next request can hit a 401 that isn't a real error"), applied to an
 // idle tab's socket instead.
+//
+// guestProviders is null for an account and the guest's ticked services
+// otherwise — sent on every message frame, since a guest has no rows for
+// the gateway to load (services/gateway/chat.go's inboundMessage).
 export function useChatSocket(
   onEvent: (ev: ChatEvent) => void,
   onDisconnect: (text: string) => void,
+  guestProviders: number[] | null,
 ) {
   const { getToken, isLoaded } = useAuth()
+  const guest = guestProviders !== null
   const socketRef = useRef<WebSocket | null>(null)
   const connectingRef = useRef<Promise<ConnectResult> | null>(null)
+  // A ref, like onEventRef below, so a re-rendered provider with a fresh
+  // array doesn't rebuild send() and reconnect the socket.
+  const guestProvidersRef = useRef(guestProviders)
   // A plain effect-local `cancelled` flag (streaming-picker.tsx's pattern)
   // doesn't reach here: the async continuation that needs to check it lives
   // inside connect()'s .then(), shared across the mount effect and any
   // later send() call via connectingRef — not owned by one effect run.
   const cancelledRef = useRef(false)
+  // Set by the close listener the moment a guest's socket drops, which is
+  // when the history is actually gone — not on the next connect, which only
+  // happens inside send() and so would land after the follow-up it needs to
+  // warn about. Cleared by send(), whose turn starts the new thread.
+  const [guestContextLost, setGuestContextLost] = useState(false)
   const onEventRef = useRef(onEvent)
   const onDisconnectRef = useRef(onDisconnect)
   useEffect(() => {
     onEventRef.current = onEvent
     onDisconnectRef.current = onDisconnect
+    guestProvidersRef.current = guestProviders
   })
 
   const ensureSocket = useCallback((): Promise<ConnectResult> => {
@@ -164,7 +189,7 @@ export function useChatSocket(
       return Promise.resolve({ socket: current })
     }
     if (!connectingRef.current) {
-      connectingRef.current = connect(getToken).then((result) => {
+      connectingRef.current = connect(getToken, guest).then((result) => {
         connectingRef.current = null
         if (cancelledRef.current) {
           if ("socket" in result) result.socket.close()
@@ -192,6 +217,11 @@ export function useChatSocket(
             // branch never runs for that case.
             if (socketRef.current === socket) {
               socketRef.current = null
+              // A guest's thread lives only on the socket that carried it, so
+              // it is gone as of now — say so before the guest types a
+              // follow-up the replacement socket would answer blind. The
+              // panel still shows the turns on screen.
+              if (guest) setGuestContextLost(true)
               onDisconnectRef.current(UNREACHABLE_TEXT)
             }
           })
@@ -200,10 +230,18 @@ export function useChatSocket(
       })
     }
     return connectingRef.current
-  }, [getToken])
+  }, [getToken, guest])
+
+  // A guest needs nothing from Clerk — waiting on its script here would make
+  // "no account needed" depend on that script loading. Derived rather than
+  // testing isLoaded in the body: isLoaded still flips false->true underneath
+  // a guest, and as a dependency that re-ran this effect, closing the open
+  // socket and dialling a second one. The close is our own, so the listener
+  // below stays silent and an in-flight turn would never be failed.
+  const ready = guest || isLoaded
 
   useEffect(() => {
-    if (!isLoaded) return
+    if (!ready) return
     cancelledRef.current = false
     ensureSocket()
     return () => {
@@ -211,7 +249,7 @@ export function useChatSocket(
       socketRef.current?.close()
       socketRef.current = null
     }
-  }, [isLoaded, ensureSocket])
+  }, [ready, ensureSocket])
 
   const send = useCallback(
     (text: string, conversationId: string): string => {
@@ -221,12 +259,20 @@ export function useChatSocket(
           onEventRef.current({ type: "error", turn, text: result.error })
           return
         }
+        // Cleared here, not at call time: a reconnect that failed leaves the
+        // history just as lost, so the warning must outlive a failed send.
+        setGuestContextLost(false)
+        // providers only on a guest frame: the gateway rejects it on an
+        // account socket as malformed, since an account's services come
+        // from its own rows, never the client.
+        const providers = guestProvidersRef.current
         result.socket.send(
           JSON.stringify({
             type: "message",
             turn,
             text,
             conversation: conversationId,
+            ...(providers !== null && { providers }),
           }),
         )
       })
@@ -235,5 +281,5 @@ export function useChatSocket(
     [ensureSocket],
   )
 
-  return { send }
+  return { send, guestContextLost }
 }

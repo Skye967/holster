@@ -1,7 +1,15 @@
 "use client"
 
 import { useAuth } from "@clerk/nextjs"
-import { Bookmark, MessageSquare, Plug, Plus, Trash2 } from "lucide-react"
+import {
+  Bookmark,
+  Info,
+  LogIn,
+  MessageSquare,
+  Plug,
+  Plus,
+  Trash2,
+} from "lucide-react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { useCallback, useEffect, useRef, useState } from "react"
@@ -28,6 +36,7 @@ import {
   fetchConversations,
   type ConversationSummary,
 } from "@/lib/conversations"
+import { signInHref } from "@/lib/guest"
 
 const nav = [
   { title: "Chat", href: "/chat", icon: MessageSquare },
@@ -39,7 +48,9 @@ const nav = [
 // chat" action, and per-row delete. Kept local to the sidebar rather than a
 // shared context: nothing else in the tree needs this list, only the one
 // cross-subtree signal a completed turn sends (CONVERSATIONS_CHANGED_EVENT).
-function ConversationsGroup() {
+// A guest keeps the header and "New chat" — the one way to reset context —
+// but has no list to load, since nothing is persisted for it.
+function ConversationsGroup({ guest }: { guest: boolean }) {
   const { getToken, isLoaded } = useAuth()
   const pathname = usePathname()
   const router = useRouter()
@@ -62,7 +73,7 @@ function ConversationsGroup() {
   const requestSeqRef = useRef(0)
 
   const refresh = useCallback(() => {
-    if (!isLoaded) return
+    if (guest || !isLoaded) return
     const seq = ++requestSeqRef.current
     fetchConversations(getToken)
       .then((data) => {
@@ -71,7 +82,7 @@ function ConversationsGroup() {
       .catch(() => {
         // Best-effort: the sidebar just keeps showing whatever it last had.
       })
-  }, [isLoaded, getToken])
+  }, [guest, isLoaded, getToken])
 
   useEffect(() => {
     refresh()
@@ -113,38 +124,84 @@ function ConversationsGroup() {
       >
         <Plus />
       </SidebarGroupAction>
-      <SidebarMenu>
-        {conversations?.map((c) => (
-          <SidebarMenuItem key={c.id}>
-            <SidebarMenuButton
-              isActive={pathname === `/chat/${c.id}`}
-              render={
-                <Link href={`/chat/${c.id}`}>
-                  <span className="truncate">{c.title}</span>
-                </Link>
-              }
-            />
-            <SidebarMenuAction
-              showOnHover
-              aria-label={`Delete "${c.title}"`}
-              disabled={deleteStatus[c.id]?.pending}
-              onClick={() => handleDelete(c.id)}
-            >
-              <Trash2 />
-            </SidebarMenuAction>
-            {deleteStatus[c.id]?.error && (
-              <p className="px-2 pt-1 text-xs text-destructive">
-                {deleteStatus[c.id]?.error}
-              </p>
-            )}
-          </SidebarMenuItem>
-        ))}
-      </SidebarMenu>
+      {guest ? (
+        <p className="px-2 text-xs text-muted-foreground">
+          <Link
+            href={signInHref(pathname)}
+            className="text-primary underline underline-offset-4"
+          >
+            Sign in
+          </Link>{" "}
+          to save future chats.
+        </p>
+      ) : (
+        <SidebarMenu>
+          {conversations?.map((c) => (
+            <SidebarMenuItem key={c.id}>
+              <SidebarMenuButton
+                isActive={pathname === `/chat/${c.id}`}
+                render={
+                  <Link href={`/chat/${c.id}`}>
+                    <span className="truncate">{c.title}</span>
+                  </Link>
+                }
+              />
+              <SidebarMenuAction
+                showOnHover
+                aria-label={`Delete "${c.title}"`}
+                disabled={deleteStatus[c.id]?.pending}
+                onClick={() => handleDelete(c.id)}
+              >
+                <Trash2 />
+              </SidebarMenuAction>
+              {deleteStatus[c.id]?.error && (
+                <p className="px-2 pt-1 text-xs text-destructive">
+                  {deleteStatus[c.id]?.error}
+                </p>
+              )}
+            </SidebarMenuItem>
+          ))}
+        </SidebarMenu>
+      )}
     </SidebarGroup>
   )
 }
 
-export function AppSidebar() {
+// Credits stays reachable for a guest: TMDB and JustWatch attribution is a
+// shipping requirement (CLAUDE.md), not something behind the user menu.
+function GuestMenu() {
+  const pathname = usePathname()
+
+  return (
+    <SidebarMenu>
+      <SidebarMenuItem>
+        <SidebarMenuButton
+          size="lg"
+          render={
+            <Link href={signInHref(pathname)}>
+              <LogIn />
+              <span>Sign in</span>
+            </Link>
+          }
+        />
+      </SidebarMenuItem>
+      <SidebarMenuItem>
+        <SidebarMenuButton
+          render={
+            <Link href="/credits">
+              <Info />
+              <span>Credits</span>
+            </Link>
+          }
+        />
+      </SidebarMenuItem>
+    </SidebarMenu>
+  )
+}
+
+// guest comes from the server layout's auth(), not Clerk's client state, so
+// the shell renders in the right mode on the first paint with no flicker.
+export function AppSidebar({ guest }: { guest: boolean }) {
   const pathname = usePathname()
 
   return (
@@ -166,7 +223,22 @@ export function AppSidebar() {
                       pathname.startsWith(`${item.href}/`)
                     }
                     render={
-                      <Link href={item.href}>
+                      // A guest's thread lives only on the open socket, so
+                      // sending them to /chat — which mints a fresh id — would
+                      // discard it with no warning. Pointing the item at the
+                      // conversation they are already in makes the click the
+                      // no-op it looks like; "New chat" above is the explicit
+                      // reset. An account resumes its last conversation from
+                      // the database, so it needs none of this.
+                      <Link
+                        href={
+                          guest &&
+                          item.href === "/chat" &&
+                          pathname.startsWith("/chat/")
+                            ? pathname
+                            : item.href
+                        }
+                      >
                         <item.icon />
                         <span>{item.title}</span>
                       </Link>
@@ -177,11 +249,9 @@ export function AppSidebar() {
             </SidebarMenu>
           </nav>
         </SidebarGroup>
-        <ConversationsGroup />
+        <ConversationsGroup guest={guest} />
       </SidebarContent>
-      <SidebarFooter>
-        <UserMenu />
-      </SidebarFooter>
+      <SidebarFooter>{guest ? <GuestMenu /> : <UserMenu />}</SidebarFooter>
     </Sidebar>
   )
 }

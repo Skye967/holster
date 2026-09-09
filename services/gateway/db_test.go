@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -469,6 +470,82 @@ func TestLoadProvidersDegradesToEmptyWithNoCacheAndFailingRefresh(t *testing.T) 
 	}
 	if len(got) != 0 {
 		t.Errorf("got = %+v, want empty", got)
+	}
+}
+
+// Refreshes are single-flighted, so one fetch serves every concurrent caller —
+// which means it must not be tied to whichever request happened to start it.
+// GET /guest/providers put this path in front of signed-out browsers, where a
+// leader closing its tab mid-refresh is ordinary: if that cancelled the flight,
+// every follower would be handed the leader's context.Canceled and degrade to
+// an empty catalog, and the cache row would never be written, so the next wave
+// would repeat it.
+func TestLoadProvidersRefreshSurvivesTheLeaderGoingAway(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const country = "XZ"
+	clear := func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool.Exec(c, `delete from streaming_providers where country = $1`, country)
+	}
+	t.Cleanup(clear)
+	clear()
+
+	var refreshCalls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	fresh := []Provider{{ProviderID: 8, ProviderName: "Netflix", DisplayPriority: 1}}
+	load := loadProviders(pool, func(context.Context, string) ([]Provider, error) {
+		if refreshCalls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return fresh, nil
+	})
+
+	// The leader, on a context that is cancelled while its refresh is in flight.
+	leaderCtx, cancelLeader := context.WithCancel(ctx)
+	go func() {
+		load(leaderCtx, country) //nolint:errcheck // the follower is what's asserted
+	}()
+	<-entered
+
+	// A follower joins the same flight, then the leader goes away.
+	followerDone := make(chan []Provider, 1)
+	go func() {
+		got, err := load(ctx, country)
+		if err != nil {
+			t.Errorf("follower load: %v", err)
+		}
+		followerDone <- got
+	}()
+	// The follower needs to be waiting on the flight before the leader is
+	// cancelled, or it would start a second one and prove nothing.
+	time.Sleep(100 * time.Millisecond)
+	cancelLeader()
+	close(release)
+
+	select {
+	case got := <-followerDone:
+		if len(got) != 1 || got[0].ProviderID != 8 {
+			t.Errorf("follower got = %+v, want the leader's fresh list", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("follower never returned")
+	}
+	if n := refreshCalls.Load(); n != 1 {
+		t.Errorf("refreshCalls = %d, want 1 — the flight was not shared", n)
+	}
+
+	// The cache write must have outlived the cancelled leader too, or every
+	// later caller pays the fetch again.
+	var cachedJSON []byte
+	if err := pool.QueryRow(ctx,
+		`select providers from streaming_providers where country = $1`, country).
+		Scan(&cachedJSON); err != nil {
+		t.Fatalf("cache row after a cancelled leader: %v", err)
 	}
 }
 
@@ -1791,5 +1868,43 @@ func TestUpdateUserEmail(t *testing.T) {
 	// upsertUser provisions the row on their first real request.
 	if err := update(ctx, "webhook_email_nonexistent", "new@example.com"); err != nil {
 		t.Errorf("update for a nonexistent id: %v", err)
+	}
+}
+
+// cachedProviderNames is the one cached-row read both loadChatContext (via
+// its transaction) and loadGuestChatContext (straight off the pool) share.
+// A throwaway 'ZZ' row, as TestLoadChatContext uses — never a real country's.
+func TestCachedProviderNames(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool.Exec(c, `delete from streaming_providers where country = 'ZZ'`)
+	})
+
+	if _, err := pool.Exec(ctx, `delete from streaming_providers where country = 'ZZ'`); err != nil {
+		t.Fatal(err)
+	}
+	names, err := cachedProviderNames(ctx, pool, "ZZ", []int{8})
+	if err != nil {
+		t.Fatalf("with no cache row: %v", err)
+	}
+	if names == nil || len(names) != 0 {
+		t.Errorf("names = %#v, want non-nil empty without a cache row", names)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`insert into streaming_providers (country, providers) values ('ZZ', $1)
+		 on conflict (country) do update set providers = excluded.providers`,
+		`[{"provider_id": 8, "provider_name": "Netflix"}, {"provider_id": 15, "provider_name": "Hulu"}]`); err != nil {
+		t.Fatal(err)
+	}
+	names, err = cachedProviderNames(ctx, pool, "ZZ", []int{15, 8, 999})
+	if err != nil {
+		t.Fatalf("with cache row: %v", err)
+	}
+	if want := []string{"Hulu", "Netflix"}; len(names) != 2 || names[0] != want[0] || names[1] != want[1] {
+		t.Errorf("names = %v, want %v (caller's order, unknown ids dropped)", names, want)
 	}
 }
