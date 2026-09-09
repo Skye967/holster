@@ -1,9 +1,9 @@
-import { auth } from "@clerk/nextjs/server"
 import { redirect } from "next/navigation"
 
 import { ChatListUnavailableNotice } from "@/components/chat/chat-list-unavailable-notice"
 import { fetchConversations } from "@/lib/conversations"
 import { GatewaySessionExpiredError } from "@/lib/gateway"
+import { getSession } from "@/lib/session"
 
 // The bare /chat route resolves "where was I" from the conversations table
 // itself (TASKS.md T15.5's "no new flag, derive it" precedent) rather than
@@ -13,7 +13,10 @@ import { GatewaySessionExpiredError } from "@/lib/gateway"
 // way. needsOnboarding is chat/layout.tsx's job now, not this page's — it
 // runs before this page ever does.
 export default async function ChatIndexPage() {
-  const { getToken } = await auth.protect()
+  const { userId, getToken } = await getSession()
+  // A guest has no conversations to resume — nothing is persisted for it —
+  // so it always starts fresh.
+  if (!userId) redirect(`/chat/${crypto.randomUUID()}`)
 
   // A failed list load is not the same as "zero conversations" — silently
   // minting a fresh id on failure would strand a user away from

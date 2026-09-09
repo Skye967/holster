@@ -1,9 +1,8 @@
-import { auth } from "@clerk/nextjs/server"
-
 import { StreamingPicker } from "@/components/streaming-picker"
+import { getSession } from "@/lib/session"
 
 export default async function ConnectionsPage() {
-  await auth.protect()
+  const { guestProviders } = await getSession()
 
   return (
     <div className="p-6">
@@ -13,7 +12,7 @@ export default async function ConnectionsPage() {
         actually watch.
       </p>
       <div className="mt-6">
-        <StreamingPicker />
+        <StreamingPicker guestProviders={guestProviders} />
       </div>
     </div>
   )

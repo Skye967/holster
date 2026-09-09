@@ -36,7 +36,7 @@ func newWatchlistTestServer(t *testing.T,
 
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		loadChatCtx, noopAgentCaller, t.Context(),
+		loadChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		loadWatchlistItems, callAgentTitles,

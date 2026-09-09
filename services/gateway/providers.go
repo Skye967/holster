@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 )
 
 // providersRefreshTimeout bounds the gateway's call to the agent when
@@ -101,15 +102,23 @@ func newAgentProviderCaller(client *http.Client, baseURL string) agentProviderCa
 // agent's live list if there is none or it is older than providerCacheTTL —
 // T15's "lazy cache, no scheduler." A refresh failure degrades to whatever is
 // already cached (or an empty list if nothing is), the same shape
-// loadChatContext already uses for its own missing-row case. A benign race
-// between two concurrent stale refreshes — both call the agent, both
-// upsert — is acceptable here: this is a low-traffic settings page, and
-// there is no advisory lock guarding it.
+// loadChatContext already uses for its own missing-row case.
+//
+// Refreshes are single-flighted per country. The benign-race note this
+// replaced rested on "low-traffic settings page", which stopped being true
+// when GET /guest/providers put this path in front of signed-out browsers:
+// on a cold cache, or the moment the TTL lapses, every concurrent caller
+// would otherwise run its own agent->TMDB fetch against a shared quota.
+// Followers wait on the leader's result instead of adding load — which is why
+// the flight runs on a context detached from the request that started it: with
+// one fetch shared by many callers, that fetch must not die with whichever of
+// them happened to be first.
 //
 // Not wrapped in withUser: provider_access's `using (true)` policy
 // (20260831233121_rls_roles.sql) carries no per-user predicate for this
 // table — only the grant and RLS being enabled matter.
 func loadProviders(db *pgxpool.Pool, refresh agentProviderCaller) func(ctx context.Context, country string) ([]Provider, error) {
+	var refreshes singleflight.Group
 	return func(ctx context.Context, country string) ([]Provider, error) {
 		var (
 			cachedJSON []byte
@@ -134,31 +143,56 @@ func loadProviders(db *pgxpool.Pool, refresh agentProviderCaller) func(ctx conte
 			}
 		}
 
-		refreshCtx, cancel := context.WithTimeout(ctx, providersRefreshTimeout)
-		defer cancel()
-		fresh, err := refresh(refreshCtx, country)
+		// Any failure inside the group degrades to `cached` rather than
+		// failing the request, marshalling included — it cannot fail for this
+		// type, and a caller holding a usable list should not be handed an
+		// error over a cache write it never asked for.
+		v, err, _ := refreshes.Do(country, func() (any, error) {
+			// Detached from whichever request happened to lead the flight: its
+			// error is handed to every follower, so a leader that navigates
+			// away must not cancel work the others are waiting on, and the
+			// cache write must outlive it or the row is never written and the
+			// next wave refetches. Detaching drops the parent's deadline too,
+			// so both halves below carry their own — the flight holds the
+			// singleflight key until it returns, and every follower waits on
+			// it, so neither half may be unbounded.
+			base := context.WithoutCancel(ctx)
+			refreshCtx, cancel := context.WithTimeout(base, providersRefreshTimeout)
+			defer cancel()
+			fresh, err := refresh(refreshCtx, country)
+			if err != nil {
+				return nil, err
+			}
+
+			freshJSON, err := json.Marshal(fresh)
+			if err != nil {
+				return nil, err
+			}
+			// provisionTimeout, the budget every other database call in this
+			// package uses: statement_timeout (main.go) is deliberately set
+			// above it so the request deadline is what normally fires, and it
+			// is the only bound on waiting for a pool connection.
+			writeCtx, cancelWrite := context.WithTimeout(base, provisionTimeout)
+			defer cancelWrite()
+			if _, err := db.Exec(writeCtx, `
+			insert into streaming_providers (country, providers, fetched_at)
+			values ($1, $2, now())
+			on conflict (country) do update
+				set providers = excluded.providers, fetched_at = excluded.fetched_at`,
+				country, freshJSON); err != nil {
+				// The fresh list is still good — only the cache write failed.
+				// Serve it anyway; the next stale read tries the write again.
+				slog.WarnContext(ctx, "provider cache write failed, serving fresh anyway",
+					"error", dbError(err), "country", country)
+			}
+			return fresh, nil
+		})
 		if err != nil {
 			slog.WarnContext(ctx, "provider refresh failed, serving cached",
 				"error", err.Error(), "country", country)
 			return cached, nil
 		}
-
-		freshJSON, err := json.Marshal(fresh)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := db.Exec(ctx, `
-			insert into streaming_providers (country, providers, fetched_at)
-			values ($1, $2, now())
-			on conflict (country) do update
-				set providers = excluded.providers, fetched_at = excluded.fetched_at`,
-			country, freshJSON); err != nil {
-			// The fresh list is still good — only the cache write failed. Serve
-			// it anyway; the next stale read tries the write again.
-			slog.WarnContext(ctx, "provider cache write failed, serving fresh anyway",
-				"error", dbError(err), "country", country)
-		}
-		return fresh, nil
+		return v.([]Provider), nil
 	}
 }
 
@@ -213,6 +247,24 @@ func (h *Handler) providers(w http.ResponseWriter, r *http.Request) {
 		entries[i] = providerCatalogEntry{Provider: p, Subscribed: subscribed[p.ProviderID]}
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// guestProviders is GET /guest/providers — the picker's catalog for a browser
+// with no session (chat.go's "Guests"). No Subscribed flag: a guest's picks
+// live in its own cookie and the browser merges them itself. Always a JSON
+// array, never null — loadProviders returns nil when there's no cached row
+// and the refresh fails, and the picker reads .length off this.
+func (h *Handler) guestProviders(w http.ResponseWriter, r *http.Request) {
+	catalog, err := h.loadProviders(r.Context(), guestRegion)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "guest provider catalog load failed", "error", dbError(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "temporarily unavailable"})
+		return
+	}
+	if catalog == nil {
+		catalog = []Provider{}
+	}
+	writeJSON(w, http.StatusOK, catalog)
 }
 
 // subscriptions is GET /api/subscriptions — the caller's subscribed provider IDs

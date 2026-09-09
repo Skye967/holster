@@ -93,7 +93,7 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 	// Provisioning is a no-op here; the SQL has its own test.
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context(),
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(),
 		noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
@@ -112,6 +112,9 @@ func newTestHandler(t *testing.T, key *rsa.PrivateKey, kid string) *Handler {
 // loadChatCtx/callAgent for real.
 func noopChatCtx(context.Context, string) (chatContext, error) {
 	return newChatContext(), nil
+}
+func noopLoadGuestChatCtx(_ context.Context, providers []int) (chatContext, error) {
+	return chatContext{Region: guestRegion, Providers: providers, ProviderNames: []string{}}, nil
 }
 func noopAgentCaller(context.Context, agentChatRequest) (<-chan agentEvent, error) {
 	return nil, nil
@@ -347,7 +350,7 @@ func TestProvisioningReceivesTokenIdentity(t *testing.T) {
 			gotID, gotEmail = id, email
 			return nil
 		},
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
@@ -396,7 +399,7 @@ func TestProvisioningFailureBlocksRequest(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return errors.New("connection refused") },
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
@@ -436,7 +439,7 @@ func TestClientDisconnectIsNotAProvisioningFailure(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(ctx context.Context, _, _ string) error { return ctx.Err() },
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
@@ -493,7 +496,7 @@ func TestProvisioningDeadlineReturns503(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		},
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
@@ -529,7 +532,7 @@ func TestNewHandlerRejectsEmptyParties(t *testing.T) {
 	kf := func(*jwt.Token) (any, error) { return nil, nil }
 	noop := func(context.Context, string, string) error { return nil }
 	_, err := newHandler(kf, testIssuer, testAudience, map[string]struct{}{}, noop,
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
@@ -890,7 +893,7 @@ func TestKeyRotationSelfHeals(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,
@@ -925,7 +928,7 @@ func TestUnknownKidDoesNotAmplify(t *testing.T) {
 	}
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		noopChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
+		noopChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(), noopLoadProviders, noopSaveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
 		noopLoadConversation, noopLoadConversationTurns, noopSaveMessages, noopLoadConversationSummaries, noopDeleteConversation,

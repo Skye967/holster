@@ -57,6 +57,7 @@ type Claims struct {
 var (
 	errNoKID             = errors.New("token has no kid header")
 	errNoSubject         = errors.New("token has no subject")
+	errNoUserID          = errors.New("no user id to mint a ticket for")
 	errNoEmail           = errors.New("token has no email")
 	errUnauthorizedParty = errors.New("unauthorized party")
 )
@@ -123,14 +124,21 @@ type Handler struct {
 	// SIGINT/SIGTERM-cancelled context (not any single request's), used to tie
 	// every open WebSocket's lifetime to server shutdown.
 	loadChatCtx func(ctx context.Context, userID string) (chatContext, error)
-	callAgent   agentCaller
-	tickets     *chatTicketStore
+	// chat.go's "Guests": loadChatCtx's counterpart for a socket with no
+	// session, taking the browser's ticked services instead of a user id.
+	loadGuestChatCtx func(ctx context.Context, providers []int) (chatContext, error)
+	callAgent        agentCaller
+	tickets          *chatTicketStore
 	// chat.go: tracks conversations deleted while a turn was still in
 	// flight on them (TASKS.md T20.5's delete race) — same in-memory,
 	// single-instance shape as tickets above.
 	conversationDeletions *conversationDeletions
 	originPatterns        []string
 	rootCtx               context.Context
+	// chat.go's per-socket guest turn nudge. A field, not a package var, so a
+	// test lowering it mutates one handler rather than process state — the
+	// latter can never run in parallel with another guest test.
+	guestTurnCap int
 
 	// providers.go (T15): the region catalog cache and the per-user
 	// subscription write, injected the same way as ensureUser/loadChatCtx
@@ -175,6 +183,7 @@ type Handler struct {
 func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]struct{},
 	ensureUser func(ctx context.Context, id, email string) error,
 	loadChatCtx func(ctx context.Context, userID string) (chatContext, error),
+	loadGuestChatCtx func(ctx context.Context, providers []int) (chatContext, error),
 	callAgent agentCaller,
 	rootCtx context.Context,
 	loadProviders func(ctx context.Context, country string) ([]Provider, error),
@@ -204,6 +213,9 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	}
 	if loadChatCtx == nil {
 		return nil, errors.New("no chat context loader configured")
+	}
+	if loadGuestChatCtx == nil {
+		return nil, errors.New("no guest chat context loader configured")
 	}
 	if callAgent == nil {
 		return nil, errors.New("no agent caller configured")
@@ -266,9 +278,11 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 		parties:                   parties,
 		ensureUser:                ensureUser,
 		loadChatCtx:               loadChatCtx,
+		loadGuestChatCtx:          loadGuestChatCtx,
 		callAgent:                 callAgent,
 		tickets:                   newChatTicketStore(),
 		conversationDeletions:     newConversationDeletions(),
+		guestTurnCap:              defaultGuestTurnCap,
 		originPatterns:            origins,
 		rootCtx:                   rootCtx,
 		loadProviders:             loadProviders,
@@ -526,6 +540,26 @@ func (h *Handler) example(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// routeMux builds a mux from routes and returns, alongside it, the sorted set
+// of methods actually registered — corsMiddleware's Access-Control-Allow-
+// Methods is derived from that instead of a separate literal that could drift
+// from it.
+func routeMux(routes map[string]http.HandlerFunc) (*http.ServeMux, string) {
+	mux := http.NewServeMux()
+	methods := map[string]struct{}{}
+	for pattern, handler := range routes {
+		method, _, _ := strings.Cut(pattern, " ")
+		methods[method] = struct{}{}
+		mux.HandleFunc(pattern, handler)
+	}
+	allow := make([]string, 0, len(methods))
+	for m := range methods {
+		allow = append(allow, m)
+	}
+	sort.Strings(allow) // deterministic header value
+	return mux, strings.Join(allow, ", ")
+}
+
 // routes wraps auth around the whole /api/ prefix rather than around individual
 // routes, so a handler registered on the api mux cannot be reachable without it.
 // Public routes go on root.
@@ -536,38 +570,28 @@ func (h *Handler) example(w http.ResponseWriter, r *http.Request) {
 // /api/ requires the Bearer path" invariant this comment states. Its own ticket
 // mint endpoint, POST /api/chat/ticket, is an ordinary Bearer-authenticated
 // route and does live on api.
+//
+// /guest/ is the browser-facing public surface (chat.go's "Guests"): CORS
+// like /api/, no auth, and nothing on it may touch a user-scoped table.
 func (h *Handler) routes() http.Handler {
-	api := http.NewServeMux()
-
-	// register collects the method set as a side effect of registering each
-	// route, so corsMiddleware's Access-Control-Allow-Methods is derived from
-	// what's actually on this mux instead of a separate literal that could
-	// drift from it.
-	methods := map[string]struct{}{}
-	register := func(pattern string, handler http.HandlerFunc) {
-		method, _, _ := strings.Cut(pattern, " ")
-		methods[method] = struct{}{}
-		api.HandleFunc(pattern, handler)
-	}
-	register("GET /api/example", h.example)
-	register("POST /api/chat/ticket", h.chatTicket)
-	register("GET /api/providers", h.providers)
-	register("GET /api/subscriptions", h.subscriptions)
-	register("PUT /api/subscriptions/{providerID}", h.setSubscription)
-	register("DELETE /api/subscriptions/{providerID}", h.setSubscription)
-	register("GET /api/verdicts", h.verdicts)
-	register("PUT /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
-	register("DELETE /api/verdicts/{mediaType}/{tmdbID}", h.setVerdict)
-	register("GET /api/watchlist", h.watchlist)
-	register("GET /api/chat/history/{conversationID}", h.chatHistory)
-	register("GET /api/conversations", h.conversations)
-	register("DELETE /api/conversations/{id}", h.deleteConversationHandler)
-
-	allowMethods := make([]string, 0, len(methods))
-	for m := range methods {
-		allowMethods = append(allowMethods, m)
-	}
-	sort.Strings(allowMethods) // deterministic header value
+	api, apiMethods := routeMux(map[string]http.HandlerFunc{
+		"GET /api/example":                          h.example,
+		"POST /api/chat/ticket":                     h.chatTicket,
+		"GET /api/providers":                        h.providers,
+		"GET /api/subscriptions":                    h.subscriptions,
+		"PUT /api/subscriptions/{providerID}":       h.setSubscription,
+		"DELETE /api/subscriptions/{providerID}":    h.setSubscription,
+		"GET /api/verdicts":                         h.verdicts,
+		"PUT /api/verdicts/{mediaType}/{tmdbID}":    h.setVerdict,
+		"DELETE /api/verdicts/{mediaType}/{tmdbID}": h.setVerdict,
+		"GET /api/watchlist":                        h.watchlist,
+		"GET /api/chat/history/{conversationID}":    h.chatHistory,
+		"GET /api/conversations":                    h.conversations,
+		"DELETE /api/conversations/{id}":            h.deleteConversationHandler,
+	})
+	guest, guestMethods := routeMux(map[string]http.HandlerFunc{
+		"GET /guest/providers": h.guestProviders,
+	})
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /health", h.health)
@@ -576,7 +600,8 @@ func (h *Handler) routes() http.Handler {
 	// token, so it cannot sit behind authMiddleware — and it isn't
 	// browser-originated, so it needs no CORS headers either.
 	root.HandleFunc("POST /webhooks/clerk", h.clerkWebhook)
-	root.Handle("/api/", h.corsMiddleware(strings.Join(allowMethods, ", "), h.authMiddleware(api)))
+	root.Handle("/api/", h.corsMiddleware(apiMethods, h.authMiddleware(api)))
+	root.Handle("/guest/", h.corsMiddleware(guestMethods, guest))
 
 	return correlationID(root)
 }
@@ -700,7 +725,7 @@ func main() {
 	agentClient := &http.Client{}
 
 	h, err := newHandler(jwks.Keyfunc, issuer, audience, parties, upsertUser(db),
-		loadChatContext(db), newAgentCaller(agentClient, agentURL), ctx,
+		loadChatContext(db), loadGuestChatContext(db), newAgentCaller(agentClient, agentURL), ctx,
 		loadProviders(db, newAgentProviderCaller(agentClient, agentURL)), saveSubscription(db),
 		loadVerdicts(db), saveVerdict(db),
 		loadWatchlistItems(db), newAgentTitlesCaller(agentClient, agentURL),

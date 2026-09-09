@@ -49,25 +49,30 @@ export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }
 
+// getToken is null for the gateway's guest surface (/guest/*): no session, so
+// no Authorization header and no 401 retry — a call site chooses null from
+// the server's own auth() result, never because a token failed to mint.
 export async function gatewayFetch(
   path: string,
   init: RequestInit,
-  getToken: GetToken,
+  getToken: GetToken | null,
 ): Promise<Response> {
-  const token = await getToken({ template: "gateway" })
-  if (!token) throw new GatewaySessionExpiredError()
-
-  const doFetch = (t: string) => {
+  const doFetch = (t: string | null) => {
     // Headers, not a plain-object spread: init.headers may legally be a
     // Headers instance or a tuple array, either of which would silently
     // spread into {} or numeric keys instead of real header entries.
     const headers = new Headers(init.headers)
-    headers.set("Authorization", `Bearer ${t}`)
+    if (t) headers.set("Authorization", `Bearer ${t}`)
     return fetch(`${process.env.NEXT_PUBLIC_GATEWAY_URL}${path}`, {
       ...init,
       headers,
     })
   }
+
+  if (getToken === null) return doFetch(null)
+
+  const token = await getToken({ template: "gateway" })
+  if (!token) throw new GatewaySessionExpiredError()
 
   let res = await doFetch(token)
   if (res.status === 401) {

@@ -1,11 +1,33 @@
-import { describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 
 import {
   GatewaySessionExpiredError,
   SESSION_EXPIRED_TEXT,
   gatewayErrorText,
+  gatewayFetch,
   withTimeout,
 } from "./gateway"
+
+describe("gatewayFetch with getToken null", () => {
+  const originalFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test("sends no Authorization header and does not retry a 401", async () => {
+    const calls: RequestInit[] = []
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      calls.push(init ?? {})
+      return new Response("", { status: 401 })
+    }) as typeof fetch
+
+    const res = await gatewayFetch("/guest/providers", {}, null)
+
+    expect(res.status).toBe(401)
+    expect(calls).toHaveLength(1)
+    expect(new Headers(calls[0].headers).has("Authorization")).toBe(false)
+  })
+})
 
 describe("gatewayErrorText", () => {
   test("returns the shared session-expired text for a GatewaySessionExpiredError", () => {

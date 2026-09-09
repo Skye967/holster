@@ -66,8 +66,10 @@ export function UserMenu() {
                 <Info />
                 Credits
               </DropdownMenuItem>
+              {/* /signed-out, not "/": the guest cookie is httpOnly, so only a
+                  route handler can clear it on the way out. */}
               <DropdownMenuItem
-                onClick={() => signOut({ redirectUrl: "/sign-in" })}
+                onClick={() => signOut({ redirectUrl: "/signed-out" })}
               >
                 <LogOut />
                 Sign out

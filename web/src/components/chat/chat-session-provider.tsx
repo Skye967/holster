@@ -14,6 +14,12 @@ interface ChatSessionContextValue {
   send: (text: string, conversationId: string) => string
   setListener: (listener: ChatListener) => void
   clearListener: () => void
+  // Decided once, server-side, in chat/layout.tsx — the panel reads it from
+  // here rather than from Clerk's client state so there is one source.
+  guest: boolean
+  // True after a dropped guest socket has been replaced: the turns are still
+  // on screen but the new socket carries none of them (chat.go's "Guests").
+  guestContextLost: boolean
 }
 
 const ChatSessionContext = createContext<ChatSessionContextValue | null>(null)
@@ -31,8 +37,12 @@ const ChatSessionContext = createContext<ChatSessionContextValue | null>(null)
 // currently on screen registers itself and hands events on to whichever
 // turn they belong to.
 export function ChatSessionProvider({
+  guestProviders,
   children,
 }: {
+  // null for an account; a guest's ticked services otherwise (lib/guest.ts),
+  // as chat/layout.tsx read them from the cookie.
+  guestProviders: number[] | null
   children: React.ReactNode
 }) {
   const listenerRef = useRef<ChatListener | null>(null)
@@ -56,7 +66,11 @@ export function ChatSessionProvider({
     listenerRef.current?.onDisconnect(text)
   }, [])
 
-  const { send } = useChatSocket(handleEvent, handleDisconnect)
+  const { send, guestContextLost } = useChatSocket(
+    handleEvent,
+    handleDisconnect,
+    guestProviders,
+  )
 
   const setListener = useCallback((listener: ChatListener) => {
     listenerRef.current = listener
@@ -66,7 +80,15 @@ export function ChatSessionProvider({
   }, [])
 
   return (
-    <ChatSessionContext.Provider value={{ send, setListener, clearListener }}>
+    <ChatSessionContext.Provider
+      value={{
+        send,
+        setListener,
+        clearListener,
+        guest: guestProviders !== null,
+        guestContextLost,
+      }}
+    >
       {children}
     </ChatSessionContext.Provider>
   )

@@ -36,7 +36,7 @@ func newProvidersTestServer(t *testing.T,
 
 	h, err := newHandler(jwks.Keyfunc, testIssuer, testAudience, map[string]struct{}{testOrigin: {}},
 		func(context.Context, string, string) error { return nil },
-		loadChatCtx, noopAgentCaller, t.Context(),
+		loadChatCtx, noopLoadGuestChatCtx, noopAgentCaller, t.Context(),
 		loadProviders, saveSubscription,
 		noopLoadVerdicts, noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
@@ -275,5 +275,63 @@ func TestProviderRoutesRequireAuth(t *testing.T) {
 		if resp := doJSON(t, srv, "", p.method, p.path); resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("%s %s without a token = %d, want 401", p.method, p.path, resp.StatusCode)
 		}
+	}
+}
+
+// --- GET /guest/providers (TASKS.md T27) ------------------------------------
+
+func TestGuestProvidersIsPublicAndOmitsSubscribed(t *testing.T) {
+	loadChatCtx := func(context.Context, string) (chatContext, error) {
+		t.Error("loadChatCtx was called for a guest — there is no user to load")
+		return chatContext{}, nil
+	}
+	loadProviders := func(_ context.Context, region string) ([]Provider, error) {
+		if region != guestRegion {
+			t.Errorf("region = %q, want %q", region, guestRegion)
+		}
+		return []Provider{{ProviderID: 8, ProviderName: "Netflix", DisplayPriority: 1}}, nil
+	}
+	srv, _ := newProvidersTestServer(t, loadChatCtx, loadProviders, noopSaveSubscription)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/guest/providers", nil)
+	req.Header.Set("Origin", testOrigin)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with no token", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != testOrigin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, testOrigin)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var entries []map[string]any
+	if err := json.Unmarshal(body, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0]["provider_name"] != "Netflix" {
+		t.Errorf("body = %s, want the one catalog entry", body)
+	}
+	if _, has := entries[0]["subscribed"]; has {
+		t.Errorf("body = %s, want no subscribed flag — a guest's picks live in the browser", body)
+	}
+}
+
+func TestGuestProvidersIsNeverNull(t *testing.T) {
+	srv, _ := newProvidersTestServer(t, noopChatCtx, noopLoadProviders, noopSaveSubscription)
+	resp := doJSON(t, srv, "", http.MethodGet, "/guest/providers")
+	if body, _ := io.ReadAll(resp.Body); strings.TrimSpace(string(body)) != "[]" {
+		t.Errorf("body = %q, want [] when the catalog is empty", body)
+	}
+}
+
+func TestGuestProvidersDegradesOnCatalogFailure(t *testing.T) {
+	loadProviders := func(context.Context, string) ([]Provider, error) { return nil, errUnauthorizedParty }
+	srv, _ := newProvidersTestServer(t, noopChatCtx, loadProviders, noopSaveSubscription)
+	if resp := doJSON(t, srv, "", http.MethodGet, "/guest/providers"); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
 	}
 }

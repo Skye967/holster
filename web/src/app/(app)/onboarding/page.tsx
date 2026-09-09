@@ -1,8 +1,8 @@
-import { auth } from "@clerk/nextjs/server"
 import Link from "next/link"
 
 import { StreamingPicker } from "@/components/streaming-picker"
 import { Button } from "@/components/ui/button"
+import { getSession } from "@/lib/session"
 
 export default async function OnboardingPage() {
   // No needsOnboarding() check here on purpose: page.tsx already resolved this
@@ -11,7 +11,7 @@ export default async function OnboardingPage() {
   // user via needsOnboarding's fail-open false — worse than letting someone who
   // already subscribed and lands here directly (bookmark, back button) just see
   // the picker again.
-  await auth.protect()
+  const { guestProviders } = await getSession()
 
   return (
     <div className="p-6">
@@ -23,9 +23,13 @@ export default async function OnboardingPage() {
         actually watch.
       </p>
       <div className="mt-6">
-        <StreamingPicker />
+        <StreamingPicker guestProviders={guestProviders} />
       </div>
-      <Button render={<Link href="/chat" />} variant="link" className="mt-4 px-0">
+      <Button
+        render={<Link href="/chat" />}
+        variant="link"
+        className="mt-4 px-0"
+      >
         Skip for now
       </Button>
     </div>
