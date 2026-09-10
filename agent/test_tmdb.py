@@ -532,18 +532,55 @@ def test_non_object_json_body_is_unavailable_not_a_crash() -> None:
         run(fake.client().discover(media_type="movie", watch_region="US"))
 
 
-def test_search_titles_merges_movie_and_tv() -> None:
+def test_search_titles_keeps_tmdbs_order_and_drops_people() -> None:
+    """The order is the signal: re-sorting it (by vote count, say) lifts a
+    popular near-match above an exact one. /search/multi also returns people,
+    which are not titles."""
     fake = FakeTMDB()
     fake.ok(
-        "/search/movie", {"results": [{"id": 1, "title": "Dune", "vote_count": 100}]}
-    )
-    fake.ok(
-        "/search/tv",
-        {"results": [{"id": 2, "name": "Dune: Prophecy", "vote_count": 500}]},
+        "/search/multi",
+        {
+            "results": [
+                {"media_type": "person", "id": 9, "name": "Someone"},
+                {
+                    "media_type": "tv",
+                    "id": 2,
+                    "name": "Dune: Prophecy",
+                    "vote_count": 500,
+                },
+                {
+                    "media_type": "movie",
+                    "id": 1,
+                    "title": "Dune",
+                    "vote_count": 15000,
+                },
+            ]
+        },
     )
 
     titles = run(fake.client().search_titles("dune"))
 
-    assert [t["tmdb_id"] for t in titles] == [2, 1]  # ordered by vote_count
-    assert titles[0]["media_type"] == "tv"
-    assert titles[1]["media_type"] == "movie"
+    # TMDB's order, not vote order — the movie has 30x the votes and stays second.
+    assert [t["tmdb_id"] for t in titles] == [2, 1]
+    assert [t["media_type"] for t in titles] == ["tv", "movie"]
+
+
+def test_search_titles_unusable_results_is_not_nothing_matched() -> None:
+    """A shape change must not read as "no such title". That answer is a claim
+    about the user's spelling; only TMDB knows it is really about TMDB."""
+    fake = FakeTMDB()
+    fake.ok("/search/multi", {"results": {"unexpected": "object"}})
+
+    with pytest.raises(TMDBError):
+        run(fake.client().search_titles("dune"))
+
+
+def test_search_titles_makes_one_request_not_one_per_media_type() -> None:
+    fake = FakeTMDB()
+    fake.ok("/search/multi", {"results": []})
+
+    run(fake.client().search_titles("dune"))
+
+    assert fake.count("/search/multi") == 1
+    assert fake.count("/search/movie") == 0
+    assert fake.count("/search/tv") == 0

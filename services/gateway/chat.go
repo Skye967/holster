@@ -822,15 +822,37 @@ func friendlyError(reason string) string {
 	}
 }
 
-func summarizePicks(picks []agentPick) string {
+// summarizePicks writes the assistant's side of the turn into stored history.
+// That text is both what a reload renders (conversations.go does not surface
+// title_refs) and what feeds the next turn's interpret(), so it has to say
+// what actually happened: "Suggested" on a turn that answered a lookup would
+// claim a recommendation the assistant never made -- and would then be read
+// back as one.
+func summarizePicks(picks []agentPick, isLookup bool) string {
 	if len(picks) == 0 {
 		return ""
+	}
+	// Count first, then qualify only the names that repeat. A lookup answers
+	// with every title carrying the name, so "Dune, Dune" and "Fargo, Fargo"
+	// are the normal case, not an edge one -- and this text is the whole
+	// assistant side of the turn, so an unqualified repeat is what a reload
+	// renders and what the next turn's interpret() reads back.
+	seen := make(map[string]int, len(picks))
+	for _, p := range picks {
+		seen[p.Title]++
 	}
 	titles := make([]string, len(picks))
 	for i, p := range picks {
 		titles[i] = p.Title
+		if seen[p.Title] > 1 && p.Year != nil {
+			titles[i] = fmt.Sprintf("%s (%d)", p.Title, *p.Year)
+		}
 	}
-	return "Suggested: " + strings.Join(titles, ", ")
+	verb := "Suggested: "
+	if isLookup {
+		verb = "Looked up: "
+	}
+	return verb + strings.Join(titles, ", ")
 }
 
 // runTurn loads the context the agent needs, calls it, and streams translated
@@ -966,7 +988,7 @@ func (h *Handler) runTurn(
 			// ev.Text on "message" isn't reachable the same way — every
 			// message-type event agent/chat.py emits comes from a non-empty
 			// template — so no matching guard is needed there.
-			if summary := summarizePicks(ev.Picks); summary != "" {
+			if summary := summarizePicks(ev.Picks, ev.Kind == "lookup"); summary != "" {
 				rec.ok = true
 				rec.userText = text
 				rec.assistantText = summary
@@ -1015,6 +1037,16 @@ func (h *Handler) runTurn(
 // second model call (TASKS.md T14) — it doubles as a comprehension check, so
 // it must be on screen well before the full pipeline finishes.
 func interpretingLine(intent agentIntent, providerNames []string) string {
+	// A named-title lookup answers with that title, not a filtered search, so
+	// none of the clauses below apply — "Looking for movies on Netflix and
+	// Hulu" would contradict the card that follows it. See the agent's
+	// catalog_tool.lookup_title.
+	if intent.Title != "" {
+		// Typographic quotes, not %q: %q is strconv.Quote, which renders a
+		// title containing quotes with literal backslashes on screen.
+		return "Looking up \u201c" + intent.Title + "\u201d"
+	}
+
 	kind := "movies"
 	if intent.MediaType == "tv" {
 		kind = "TV shows"
@@ -1217,12 +1249,16 @@ type agentChatRequest struct {
 // Deliberately omits sort_by and limit: interpretingLine() is a comprehension
 // check on *what* the user asked for, not *how* the search runs — the user
 // already knows how many results they asked for and doesn't need it read
-// back. Every other DiscoverIntent field is here; an omitted field silently
-// vanishes on decode (json.Unmarshal drops unknown keys), so if you add a
-// field to DiscoverIntent that should show up in the interpreting line, it
-// must be added here too — nothing else catches the gap.
+// back. Title is the one field here that changes which line gets built at
+// all rather than adding a clause to it — a named-title turn skips
+// discover() entirely on the agent side. Every other DiscoverIntent field is
+// here; an omitted field silently vanishes on decode (json.Unmarshal drops
+// unknown keys), so if you add a field to DiscoverIntent that should show up
+// in the interpreting line, it must be added here too — nothing else catches
+// the gap.
 type agentIntent struct {
 	MediaType         string   `json:"media_type"`
+	Title             string   `json:"title"`
 	Genres            []string `json:"genres"`
 	WithoutGenres     []string `json:"without_genres"`
 	Keywords          []string `json:"keywords"`
@@ -1285,7 +1321,17 @@ type agentProvider struct {
 // agentEvent is one NDJSON line from POST /chat on the agent — see
 // agent/chat.py's module docstring for the full shape of each type.
 type agentEvent struct {
-	Type    string          `json:"type"`
+	Type string `json:"type"`
+	// Which path search() took, on "results" only: "search" or "lookup".
+	// The agent records this where the branch is actually taken, so stored
+	// history reflects what the turn did rather than what its intent looked
+	// like. interpretingLine cannot use it and reads intent.Title instead:
+	// the interpreting line is built from the "intent" event, which is
+	// emitted before search() has chosen a path (agent/catalog_tool.py fires
+	// on_intent first, deliberately). The two agree today; if they ever
+	// diverge, the cost is a premature interpreting line, never a wrong verb
+	// written into history.
+	Kind    string          `json:"kind,omitempty"`
 	Intent  json.RawMessage `json:"intent,omitempty"`
 	Picks   []agentPick     `json:"picks,omitempty"`
 	Relaxed []string        `json:"relaxed,omitempty"`

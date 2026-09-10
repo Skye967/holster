@@ -35,13 +35,20 @@ survivable.
 - **The agent is never reachable from the internet.** Only the gateway is exposed.
 - **Agent tools are a fixed, declared list.** Never add a tool that takes a URL, an
   endpoint, or a raw query from the model. Parameters may be filled in from a declared
-  set; the destination may not.
+  set; the destination may not. A *search term* is the one exception, and it is a
+  narrow one: the model may name a person, a keyword, or a title, and that name
+  reaches TMDB as a `query` value inside a path built here. It chooses what to look
+  for, never where to look, and every row that comes back is a real TMDB row.
 - **The agent holds no credential belonging to a user or a third-party account.** It
   may hold app-level API keys — TMDB, the LLM provider — whose compromise costs a key
   rotation, not a user. If a change would give it a credential that reaches a user's
   account anywhere, that change is wrong.
 - **Row-level security on every user-scoped table**, keyed on the Clerk user ID.
-- **Every catalog query carries `watch_region`.** Availability is country-specific.
+- **Every catalog query carries `watch_region`, except `/search/multi`.**
+  Availability is country-specific. That one endpoint accepts no region parameter
+  at all, and the availability step that follows it carries one — so a card's
+  streaming claim is still country-scoped. Named exception, not a judgement call:
+  anything else that reaches TMDB without a region is a bug.
 - **No table holds a credential.** Holster stores no secret belonging to any other
   service, for any user. There is no encryption layer because there is nothing to
   encrypt — do not reintroduce one without reintroducing the thing it protects.

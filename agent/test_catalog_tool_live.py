@@ -111,6 +111,51 @@ def test_interpret_does_not_ask_on_an_explicit_blind_request() -> None:
     asyncio.run(go())
 
 
+def test_interpret_sets_title_for_a_named_title() -> None:
+    """T27's premise: a message naming one title has to reach lookup_title,
+    which only happens if interpret() puts the name in `title`. Asserts the
+    name is carried, not how it was spelled back."""
+
+    async def go() -> None:
+        call = google_interpreter(_model())
+        intent = await call("is The Matrix on netflix?")
+        assert "matrix" in intent.title.casefold()
+
+    asyncio.run(go())
+
+
+def test_interpret_leaves_title_empty_for_a_comparison() -> None:
+    """The other half, and the one that fails quietly: a title named as a
+    comparison is a search for other films. Setting `title` here would turn
+    every "something like X" into a card for X itself."""
+
+    async def go() -> None:
+        call = google_interpreter(_model())
+        intent = await call("something like Heat but shorter")
+        assert not intent.title
+
+    asyncio.run(go())
+
+
+def test_interpret_does_not_reuse_a_title_from_an_earlier_turn() -> None:
+    """Sibling to the clarifying-question rule below, for the same reason:
+    the gateway writes "Looked up: Heat" into history, so a follow-up that
+    names no title must not re-read that one and answer about it again."""
+
+    async def go() -> None:
+        call = google_interpreter(_model())
+        folded = (
+            "Recent conversation:\n"
+            "User: is Heat on netflix?\n"
+            "Assistant: Looked up: Heat\n\n"
+            "Current message: what else is like that but funnier"
+        )
+        intent = await call(folded)
+        assert not intent.title
+
+    asyncio.run(go())
+
+
 def test_interpret_does_not_ask_twice_in_a_row() -> None:
     """Mirrors the conversation shape chat.py's _with_history actually
     builds: once the assistant's last turn was already a clarifying
