@@ -16,16 +16,30 @@ output has been used to call TMDB. A single call cannot see results it has not
 yet triggered. (On an empty result, this TMDB step retries with progressively
 fewer soft constraints — see search().)
 
+A message naming a film or show takes a shorter path — interpret() sets
+DiscoverIntent.title, and search() answers with the titles carrying that name
+rather than a discover() query, one model call instead of two (see
+lookup_title()).
+
 Both steps read untrusted text — the user's message and, in TMDB's overviews,
 third-party-editable text anyone can put a hostile instruction in (see
 ARCHITECTURE.md) — but the two calls differ in blast radius, not exposure.
-interpret()'s output only ever populates tmdb.discover()'s already-typed,
+interpret()'s output mostly populates tmdb.discover()'s already-typed,
 already-validated parameter surface (Literals, and bounds on ``limit``,
-runtime, and year), so a manipulated message can at most
-produce a weird-but-valid catalog query. rank()'s output schema carries no
-title metadata at all — only a selected id and a one-line blurb — so a
-manipulated overview can at most win a bad blurb, never assert a fake title,
-year, or availability.
+runtime, and year), so a manipulated message can at most produce a
+weird-but-valid catalog query. rank()'s output schema carries no title
+metadata at all — only a selected id and a one-line blurb — so a manipulated
+overview can at most win a bad blurb, never assert a fake title, year, or
+availability.
+
+``title`` is the one field that is free text rather than a bounded parameter:
+it reaches TMDB as a ``query`` term, the same way the model's cast, crew and
+keyword names already do (tmdb.py's _resolve_name). What bounds it is not its
+type but its destination and its result — the endpoint is a literal, and every
+card that comes back is a real TMDB row fetched by id. Note that rank()'s
+id-validation, the enforcement point described below, does not apply on that
+path, because rank() never runs there; the equivalent guarantee is that
+lookup_title only ever enriches rows TMDB itself returned.
 
 watch_region and watch_providers are not fields the model can set anywhere in
 this module. They are ordinary keyword arguments to search(), supplied by the
@@ -44,6 +58,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -53,6 +69,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 
 from tmdb import (
+    MIN_VOTE_COUNT,
     MOVIE_GENRES,
     TV_GENRES,
     DiscoverSort,
@@ -72,12 +89,13 @@ logger = logging.getLogger("holster.catalog_tool")
 
 class DiscoverIntent(BaseModel):
     """interpret()'s output — tmdb.discover()'s creative parameters, none of
-    its identity parameters, plus two fields that aren't search parameters at
-    all: is_capability_question and clarifying_question, search()'s signal to
-    skip discover()/rank() entirely (TASKS.md T16.5). watch_region and
-    watch_providers are deliberately absent: the model must never be able to
-    choose which streaming services results come from (TASKS.md T13,
-    CLAUDE.md)."""
+    its identity parameters, plus three fields that aren't discover()
+    parameters at all: is_capability_question and clarifying_question,
+    search()'s signal to skip discover()/rank() entirely (TASKS.md T16.5),
+    and title, its signal to look one named title up instead (TASKS.md T27).
+    watch_region and watch_providers are deliberately absent: the model must
+    never be able to choose which streaming services results come from
+    (TASKS.md T13, CLAUDE.md)."""
 
     media_type: MediaType = Field(description="'movie' for films, 'tv' for series.")
     is_capability_question: bool = Field(
@@ -106,6 +124,21 @@ class DiscoverIntent(BaseModel):
             "row: if the assistant's last message was already a clarifying "
             "question, treat whatever the user says next as enough to "
             "search on, however thin."
+        ),
+    )
+    title: str = Field(
+        default="",
+        description=(
+            "The name of one specific film or show the user is asking about "
+            "by name — 'is The Matrix on Netflix', 'do you have Fargo'. "
+            "Copy it as they wrote it; never correct it, expand it, or "
+            "supply a year, and never put a title here that they did not "
+            "type. Read it only from the current message, never from earlier "
+            "turns of the conversation — a title asked about two turns ago "
+            "is not what they're asking now. Leave it empty when a title is "
+            "named only as a comparison ('something like Heat') — that is a "
+            "search for other titles, so let the mood and genre fields carry "
+            "it instead."
         ),
     )
     keywords: list[str] = Field(
@@ -230,6 +263,13 @@ class CatalogToolError(Exception):
 # (TASKS.md T13.5).
 RelaxedConstraint = Literal["runtime", "year", "keywords"]
 
+# Which path search() took. Set where the branch is actually taken, not
+# re-derived downstream from intent.title: the two agree today, but they are
+# not the same question, and stored history is where a wrong answer compounds
+# (services/gateway/chat.go's summarizePicks writes it, and the next turn's
+# interpret() reads it back).
+CatalogKind = Literal["search", "lookup"]
+
 
 @dataclass
 class CatalogResult:
@@ -257,6 +297,10 @@ class CatalogResult:
     # so both can be true at once, which is why the caller gives this one
     # precedence.
     all_judged: bool = False
+    # "lookup" when the turn answered about one named title (see
+    # lookup_title), "search" for the discover()/rank() ladder. The caller
+    # forwards it rather than inferring the path from intent fields.
+    kind: CatalogKind = "search"
 
 
 Interpreter = Callable[[str], Awaitable[DiscoverIntent]]
@@ -484,7 +528,7 @@ async def enrich_known_title(
     still carries every key a resolved pick does (_UNAVAILABLE_PLACEHOLDER),
     enough for the caller to render a minimal row with a working remove
     action instead of losing the row silently. Same key set either way, on
-    purpose: services/gateway/chat.go's agentPick and web/lib/chat-socket.ts's
+    purpose: services/gateway/chat.go's agentPick and web/src/lib/chat-socket.ts's
     AgentPick declare genre_ids/genre_names/cast as plain (non-nullable)
     arrays — a sparse dict missing those keys would decode as Go nil slices
     and re-marshal as JSON null, breaking that contract for a case nothing
@@ -504,6 +548,188 @@ async def enrich_known_title(
         **_merge_enrichment(title, details, availability, wanted, blurb=""),
         "unavailable": False,
     }
+
+
+# Ceiling on how many titles one name lookup shows. A name is often several
+# titles — "Dune" is two films plus a series, "Star Wars" a franchise — and
+# the card row already scrolls, so the result set is its own disambiguation
+# rather than a prompt asking which one they meant. Matches discover()'s own
+# default limit; enrichment is concurrent, so more cards cost width, not time.
+MAX_TITLE_MATCHES = 5
+
+# A leading article carries no identity: "The Lord of the Rings: The Two
+# Towers" is what someone typing "lord of the rings" means. Stripped from
+# both sides in the prefix tier only — never in the exact tier, where it is
+# the whole difference between "Heat" and "The Heat".
+_LEADING_ARTICLE = re.compile(r"^(?:the|a|an) ")
+# Straight and typographic: phones substitute the curly one by default, so
+# "Schindler’s List" typed on a phone must still match TMDB's ASCII row.
+_APOSTROPHE = re.compile(r"['’]")
+# NFKD splits an accent off its letter, but a letter that *is* its own
+# character survives it. TMDB resolves these to the ASCII spelling and returns
+# the row, so without the table the comparison rejects what TMDB just found:
+# "Aeon Flux" is Æon Flux's top result on TMDB and matched nothing here.
+_LIGATURES = str.maketrans(
+    {"æ": "ae", "ø": "o", "œ": "oe", "ł": "l", "đ": "d", "ð": "d", "þ": "th"}
+)
+
+
+def _fold(text: str) -> str:
+    """Case, diacritics and apostrophes removed — the part both match keys
+    share. TMDB's own search already resolves "Shogun" to "Shōgun" and
+    "Oceans Eleven" to "Ocean's Eleven"; this is what lets our comparison
+    keep up with it instead of rejecting the row TMDB just found. An
+    apostrophe is intra-word, so it is deleted rather than spaced: "It's"
+    must not become "it s" and prefix-match a query of "It"."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return _APOSTROPHE.sub("", stripped.casefold().translate(_LIGATURES))
+
+
+def _match_key(title: str) -> str:
+    """Equality key: letters and digits only. Collapsing punctuation rather
+    than spacing it is what makes "Spiderman" match "Spider-Man"."""
+    return re.sub(r"[^\w]", "", _fold(title))
+
+
+def _match_stem(title: str) -> str:
+    """Prefix key: words, leading article dropped. Keeps word boundaries so
+    "Moon" does not prefix-match "MoonPhase"."""
+    words = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", _fold(title))).strip()
+    return _LEADING_ARTICLE.sub("", words)
+
+
+def _matching_titles(
+    query: str, results: list[Title]
+) -> tuple[list[Title], list[Title], list[Title]]:
+    """The rows carrying ``query`` as a name, split into three tiers and each
+    ordered by vote count.
+
+    The tiers answer different questions. An **exact** carry is the name as
+    typed — "Heat" is Heat (1995), not Red Heat, which is why a bare
+    contains-match is deliberately not a tier here. An **article** carry
+    differs from it by a leading article alone: someone typing "godfather"
+    means The Godfather, and TMDB agrees, returning it first. A **continued**
+    carry is the same name carried on: Star Wars: The Last Jedi, Dune: Part
+    Two. Without that last tier "is Star Wars on Netflix" answers with the
+    1977 film alone and hides the other eight.
+
+    Kept apart rather than concatenated because the caller's vote floor has to
+    apply inside a tier, never across one, and because the article tier is a
+    weaker claim than the exact one: it is consulted only when no exact carry
+    is prominent enough to be the answer (see lookup_title). That ordering is
+    what lets "godfather" reach The Godfather while "Heat" still does not
+    reach The Heat.
+
+    Sorting by votes within a tier is safe for the same reason — the tier is
+    the relevance signal — and it is what puts Spider-Man (2002) above the
+    1967 cartoon that shares its name. One pass, and the tiers cannot overlap:
+    a row lands in the first that claims it.
+    """
+    key, stem = _match_key(query), _match_stem(query)
+    exact: list[Title] = []
+    article: list[Title] = []
+    continued: list[Title] = []
+    for t in results:
+        t_key, t_stem = _match_key(t["title"]), _match_stem(t["title"])
+        if t_key == key:
+            exact.append(t)
+        elif t_stem == stem:
+            article.append(t)
+        elif t_stem.startswith(stem + " "):
+            continued.append(t)
+
+    def by_votes(tier: list[Title]) -> list[Title]:
+        return sorted(tier, key=_vote_count, reverse=True)
+
+    return by_votes(exact), by_votes(article), by_votes(continued)
+
+
+def _believable(tier: list[Title]) -> list[Title]:
+    """The vote floor as this path uses it: enough votes to be the title
+    someone meant, rather than the 0-vote short that shares its name. It
+    filters within a tier and never empties one that had rows — the caller
+    keeps a single best match when nothing clears it."""
+    return [t for t in tier if t["vote_count"] >= MIN_VOTE_COUNT]
+
+
+def _vote_count(title: Title) -> int:
+    return title["vote_count"]
+
+
+async def lookup_title(
+    query: str,
+    *,
+    client: TMDBClient,
+    watch_region: str,
+    watch_providers: list[int],
+) -> list[dict[str, Any]]:
+    """Answer about a named film or show — search()'s other path, taken when
+    interpret() sets ``intent.title`` (TASKS.md T27).
+
+    Selection is _matching_titles() for *which* rows carry the name, then one
+    judgement here: of those, keep the ones prominent enough to believe.
+    MIN_VOTE_COUNT is discover()'s bar for "worth putting in front of
+    someone", borrowed for a smaller question — is this a real title, or the
+    0-vote short that happens to share the name?
+
+    The floor filters, it never gates: when nothing clears it the best match
+    is still shown, alone. Obscure is not absent — most TV, documentaries and
+    anything released last week sit under 200 votes, and "is Nightfall
+    streaming" must answer about Nightfall rather than about whatever TMDB
+    ranked first. One card rather than several because the card names what it
+    found, so a wrong guess reads as a wrong guess where a row reads as an
+    answer.
+
+    Three things this deliberately does not do, each of which would answer a
+    different question than the one asked:
+
+    - **No media_type filter.** interpret() always sets one, but on a name it
+      is a guess with nothing to go on, and getting it wrong is unrecoverable
+      here: "The Office" as a movie is a 1930 silent film. search_titles()
+      ranks films and series against each other, so the guess is not used.
+    - **No watch_providers filter on the query.** "Is X on Netflix" has to be
+      answerable with *no*. Filtering here would return zero results and read
+      as "nothing matched", which is a different claim. Availability is
+      applied downstream instead, by _enrich_pick's own filter, so an
+      unavailable title comes back as a real card whose available_on is empty
+      — which the UI renders as "Not on your services". TASKS.md T13's
+      invariant is untouched: that filter is still the only thing deciding
+      what available_on may name.
+    - **No verdict exclusion.** search() drops candidates the user has already
+      judged, because a recommendation should not repeat them. A question
+      about a named title is not a recommendation — "is Heat on my services"
+      deserves an answer whether or not Heat is already marked seen.
+
+    _enrich_pick, not enrich_known_title: the Title is already in hand from
+    the search, so a failed details call costs runtime and cast, never the
+    name. enrich_known_title's _UNAVAILABLE_PLACEHOLDER would blank the card
+    instead, and both services/gateway/chat.go's agentPick and
+    web/src/lib/chat-socket.ts's AgentPick document `unavailable` as absent on
+    every /chat pick.
+
+    rank() never runs: there is nothing to rank, so this path costs one model
+    call rather than two. Picks carry no blurb for the same reason — nothing
+    here is explaining a fit — and title-card.tsx already omits the line when
+    it is empty.
+
+    Returns [] when nothing carried the name, TMDB returning nothing at all
+    included; the caller turns that into its own message rather than
+    presenting an unrelated title as the answer (see chat.py).
+    """
+    exact, article, continued = _matching_titles(
+        query, await client.search_titles(query)
+    )
+    # The name as typed wins outright; a leading-article difference counts
+    # only when no exact carry is prominent enough to be the answer. The
+    # trailing `[:1]`s are the floor filtering rather than gating: a named
+    # title nobody has voted on is still the title that was named.
+    head = _believable(exact) or _believable(article) or (exact or article)[:1]
+    chosen = (head + _believable(continued))[:MAX_TITLE_MATCHES] or continued[:1]
+    wanted = set(watch_providers)
+    return await gather_all(
+        *(_enrich_pick(client, watch_region, wanted, t, blurb="") for t in chosen)
+    )
 
 
 class TitleRef(BaseModel):
@@ -535,7 +761,8 @@ class TitleVerdict(BaseModel):
 class TitlesRequest(BaseModel):
     """POST /titles' request body — a caller-supplied list of already-known
     ids to enrich, plus the real user context every catalog call needs
-    (CLAUDE.md: "every catalog query carries watch_region")."""
+    (CLAUDE.md: "every catalog query whose answer depends on country
+    carries watch_region")."""
 
     watch_region: str
     watch_providers: list[int] = Field(default_factory=list)
@@ -699,6 +926,13 @@ async def search(
     ticked streaming services can't get results from any, so there is
     nothing to interpret or search for.
 
+    Takes a different path entirely when interpret() sets ``intent.title``,
+    i.e. the message asks about one film or show by name: neither discover()
+    nor rank() runs, and the answer is that title itself, looked up by name
+    and enriched — see lookup_title() for what that path deliberately does
+    not filter on, and why. ``relaxed`` is empty there because no constraint
+    ladder exists to relax.
+
     Also returns picks-less (this time with ``intent`` set) when interpret()
     flags the message as a capability question rather than a title request
     (TASKS.md T16.5), or sets ``intent.clarifying_question`` because neither
@@ -729,6 +963,9 @@ async def search(
     # below (chat.py sends it to the user verbatim) or as a truthy
     # short-circuit signal here.
     intent.clarifying_question = intent.clarifying_question.strip()
+    # Same reason as above: a whitespace-only title must not read as a real
+    # lookup below, and must not reach search_titles() as a blank query.
+    intent.title = intent.title.strip()
     if intent.is_capability_question or intent.clarifying_question:
         # Nothing to search for either way — an explicit question about the
         # assistant, or too little signal yet to search on. Before on_intent:
@@ -740,6 +977,22 @@ async def search(
         return CatalogResult(intent=intent, picks=[], relaxed=[])
     if on_intent is not None:
         await on_intent(intent)
+
+    # After on_intent, not before: a lookup still costs a search plus per-title
+    # details and availability, so it needs an interpreting line as much as a
+    # discover() turn does. The gateway templates a different one off
+    # intent.title (services/gateway/chat.go's interpretingLine).
+    if intent.title:
+        picks = await lookup_title(
+            intent.title,
+            client=client,
+            watch_region=watch_region,
+            watch_providers=watch_providers,
+            # intent.limit is deliberately not passed: it sizes a
+            # recommendation list, and this path answers a question.
+            # MAX_TITLE_MATCHES is the only ceiling that applies.
+        )
+        return CatalogResult(intent=intent, picks=picks, relaxed=[], kind="lookup")
 
     # Mutable locals for the soft constraints, cleared one at a time below.
     # The three ints are copied by value; `keywords` aliases intent.keywords —
@@ -886,6 +1139,12 @@ _INTERPRET_SYSTEM_PROMPT = (
     "you are describing what to search for, not recalling titles from "
     "memory. Leave a field empty when the message does not mention it, "
     "except keywords. "
+    "The one exception is title: when the user asks about a specific film or "
+    "show by name ('is The Matrix on Netflix', 'do you have Fargo'), put "
+    "their words in title and leave keywords and genres empty — that request "
+    "is answered by looking the title up, not by searching for others like "
+    "it. A title named as a comparison ('something like Heat') is the "
+    "opposite case: leave title empty and describe what to search for. "
     "Only set genres when the message explicitly names a genre (e.g. 'a "
     "horror movie', 'documentaries'). Mood words like 'scary', 'funny', or "
     "'intense' go in keywords, never in genres, even if a mood word happens "
@@ -898,8 +1157,7 @@ _INTERPRET_SYSTEM_PROMPT = (
     "above as best you can. "
     "Set clarifying_question, per its own field description, whenever "
     "there's truly nothing to search on yet — never guess at fields "
-    "instead, and never ask twice in a row. "
-    + _GENRE_VOCABULARY
+    "instead, and never ask twice in a row. " + _GENRE_VOCABULARY
 )
 
 _RANK_SYSTEM_PROMPT = (

@@ -53,10 +53,10 @@ def test_watch_provider_list_finds_netflix_in_us() -> None:
 def test_title_lookup_returns_streaming_services() -> None:
     async def go() -> None:
         async with TMDBClient(TOKEN) as client:
-            matches = await client.search_titles("Dune", media_type="movie")
+            matches = await client.search_titles("Dune")
             assert matches
             avail = await client.watch_providers(
-                media_type="movie",
+                media_type=matches[0]["media_type"],
                 tmdb_id=matches[0]["tmdb_id"],
                 watch_region="US",
             )

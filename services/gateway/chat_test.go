@@ -122,6 +122,115 @@ func TestInterpretingLineComposesGenreYearRuntimeAndProviders(t *testing.T) {
 	}
 }
 
+func TestSummarizePicksDistinguishesALookupFromASuggestion(t *testing.T) {
+	// This text is what a reload renders and what feeds the next turn's
+	// interpret(), so "Suggested" on a lookup would both misreport the turn
+	// and be read back as a recommendation that never happened.
+	picks := []agentPick{{TMDBID: 1, Title: "Heat"}}
+
+	if got := summarizePicks(picks, false); got != "Suggested: Heat" {
+		t.Errorf("summarizePicks(discover) = %q, want %q", got, "Suggested: Heat")
+	}
+	if got := summarizePicks(picks, true); got != "Looked up: Heat" {
+		t.Errorf("summarizePicks(lookup) = %q, want %q", got, "Looked up: Heat")
+	}
+	if got := summarizePicks(nil, true); got != "" {
+		t.Errorf("summarizePicks(no picks) = %q, want empty", got)
+	}
+}
+
+func TestSummarizePicksDisambiguatesRepeatedTitles(t *testing.T) {
+	// Exact name matches carry the same title by definition, so a lookup on an
+	// ambiguous name repeats it once per card. This string is what a reload
+	// renders and what feeds the next turn's interpret(); "Dune, Dune" tells
+	// neither of them which two films were on screen.
+	y1, y2 := 2021, 1984
+	picks := []agentPick{
+		{TMDBID: 1, Title: "Dune", Year: &y1},
+		{TMDBID: 2, Title: "Dune", Year: &y2},
+	}
+
+	want := "Looked up: Dune (2021), Dune (1984)"
+	if got := summarizePicks(picks, true); got != want {
+		t.Errorf("summarizePicks() = %q, want %q", got, want)
+	}
+}
+
+func TestSummarizePicksLeavesDistinctTitlesAlone(t *testing.T) {
+	// Only a repeat needs the year; a franchise row is already unambiguous.
+	y := 1977
+	picks := []agentPick{
+		{TMDBID: 1, Title: "Star Wars", Year: &y},
+		{TMDBID: 2, Title: "Star Wars: The Last Jedi", Year: &y},
+	}
+
+	want := "Looked up: Star Wars, Star Wars: The Last Jedi"
+	if got := summarizePicks(picks, true); got != want {
+		t.Errorf("summarizePicks() = %q, want %q", got, want)
+	}
+}
+
+func TestAgentEventDecodesTheResultsKind(t *testing.T) {
+	// The gateway no longer infers a lookup from intent.Title, so this tag is
+	// the only thing standing between a lookup and being stored as "Suggested".
+	var ev agentEvent
+	if err := json.Unmarshal([]byte(`{"type":"results","kind":"lookup"}`), &ev); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if ev.Kind != "lookup" {
+		t.Errorf("agentEvent.Kind = %q, want %q", ev.Kind, "lookup")
+	}
+}
+
+func TestInterpretingLineNamesTheTitleOnALookup(t *testing.T) {
+	// A named-title turn skips discover() on the agent side, so every clause
+	// the discover path composes would describe a search that never ran —
+	// "Looking for movies on Netflix" over a card for one specific film.
+	intent := agentIntent{
+		MediaType: "movie",
+		Title:     "Heat",
+		Genres:    []string{"comedy"},
+	}
+	line := interpretingLine(intent, []string{"Netflix", "Hulu"})
+
+	if !strings.Contains(line, "\u201cHeat\u201d") {
+		t.Errorf("interpretingLine() = %q, want it to name the title", line)
+	}
+	for _, unwanted := range []string{"comedy", "movies", "Netflix"} {
+		if strings.Contains(line, unwanted) {
+			t.Errorf("interpretingLine() = %q, should not mention %q", line, unwanted)
+		}
+	}
+}
+
+func TestInterpretingLineDoesNotEscapeQuotesInATitle(t *testing.T) {
+	// fmt's %q is strconv.Quote: it backslash-escapes quotes inside the
+	// value, and this line goes straight to the user as a comprehension
+	// check. A title carrying its own quotes must read as itself.
+	intent := agentIntent{MediaType: "movie", Title: `"Weird Al" Yankovic`}
+	line := interpretingLine(intent, nil)
+
+	if strings.Contains(line, `\"`) {
+		t.Errorf("interpretingLine() = %q, want no backslash-escaped quotes", line)
+	}
+	if !strings.Contains(line, `"Weird Al" Yankovic`) {
+		t.Errorf("interpretingLine() = %q, want the title verbatim", line)
+	}
+}
+
+func TestAgentIntentDecodesTheTitleField(t *testing.T) {
+	// agentIntent is hand-kept against the agent's DiscoverIntent dump and an
+	// unknown key vanishes silently on decode, so the json tag is pinned here
+	// rather than left to interpretingLine's own test to notice.
+	var intent agentIntent
+	if err := json.Unmarshal([]byte(`{"media_type":"movie","title":"Fargo"}`), &intent); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if intent.Title != "Fargo" {
+		t.Errorf("agentIntent.Title = %q, want %q", intent.Title, "Fargo")
+	}
+}
+
 func TestInterpretingLineDegradesGracefullyWithNoProviderNames(t *testing.T) {
 	line := interpretingLine(agentIntent{MediaType: "tv"}, nil)
 	if strings.Contains(line, " on ") {

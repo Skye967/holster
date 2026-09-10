@@ -28,6 +28,7 @@ CAPABILITY_QUESTION = "on a capability question"
 NEEDS_CLARIFICATION = "on a message that needs clarification"
 INTERPRET_RAISED = "interpret() raised"
 NO_PROVIDERS = "no providers ticked"
+TITLE_LOOKUP = "on a named-title lookup"
 
 
 def raw_movie(tmdb_id: int) -> dict[str, Any]:
@@ -42,6 +43,24 @@ def raw_movie(tmdb_id: int) -> dict[str, Any]:
         "vote_average": 7.5,
         "vote_count": 500,
         "genre_ids": [],
+    }
+
+
+def raw_named(
+    tmdb_id: int, title: str, vote_count: int, media_type: str = "movie"
+) -> dict[str, Any]:
+    """A /search/multi result row. Unlike raw_movie's generated "Title 101"
+    names, a title lookup asserts on the name, on the vote floor and on which
+    media type won, so all three are callers' business here. media_type is on
+    the row itself, which is what distinguishes /search/multi's shape from the
+    per-type endpoints'."""
+    return {
+        **raw_movie(tmdb_id),
+        "media_type": media_type,
+        "title": title,
+        "name": title,
+        "first_air_date": "2020-01-01",
+        "vote_count": vote_count,
     }
 
 

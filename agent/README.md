@@ -73,14 +73,18 @@ minted, so a request can be followed across services.
 service, region, runtime, year, genre, cast, crew, keywords), "more like this", and
 per-title streaming availability. Callers pass names — "Tilda Swinton", "heist" — and
 the client resolves them to TMDB IDs and caches the mapping. A `vote_count` floor is
-always applied and cannot be lowered; subscription matches are `flatrate` only. No
-results is an empty list; only TMDB being unreachable or 429/5xx raises
-`TMDBUnavailable`. It takes no URL or raw query from its caller, and reads no
+always applied to `discover` and cannot be lowered; subscription matches are
+`flatrate` only. No results is an empty list; only TMDB being unreachable or 429/5xx
+raises `TMDBUnavailable`. It takes no URL, endpoint, or raw query from its caller —
+every path is built here from a validated media type or a literal — and reads no
 environment — the token is passed to `TMDBClient(...)`.
 
 ## Catalog tool
 
-`catalog_tool.py` puts a model in front of `tmdb.py`: two calls, not an agent loop.
+`catalog_tool.py` puts a model in front of `tmdb.py`: two calls, not an agent loop —
+or one, when the message names a title and `search()` looks it up instead. A lookup
+answers with every title carrying that name — the film itself, and anything carrying
+it on, so "Star Wars" reaches the sequels too.
 `interpret()` turns a message into `DiscoverIntent` — `tmdb.discover()`'s creative
 parameters, with no `watch_region`/`watch_providers` field, so the model can never
 choose which streaming services results come from. `search()` calls `discover()` with
@@ -126,7 +130,9 @@ gateway with the message. The gateway only reads the rows; what each verdict *me
 a recommendation is decided here, in `search()`:
 
 - **Every verdict but `want_to_watch` removes that title from the candidates `rank()`
-  sees** — the four judgments are settled opinions, `want_to_watch` is an open
+  sees** (on the discover path; a named-title lookup runs no `rank()` and applies no
+  verdict filter, because a factual question about a title is not a recommendation) —
+  the four judgments are settled opinions, `want_to_watch` is an open
   intention. A set filter applied after the relaxation ladder, never a prompt
   instruction, so it holds whatever the model does. An unrecognised verdict excludes
   too, which is the safe direction.

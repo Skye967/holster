@@ -21,6 +21,7 @@ from chat import (
     ChatRequest,
     HistoryTurn,
     _nothing_found_message,
+    _title_not_found_message,
     stream_chat,
 )
 from testutil import (
@@ -29,10 +30,12 @@ from testutil import (
     MOVIE_A,
     NEEDS_CLARIFICATION,
     NO_CANDIDATES,
+    TITLE_LOOKUP,
     FakeTMDB,
     make_intent,
     ok_interpret,
     rank_must_not_run,
+    raw_named,
 )
 from tmdb import Title, TMDBClient
 
@@ -94,9 +97,7 @@ def test_capability_question_short_circuits_with_a_message() -> None:
     assert fake_tmdb.requests == []
 
 
-def test_capability_question_degrades_gracefully_with_uncached_provider_names() -> (
-    None
-):
+def test_capability_question_degrades_gracefully_with_uncached_provider_names() -> None:
     """watch_providers non-empty but watch_provider_names empty is a real,
     reachable state (loadChatContext's per-country name cache hasn't warmed
     up yet — see chat.go) — must not be misread as "no services picked"."""
@@ -206,6 +207,7 @@ def test_successful_search_emits_intent_then_results_then_done() -> None:
     assert pick["title"] == "Fake Heist"
     assert pick["blurb"] == "great fit"
     assert events[1]["relaxed"] == []
+    assert events[1]["kind"] == "search"
     # Enrichment (TASKS.md T16) reaches the wire event: genre_names is a pure
     # local lookup from MOVIE_A's genre_ids ([80] -> Crime), no TMDB call
     # needed; the other three fields come back empty because this test's
@@ -446,6 +448,16 @@ def test_all_judged_message_replaces_the_loosening_advice() -> None:
     assert "how long" in _nothing_found_message(["runtime"], all_judged=False)
 
 
+def test_title_not_found_message_quotes_the_name_back() -> None:
+    """Echoing the name is the point: a misheard or misspelled title is the
+    likeliest reason a lookup found nothing, and the user can only see that
+    if the text shows what was searched for."""
+    text = _title_not_found_message("Nonexistent Film")
+
+    assert '"Nonexistent Film"' in text
+    assert "loosening" not in text
+
+
 def test_chat_request_rejects_an_unknown_media_type() -> None:
     """TitleVerdict types media_type as a Literal while verdict is a plain str,
     and the docstring justifies the split at length - this is what holds the
@@ -487,3 +499,72 @@ def test_verdicts_reach_search_and_shape_the_reply() -> None:
 
     assert [e["type"] for e in events] == ["intent", "message", "done"]
     assert "rated all of them" in events[1]["text"]
+
+
+def test_unresolvable_title_gets_its_own_message_not_the_loosening_advice() -> None:
+    """A name that TMDB can't resolve has no constraint to loosen, so
+    _nothing_found_message's advice would read as nonsense in reply to it."""
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="do you have Nonexistent Film?", watch_region="US", watch_providers=[8]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Nonexistent Film")
+
+    events = asyncio.run(
+        _collect(
+            req, fake_tmdb.client(), fake_interpret, rank_must_not_run(TITLE_LOOKUP)
+        )
+    )
+
+    assert [e["type"] for e in events] == ["intent", "message", "done"]
+    assert "Nonexistent Film" in events[1]["text"]
+    assert "loosening" not in events[1]["text"]
+
+
+def test_results_event_marks_a_lookup_so_history_says_what_happened() -> None:
+    """services/gateway/chat.go's summarizePicks reads this to choose between
+    "Looked up:" and "Suggested:", and that text is what the next turn's
+    interpret() sees. Drop the field and a lookup is stored, and read back,
+    as a recommendation the assistant never made."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/multi", {"results": [raw_named(101, "Heat", 8658)]})
+    req = ChatRequest(
+        message="is Heat on netflix?", watch_region="US", watch_providers=[8]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    events = asyncio.run(
+        _collect(
+            req, fake_tmdb.client(), fake_interpret, rank_must_not_run(TITLE_LOOKUP)
+        )
+    )
+
+    assert [e["type"] for e in events] == ["intent", "results", "done"]
+    assert events[1]["kind"] == "lookup"
+    assert [p["title"] for p in events[1]["picks"]] == ["Heat"]
+
+
+def test_intent_event_carries_the_title_for_the_gateways_line() -> None:
+    """services/gateway/chat.go's interpretingLine templates off this field —
+    excluded from the dump and the gateway silently says "Looking for movies"
+    over a title lookup."""
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="is Heat on netflix?", watch_region="US", watch_providers=[8]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    events = asyncio.run(
+        _collect(
+            req, fake_tmdb.client(), fake_interpret, rank_must_not_run(TITLE_LOOKUP)
+        )
+    )
+
+    assert events[0]["type"] == "intent"
+    assert events[0]["intent"]["title"] == "Heat"

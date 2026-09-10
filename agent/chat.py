@@ -11,16 +11,21 @@ lets an "intent" event reach the caller in ~1-2s while the full pipeline
 Event shapes on the wire (one JSON object per line):
 
     {"type": "intent", "intent": {...DiscoverIntent fields...}}
-    {"type": "results", "relaxed": [...], "picks": [{...Title fields, "genre_names":
+    {"type": "results", "kind": "search" | "lookup", "relaxed": [...],
+        "picks": [{...Title fields, "genre_names":
         [...], "runtime_minutes": int | None, "cast": [...], "available_on":
         [...Provider fields] | None, "blurb": str}]}
         -- available_on is None only when the availability check itself
            failed, distinct from [] (confirmed available nowhere the caller
            subscribes) — see catalog_tool.py's _safe_availability
+        -- kind is which path search() took, recorded where the branch is
+           taken rather than inferred from intent fields afterwards; the
+           gateway writes it into stored history (chat.go's summarizePicks)
     {"type": "message", "text": str}   -- a plain reply with no candidates
                                            (no subscriptions, capability
-                                           question, clarifying question, or
-                                           nothing found)
+                                           question, clarifying question, a
+                                           named title that didn't resolve,
+                                           or nothing found)
     {"type": "error", "reason": str}   -- one of a fixed set, see _error_reason
     {"type": "done"}
 
@@ -135,6 +140,21 @@ def _human_join(items: Sequence[str]) -> str:
     return ", ".join(items[:-1]) + f" and {items[-1]}"
 
 
+def _title_not_found_message(title: str) -> str:
+    """A named title nothing carried — TMDB returned no rows, or none of the
+    rows it did return actually bear the name. Distinct from
+    _nothing_found_message because the advice differs: there is nothing to
+    loosen, and "try loosening what you're looking for" reads as nonsense in
+    reply to a name. Quotes the name back so a misheard or misspelled one is
+    visible to the user, which is the likeliest cause -- and saying so is
+    honest where a card for the nearest real title would assert an answer
+    about something they never asked about."""
+    return (
+        f'I couldn\'t find anything called "{title}". Check the spelling, or '
+        "tell me what you're in the mood for instead."
+    )
+
+
 def _nothing_found_message(relaxed: Sequence[str], all_judged: bool) -> str:
     """Why nothing came back, in the caller's words. all_judged takes
     precedence over relaxed: when every title found was already rated, the
@@ -214,7 +234,9 @@ async def stream_chat(
         # is_capability_question/clarifying_question never reach here in
         # practice (search() returns early for both — see catalog_tool.py)
         # but excluded on principle: neither is a search parameter,
-        # meaningless in the gateway's template.
+        # meaningless in the gateway's template. `title` is not excluded with
+        # them — it is what the turn is searching for, and the gateway's
+        # interpreting line is templated off it.
         await queue.put(
             {
                 "type": "intent",
@@ -268,8 +290,20 @@ async def stream_chat(
             await queue.put(
                 {
                     "type": "results",
+                    "kind": result.kind,
                     "relaxed": result.relaxed,
                     "picks": result.picks,
+                }
+            )
+        elif result.kind == "lookup" and result.intent is not None:
+            # A name that resolved to nothing — never the relaxation copy,
+            # which has no constraint to talk about here. Keyed on the path
+            # search() actually took, the same signal the results event
+            # carries, so the two can never disagree about what a lookup is.
+            await queue.put(
+                {
+                    "type": "message",
+                    "text": _title_not_found_message(result.intent.title),
                 }
             )
         else:

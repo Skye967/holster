@@ -137,8 +137,10 @@ originally planned, because film verdicts predict film taste and music does not.
 ## Regions
 
 Streaming availability is country-specific — a title on Netflix in the US may be on a
-different service in the UK. `users.country` is set at signup and every catalog query
-carries `watch_region`.
+different service in the UK. `users.country` is set at signup and every catalog query carries
+`watch_region`, with one named exception: `/search/multi`, which accepts no region
+parameter. The availability check that enriches each of its results does carry one,
+so what a card claims about streaming is still country-scoped.
 
 ## Data model
 

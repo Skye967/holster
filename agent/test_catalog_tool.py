@@ -23,6 +23,7 @@ import tmdb
 from catalog_tool import (
     _UNAVAILABLE_PLACEHOLDER,
     MAX_TASTE_TITLES,
+    MAX_TITLE_MATCHES,
     TASTE_HEADER,
     CatalogResult,
     CatalogToolError,
@@ -34,6 +35,7 @@ from catalog_tool import (
     TitleRef,
     TitleVerdict,
     _format_candidates,
+    _matching_titles,
     enrich_known_title,
     enrich_watchlist,
     interpret,
@@ -49,12 +51,14 @@ from testutil import (
     NEEDS_CLARIFICATION,
     NO_CANDIDATES,
     NO_PROVIDERS,
+    TITLE_LOOKUP,
     FakeTMDB,
     make_intent,
     ok_interpret,
     rank_must_not_run,
     raw_movie,
     raw_movie_full,
+    raw_named,
 )
 from tmdb import Title, TMDBUnavailable
 
@@ -63,16 +67,22 @@ def run[T](coro: Coroutine[Any, Any, T]) -> T:
     return asyncio.run(coro)
 
 
-def _title(tmdb_id: int, media_type: tmdb.MediaType = "movie") -> Title:
+def _title(
+    tmdb_id: int,
+    media_type: tmdb.MediaType = "movie",
+    *,
+    title: str | None = None,
+    vote_count: int = 500,
+) -> Title:
     return Title(
         tmdb_id=tmdb_id,
         media_type=media_type,
-        title=f"Title {tmdb_id}",
+        title=title or f"Title {tmdb_id}",
         year=2020,
         overview="An overview.",
         poster_url=None,
         vote_average=7.0,
-        vote_count=500,
+        vote_count=vote_count,
         genre_ids=[],
     )
 
@@ -1367,3 +1377,821 @@ def test_enrich_watchlist_degrades_on_an_unusable_tmdb_body() -> None:
 
     assert [p["tmdb_id"] for p in picks] == [101]
     assert picks[0]["unavailable"] is True
+
+
+# --- Named-title lookup (T27) ------------------------------------------------
+
+
+def _names(tiers: tuple[list[Title], list[Title], list[Title]]) -> list[str]:
+    """All three tiers flattened — the order lookup_title considers them in."""
+    return [t["title"] for tier in tiers for t in tier]
+
+
+def test_matching_titles_drops_substring_hits() -> None:
+    # "Red Heat" carries the word, not the name, and no tier may claim it. A
+    # bare contains-match is why raw top-3 for "Heat" is two wrong films.
+    # "The Heat" is the separate article tier's business, asserted below and
+    # in test_title_lookup_wont_answer_about_heat_with_the_heat — which is
+    # where the guarantee that matters lives, since that tier is only ever
+    # consulted when no exact carry clears the floor.
+    heat = [_title(i, title=n) for i, n in enumerate(("Heat", "The Heat", "Red Heat"))]
+
+    exact, article, continued = _matching_titles("Heat", heat)
+    assert [t["title"] for t in exact] == ["Heat"]
+    assert [t["title"] for t in article] == ["The Heat"]
+    assert continued == []
+
+
+def test_matching_titles_keeps_the_rest_of_a_franchise() -> None:
+    # The bug this tier exists for: "is Star Wars on Netflix" answered with
+    # the 1977 film alone, hiding every sequel that continues the name.
+    results = [
+        _title(1, title="Star Wars", vote_count=22831),
+        _title(2, title="Star Wars: The Last Jedi", vote_count=16652),
+        _title(3, title="Spaceballs", vote_count=1500),
+    ]
+
+    assert _names(_matching_titles("star wars", results)) == [
+        "Star Wars",
+        "Star Wars: The Last Jedi",
+    ]
+
+
+def test_matching_titles_puts_an_exact_carry_above_a_longer_one() -> None:
+    # Tier before votes: the continuation has three times the votes here and
+    # still must not displace the title actually named.
+    results = [
+        _title(1, title="Dune: Part Two", vote_count=9000),
+        _title(2, title="Dune", vote_count=3000),
+    ]
+
+    assert _names(_matching_titles("Dune", results)) == ["Dune", "Dune: Part Two"]
+
+
+def test_matching_titles_orders_within_a_tier_by_votes() -> None:
+    # Three real titles share the name "Spider-Man"; the 2002 film is the one
+    # someone asking about Spider-Man means.
+    results = [
+        _title(1, title="Spider-Man", vote_count=239),
+        _title(2, title="Spider-Man", vote_count=21372),
+    ]
+
+    exact, _, _ = _matching_titles("Spider-Man", results)
+    assert [t["tmdb_id"] for t in exact] == [2, 1]
+
+
+def test_matching_titles_keeps_a_genuinely_ambiguous_name() -> None:
+    # Two real films with the same name must both survive — that ambiguity is
+    # what the multi-card result set exists to show.
+    results = [_title(1, title="Dune"), _title(3, title="Dune")]
+
+    exact, _, _ = _matching_titles("Dune", results)
+    assert len(exact) == 2
+
+
+def test_matching_titles_survives_how_the_name_was_typed() -> None:
+    # TMDB's own search already resolves every one of these, so rejecting the
+    # row it just returned is our comparison failing, not TMDB. The curly
+    # apostrophe is what a phone substitutes by default.
+    typed = [
+        ("shogun", "Sh\u014dgun"),
+        ("Amelie", "Am\u00e9lie"),
+        ("Spiderman", "Spider-Man"),
+        ("Oceans Eleven", "Ocean's Eleven"),
+        ("Schindler\u2019s List", "Schindler's List"),
+        ("  the matrix ", "The Matrix"),
+    ]
+
+    for query, held in typed:
+        assert _names(_matching_titles(query, [_title(1, title=held)])) == [held]
+
+
+def test_matching_titles_sorts_a_leading_article_into_its_own_tier() -> None:
+    # "lord of the rings" must reach titles that all begin "The Lord of the
+    # Rings:" as continuations, while "The Heat" is only ever an article
+    # carry of "Heat" — never an exact one. The separation is what lets
+    # lookup_title prefer The Godfather for "godfather" without ever
+    # preferring The Heat for "heat".
+    lotr = [_title(1, title="The Lord of the Rings: The Two Towers")]
+    exact, article, continued = _matching_titles("Lord of the Rings", lotr)
+    assert (exact, article) == ([], [])
+    assert [t["title"] for t in continued] == [lotr[0]["title"]]
+
+    exact, article, _ = _matching_titles("Heat", [_title(1, title="The Heat")])
+    assert exact == []
+    assert [t["title"] for t in article] == ["The Heat"]
+
+
+def test_matching_titles_requires_a_word_boundary() -> None:
+    # "Moon" must not reach "MoonPhase"; only a continued name counts.
+    assert _names(_matching_titles("Moon", [_title(1, title="MoonPhase")])) == []
+
+    wonderful = [_title(1, title="It's a Wonderful Life")]
+    assert _names(_matching_titles("It", wonderful)) == []
+
+
+def test_matching_titles_empty_when_nothing_carries_the_name() -> None:
+    # The caller returns no picks on [], so a misspelled name lands on the
+    # not-found message rather than on an unrelated title's card. A leading
+    # article is not a misspelling — "matrix" belongs to The Matrix and is
+    # covered by the article tier above.
+    assert _names(_matching_titles("Gladiater", [_title(1, title="Gladiator")])) == []
+    assert _names(_matching_titles("Heat 2", [_title(1, title="Heat")])) == []
+
+
+def _queue_title_lookup(fake_tmdb: FakeTMDB, *rows: dict[str, Any]) -> None:
+    """One /search/multi page, in the order TMDB returned it — which is the
+    order lookup_title keeps."""
+    fake_tmdb.ok("/search/multi", {"results": list(rows)})
+
+
+def _queue_enrichment(
+    fake_tmdb: FakeTMDB,
+    *,
+    media_type: str,
+    tmdb_id: int,
+    title: str,
+    flatrate: list[dict[str, Any]],
+) -> None:
+    fake_tmdb.ok(
+        f"/{media_type}/{tmdb_id}",
+        {
+            "id": tmdb_id,
+            "title": title,
+            "name": title,
+            "release_date": "1995-01-01",
+            "first_air_date": "1995-01-01",
+            "overview": "",
+            "vote_average": 7.0,
+            "vote_count": 500,
+            "genres": [],
+            "runtime": 170,
+            "credits": {"cast": []},
+        },
+    )
+    fake_tmdb.ok(
+        f"/{media_type}/{tmdb_id}/watch/providers",
+        {"results": {"US": {"flatrate": flatrate}}},
+    )
+
+
+NETFLIX = {"provider_id": 8, "provider_name": "Netflix", "logo_path": None}
+
+
+def test_search_looks_a_named_title_up_instead_of_discovering() -> None:
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Heat", 8658))
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=1, title="Heat", flatrate=[NETFLIX]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    result = run(
+        search(
+            "is Heat on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert [p["title"] for p in result.picks] == ["Heat"]
+    assert result.picks[0]["available_on"] == [
+        {"provider_id": 8, "provider_name": "Netflix", "logo_url": None}
+    ]
+    # The discover ladder never runs, so there is nothing to relax.
+    assert result.relaxed == []
+    assert fake_tmdb.count("/discover/movie") == 0
+
+
+def test_title_lookup_still_streams_an_interpreting_line() -> None:
+    # A lookup is several TMDB round trips, so it needs the comprehension
+    # line as much as a discover() turn does — unlike the capability and
+    # clarifying short-circuits, which fire no on_intent at all.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Heat", 8658))
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=1, title="Heat", flatrate=[]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    seen: list[DiscoverIntent] = []
+
+    async def on_intent(intent: DiscoverIntent) -> None:
+        seen.append(intent)
+
+    run(
+        search(
+            "is Heat on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+            on_intent=on_intent,
+        )
+    )
+
+    assert [i.title for i in seen] == ["Heat"]
+
+
+def test_title_lookup_ignores_the_interpreted_media_type() -> None:
+    # "The Office" as a movie is a 1930 silent film; as TV it is the 2005
+    # series. interpret() guessed movie here and must not be believed.
+    fake_tmdb = FakeTMDB()
+    # TMDB's own order: the series first, the 1930 film after it. The film
+    # is under MIN_VOTE_COUNT anyway, so both signals point the same way.
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(22, "The Office", 5452, media_type="tv"),
+        raw_named(11, "The Office", 13),
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="tv", tmdb_id=22, title="The Office", flatrate=[NETFLIX]
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=11, title="The Office", flatrate=[]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        # make_intent's media_type is "movie" — the wrong guess, on purpose.
+        return make_intent(title="The Office")
+
+    result = run(
+        search(
+            "do you have The Office?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert result.picks[0]["media_type"] == "tv"
+    assert result.picks[0]["tmdb_id"] == 22
+
+
+def test_title_lookup_answers_no_rather_than_nothing_matched() -> None:
+    # The point of the feature: a title the user cannot stream comes back as
+    # a real card with an empty available_on ("Not on your services"), never
+    # as an empty result that reads as "no such film".
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Heat", 8658))
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=1, title="Heat", flatrate=[]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    result = run(
+        search(
+            "is Heat on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert len(result.picks) == 1
+    assert result.picks[0]["available_on"] == []
+
+
+def test_title_lookup_is_not_filtered_by_verdicts() -> None:
+    # search() drops already-judged titles from a recommendation. A question
+    # about a named title is not a recommendation — "is Heat on my services"
+    # deserves an answer whether or not Heat is marked seen.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Heat", 8658))
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=1, title="Heat", flatrate=[NETFLIX]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    result = run(
+        search(
+            "is Heat on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+            verdicts=[TitleVerdict(tmdb_id=1, media_type="movie", verdict="seen")],
+        )
+    )
+
+    assert [p["tmdb_id"] for p in result.picks] == [1]
+
+
+def test_title_lookup_caps_the_number_of_matches() -> None:
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb, *(raw_named(i, "Dune", 1000 - i) for i in range(1, 8))
+    )
+    for i in range(1, 8):
+        _queue_enrichment(
+            fake_tmdb, media_type="movie", tmdb_id=i, title="Dune", flatrate=[]
+        )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Dune")
+
+    result = run(
+        search(
+            "is Dune streaming?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert len(result.picks) == catalog_tool.MAX_TITLE_MATCHES
+
+
+def test_title_lookup_that_resolves_to_nothing_returns_no_picks() -> None:
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb)
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Nonexistent Film")
+
+    result = run(
+        search(
+            "do you have Nonexistent Film?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert result.picks == []
+    assert result.intent is not None and result.intent.title == "Nonexistent Film"
+    assert fake_tmdb.count("/discover/movie") == 0
+
+
+def test_whitespace_only_title_is_not_a_lookup() -> None:
+    # Normalized alongside clarifying_question — a blank must never reach
+    # search_titles() as an empty query.
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="   ")
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(picks=[])
+
+    run(
+        search(
+            "something funny",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=fake_rank,
+        )
+    )
+
+    assert fake_tmdb.count("/discover/movie") == 1
+    assert fake_tmdb.count("/search/multi") == 0
+
+
+def test_title_lookup_never_names_a_service_the_user_lacks() -> None:
+    # TASKS.md T13's availability invariant, on this path. Without a provider the
+    # caller doesn't have in the response, deleting the filter would keep every
+    # other lookup test green.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Heat", 8658))
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=1,
+        title="Heat",
+        flatrate=[
+            NETFLIX,
+            {"provider_id": 15, "provider_name": "Hulu", "logo_path": None},
+        ],
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    result = run(
+        search(
+            "is Heat on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],  # Netflix only — Hulu must not appear
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert result.picks[0]["available_on"] == [
+        {"provider_id": 8, "provider_name": "Netflix", "logo_url": None}
+    ]
+
+
+def test_title_lookup_keeps_the_real_title_when_enrichment_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Title is already in hand from the search, so a failed details call
+    # costs runtime and cast — never the name. enrich_known_title's
+    # _UNAVAILABLE_PLACEHOLDER would blank the card instead, and both
+    # agentPick.Unavailable and AgentPick.unavailable document that shape as
+    # absent on every /chat pick.
+    monkeypatch.setattr(tmdb, "_sleep", AsyncMock())
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Heat", 8658))
+    fake_tmdb.queue("/movie/1", *[httpx2.Response(503) for _ in range(3)])
+    fake_tmdb.ok("/movie/1/watch/providers", {"results": {"US": {"flatrate": []}}})
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    result = run(
+        search(
+            "is Heat on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    pick = result.picks[0]
+    assert pick["title"] == "Heat"
+    assert pick["runtime_minutes"] is None
+    assert "unavailable" not in pick
+
+
+def test_title_lookup_wont_let_a_zero_vote_namesake_win() -> None:
+    # Name first, floor second. TMDB has a 0-vote short called "Spiderman";
+    # both rows carry the name, and the floor is what decides between them.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(1, "Spider-Man", 23857),
+        raw_named(2, "Spiderman", 0),
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=1, title="Spider-Man", flatrate=[]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Spiderman")
+
+    result = run(
+        search(
+            "do you have Spiderman?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert [p["tmdb_id"] for p in result.picks] == [1]
+
+
+def test_title_lookup_prefers_an_article_carry_to_an_obscure_namesake() -> None:
+    # Live TMDB for "godfather": four namesakes, the best of them on 18
+    # votes, and The Godfather on 23,516 — reachable only across a leading
+    # article. Matching on the typed key alone answered with the 18-vote
+    # film, and summarizePicks stored it as the answer.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(1, "GodFather", 18),
+        raw_named(2, "The Godfather", 23516),
+    )
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=2,
+        title="The Godfather",
+        flatrate=[NETFLIX],
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="godfather")
+
+    result = run(
+        search(
+            "is godfather on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert [p["title"] for p in result.picks] == ["The Godfather"]
+
+
+def test_title_lookup_wont_answer_about_heat_with_the_heat() -> None:
+    # The other half of the tier split, and the reason the article tier is
+    # consulted rather than merged: "Heat" is Heat (1995). The Heat has to
+    # lose here even though it clears the floor comfortably, because an exact
+    # carry that clears the floor settles the question by itself.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(1, "The Heat", 4261),
+        raw_named(2, "Heat", 8658),
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=2, title="Heat", flatrate=[NETFLIX]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat")
+
+    result = run(
+        search(
+            "is Heat on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert [p["title"] for p in result.picks] == ["Heat"]
+
+
+def test_title_lookup_matches_a_ligature_spelled_out() -> None:
+    # NFKD splits an accent off its letter but leaves æ/ø/ł whole. TMDB's own
+    # search resolves "Aeon Flux" to Æon Flux and returns it first, so
+    # rejecting that row is our comparison failing, not TMDB.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Æon Flux", 2537))
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=1,
+        title="Æon Flux",
+        flatrate=[NETFLIX],
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Aeon Flux")
+
+    result = run(
+        search(
+            "is Aeon Flux on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert [p["title"] for p in result.picks] == ["Æon Flux"]
+
+
+def test_title_lookup_answers_about_a_title_under_the_vote_floor() -> None:
+    # The floor is a preference, not a gate. A real but obscure title — most
+    # TV, documentaries, foreign films, anything released last week — must be
+    # answerable, not reported as a name that does not exist.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Somebody Somewhere", 120))
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=1,
+        title="Somebody Somewhere",
+        flatrate=[NETFLIX],
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Somebody Somewhere")
+
+    result = run(
+        search(
+            "is Somebody Somewhere on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert [p["title"] for p in result.picks] == ["Somebody Somewhere"]
+
+
+def test_title_lookup_returns_nothing_when_no_row_carries_the_name() -> None:
+    # "Heat 2" does not exist. TMDB still returns Heat and two films that
+    # merely contain the word; answering with Heat's card asserts a title the
+    # user never asked about, and stores it as the answer. Better to say so.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(1, "Heat", 8658),
+        raw_named(2, "The Heat", 4200),
+        raw_named(3, "Red Heat", 900),
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Heat 2")
+
+    result = run(
+        search(
+            "is Heat 2 on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert result.picks == []
+
+
+def test_title_lookup_keeps_an_exact_match_under_the_vote_floor() -> None:
+    # The floor decides whether an exact match may override TMDB's ordering.
+    # It must never remove one from consideration first: filtering the pool
+    # before matching answered "is Task streaming?" with Task Force — a
+    # different title, presented as the answer and stored as one.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(1, "Task", tmdb.MIN_VOTE_COUNT - 50),
+        raw_named(2, "Task Force", tmdb.MIN_VOTE_COUNT * 2),
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=1, title="Task", flatrate=[NETFLIX]
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=2, title="Task Force", flatrate=[]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Task")
+
+    result = run(
+        search(
+            "is Task on my services?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    # Task Force continues the name and may follow, but never leads.
+    assert result.picks[0]["title"] == "Task"
+
+
+def test_title_lookup_answers_about_the_name_when_nothing_clears_the_floor() -> None:
+    # The floor filters, it never gates. Every "Nightfall" on TMDB is under
+    # 200 votes, so gating on it answered "do you have Nightfall?" with
+    # The Nightfall — a different title, presented and stored as the answer.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(1, "The Nightfall", 5),
+        raw_named(2, "Nightfall", 107),
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=2, title="Nightfall", flatrate=[]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Nightfall")
+
+    result = run(
+        search(
+            "do you have Nightfall?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert [p["title"] for p in result.picks] == ["Nightfall"]
+
+
+def test_title_lookup_picks_the_name_over_tmdbs_top_result() -> None:
+    # The fixtures elsewhere put the intended winner first, so the whole
+    # matcher could be deleted and they would stay green. Here TMDB ranks a
+    # different title first and the exact carry must still win.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(1, "Task Force", tmdb.MIN_VOTE_COUNT * 2),
+        raw_named(2, "Task", tmdb.MIN_VOTE_COUNT * 3),
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=2, title="Task", flatrate=[NETFLIX]
+    )
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=1, title="Task Force", flatrate=[]
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Task")
+
+    result = run(
+        search(
+            "is Task on my services?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert result.picks[0]["title"] == "Task"
+
+
+def test_title_lookup_shows_the_rest_of_a_franchise() -> None:
+    # The reported bug: "is Star Wars on Netflix" returned the 1977 film
+    # alone, because every sequel continues the name rather than equalling it.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb,
+        raw_named(1, "Star Wars", 22831),
+        raw_named(2, "Star Wars: The Last Jedi", 16652),
+        raw_named(3, "Spaceballs", 1500),
+    )
+    for i, name in ((1, "Star Wars"), (2, "Star Wars: The Last Jedi")):
+        _queue_enrichment(
+            fake_tmdb, media_type="movie", tmdb_id=i, title=name, flatrate=[]
+        )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Star Wars")
+
+    result = run(
+        search(
+            "is Star Wars on netflix?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert [p["title"] for p in result.picks] == [
+        "Star Wars",
+        "Star Wars: The Last Jedi",
+    ]
+
+
+def test_title_lookup_ignores_an_explicit_limit() -> None:
+    # intent.limit sizes a recommendation list, and carries forward from an
+    # earlier turn. A lookup answers a question instead, and an ambiguous
+    # name *is* the answer: "just one" said two turns ago must not hide Dune
+    # (1984) from someone asking whether Dune is streaming.
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(
+        fake_tmdb, *(raw_named(i, "Dune", 1000 - i) for i in range(1, 7))
+    )
+    for i in range(1, 7):
+        _queue_enrichment(
+            fake_tmdb, media_type="movie", tmdb_id=i, title="Dune", flatrate=[]
+        )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Dune", limit=1)
+
+    result = run(
+        search(
+            "just one — is Dune streaming?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert len(result.picks) == MAX_TITLE_MATCHES

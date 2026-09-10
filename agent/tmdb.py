@@ -13,16 +13,23 @@ about:
   life of the process. Genre names resolve against a frozen table — TMDB's genre
   list is reference data that changes about twice a decade.
 - **The correctness floors from TASKS.md T12.** ``watch_region`` is required on
-  every catalog call; a ``vote_count.gte`` floor is always applied and cannot be
-  overridden; subscription matching is ``flatrate`` only, kept separate from
-  rent/buy.
+  every call whose answer depends on country — availability, and any browse that
+  filters by service. Name search does not: ``/search/multi`` takes no region,
+  and the availability step that follows it carries one. A ``vote_count.gte``
+  floor is always applied to ``discover`` and cannot be overridden; subscription
+  matching is ``flatrate`` only, kept separate from rent/buy.
 - **"Nothing matched" vs "something broke."** No results is an empty list, never
   an exception. Only TMDB being unreachable or returning 429/5xx raises
   (``TMDBUnavailable``), which the caller turns into "try again later" — never a
   status code on screen.
 
-The client takes no URL, endpoint, or raw query from its caller — see the
-invariant in ``../CLAUDE.md``. It reads no environment; the token is passed in.
+The client takes no URL, endpoint, or raw query from its caller — the
+invariant in ``../CLAUDE.md``. Every path is built here from a validated
+``MediaType`` or a literal, never from a caller-supplied string. Search
+*terms* are the one caller-supplied value that reaches TMDB, as a ``query``
+parameter: person and keyword names via ``_resolve_name``, and a title via
+``search_titles``. That is a value filled into a fixed destination, not a
+destination. It reads no environment; the token is passed in.
 """
 
 from __future__ import annotations
@@ -47,7 +54,9 @@ LANGUAGE = "en-US"
 
 # A correctness floor, not a preference: without it "highest rated sci-fi"
 # returns an obscure short with three 10/10 votes. The model must not be able to
-# lower it, so it is not a parameter.
+# lower it, so it is not a parameter. Unconditional on discover(); catalog_tool's
+# name lookup reuses the number to rank namesakes, where it filters within a
+# tier rather than gating (see lookup_title).
 MIN_VOTE_COUNT = 200
 
 REQUEST_TIMEOUT = 10.0
@@ -507,23 +516,46 @@ class TMDBClient:
         if ids:
             params[key] = ",".join(map(str, ids))
 
-    async def search_titles(
-        self, query: str, *, media_type: MediaType | None = None
-    ) -> list[Title]:
-        """Find titles by name. Without media_type, searches both movies and TV;
-        merged results are ordered by vote count as a prominence proxy."""
-        if media_type is not None:
-            _validate_media_type(media_type)
-        types: list[MediaType] = [media_type] if media_type else ["movie", "tv"]
-        results: list[Title] = []
-        for mt in types:
-            data = await self._get(
-                f"/search/{mt}",
-                {"query": query, "include_adult": "false", "language": LANGUAGE},
-            )
-            results.extend(_trim_title(r, mt) for r in data.get("results", []))
-        results.sort(key=lambda t: t["vote_count"], reverse=True)
-        return results
+    async def search_titles(self, query: str) -> list[Title]:
+        """Find titles by name, in TMDB's own relevance order.
+
+        /search/multi rather than /search/movie plus /search/tv: one request
+        instead of two, and TMDB ranks films and series against each other
+        rather than leaving us to merge two lists that each know nothing of
+        the other. Its matching also handles what a person actually types —
+        it resolves "Shogun" to "Shōgun", "Amelie" to "Amélie", and "Oceans
+        Eleven" to "Ocean's Eleven".
+
+        The order is returned exactly as TMDB gave it. Re-sorting — by vote
+        count, say — discards the relevance signal and lifts a popular
+        near-match above an exact one; a caller that wants a different
+        ordering should apply it to this list, not ask for it here.
+
+        Only movie and tv rows are kept: /search/multi returns people too,
+        and a page can be mostly people ("Jackie Brown" returns nine)
+        without costing the real answer, which is still in what remains.
+
+        The isinstance guard is the same promise _get's non-object check
+        makes one level up: this filter reads the row before _trim_title's
+        own except can, so without it a malformed row surfaces as an
+        AttributeError bug rather than the TMDBError it is.
+        """
+        data = await self._get(
+            "/search/multi",
+            {"query": query, "include_adult": "false", "language": LANGUAGE},
+        )
+        results = data.get("results") or []
+        if not isinstance(results, list):
+            # Present but the wrong shape. Left to the filter below this would
+            # drop every row and read as "no such title" — a claim about the
+            # user's spelling, not about TMDB. See the module docstring's
+            # "'Nothing matched' vs 'something broke'".
+            _unusable("search result list", TypeError(type(results).__name__))
+        return [
+            _trim_title(r, cast(MediaType, r["media_type"]))
+            for r in results
+            if isinstance(r, dict) and r.get("media_type") in ("movie", "tv")
+        ]
 
     async def discover(
         self,
