@@ -29,6 +29,21 @@ export function gatewayErrorText(err: unknown, fallback: string): string {
     : fallback
 }
 
+// The browser and this container reach the gateway at different addresses. A
+// browser resolves NEXT_PUBLIC_GATEWAY_URL on the host; server components and
+// route handlers run inside the container, where that URL's localhost is the
+// container itself. GATEWAY_SERVICE_URL is the compose-network address, set
+// only for the containerised web service — unset (bun run dev on the host),
+// both callers share an origin and the public URL is right for each.
+//
+// Deliberately not NEXT_PUBLIC_: that prefix would inline it into the client
+// bundle, the one place it must never appear.
+function gatewayBase(): string | undefined {
+  return typeof window === "undefined"
+    ? (process.env.GATEWAY_SERVICE_URL ?? process.env.NEXT_PUBLIC_GATEWAY_URL)
+    : process.env.NEXT_PUBLIC_GATEWAY_URL
+}
+
 export type GetToken = (opts: {
   template: string
   skipCache?: boolean
@@ -63,7 +78,7 @@ export async function gatewayFetch(
     // spread into {} or numeric keys instead of real header entries.
     const headers = new Headers(init.headers)
     if (t) headers.set("Authorization", `Bearer ${t}`)
-    return fetch(`${process.env.NEXT_PUBLIC_GATEWAY_URL}${path}`, {
+    return fetch(`${gatewayBase()}${path}`, {
       ...init,
       headers,
     })

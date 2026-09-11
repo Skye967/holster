@@ -10,13 +10,12 @@ tonight, on a service you already have.
 
 ## Status
 
-MVP complete — chat, taste (verdicts), watchlist, and attribution are all built. Each
-service has its own Dockerfile; wiring `web/` into `docker-compose.yml` (so a single
-`docker compose up` starts everything) is the one piece still outstanding.
+MVP complete — chat, taste (verdicts), watchlist, and attribution are all built, and
+the whole stack comes up from a single `docker compose up --build`.
 
 | Component | Stack | Status |
 |---|---|---|
-| `web/` | Next.js, TypeScript, Tailwind, shadcn/ui | Built — run separately, see below |
+| `web/` | Next.js, TypeScript, Tailwind, shadcn/ui | Built — in `docker-compose.yml` |
 | `services/gateway/` | Go | Built — in `docker-compose.yml` |
 | `agent/` | Python, FastAPI, LangChain | Built — in `docker-compose.yml` |
 | `db/` | Supabase (PostgreSQL) | Schema + RLS in place |
@@ -79,16 +78,38 @@ holds no real values. Never commit a filled-in `.env`.
 ```bash
 git clone https://github.com/Skye967/holster.git
 cd holster
-cp .env.example .env    # fill in your own keys
-docker compose up       # starts services/gateway, agent, and postgres
+cp .env.example .env       # fill in your own keys first — see below
+docker compose up --build  # web, gateway, agent, postgres
 ```
 
-`web/` isn't wired into `docker-compose.yml` yet, so start it separately:
+Then open <http://localhost:3000>.
+
+**Fill in `.env` before the first build.** The `NEXT_PUBLIC_*` values are compiled
+into the frontend bundle rather than read at runtime, so `web/` checks them during the
+build and rejects a placeholder — an invalid Clerk key would otherwise compile in
+cleanly and then 500 every request. The gateway is stricter still and exits at startup
+on any missing or malformed Clerk value, its webhook signing secret included. You need
+a Clerk application, a TMDB key and a Google AI key; `.env.example` says where each
+value comes from.
+
+`--build` rather than a bare `up` for the same reason: editing a `NEXT_PUBLIC_*` value
+only reaches the browser through a rebuild.
+
+To work on the frontend with hot reload, stop the containerised frontend, bring the
+backend up on its own, and run `web/` from the host:
 
 ```bash
-cd web
-bun run dev             # serves the frontend at localhost:3000
+docker compose stop web             # frees port 3000
+docker compose up --build gateway   # pulls in agent, postgres and db-init
+cd web && bun run dev               # serves the frontend at localhost:3000
 ```
+
+`next dev` reads `web/.env*` and never the repo-root `.env`, so `web/.env.local` needs
+its own copy of `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` and `CLERK_SECRET_KEY`, plus
+`NEXT_PUBLIC_GATEWAY_URL` set to wherever the gateway is published
+(`http://localhost:8080` by default — compose derives that, `next dev` cannot). Leave
+`GATEWAY_SERVICE_URL` out of it: that address only resolves inside compose, and on the
+host both callers share one URL.
 
 ## Layout
 

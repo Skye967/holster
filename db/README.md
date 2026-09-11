@@ -11,7 +11,7 @@ directory, but only on first start with an empty data directory. To re-apply aft
 editing or adding a migration:
 
 ```
-docker compose down -v && docker compose up
+docker compose down -v && docker compose up --build
 ```
 
 Skip the `down -v` and a newly added migration never runs, so anything it
