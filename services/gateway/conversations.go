@@ -20,18 +20,22 @@ import (
 const maxStoredHistoryMessages = 50
 
 // conversationTurn is the wire shape of GET /api/chat/history — one entry per
-// completed exchange. title_refs is deliberately not surfaced here: nothing
-// yet re-renders title cards from a reload, only the text (see
+// completed exchange. title_refs is deliberately not surfaced *to the browser*
+// here: nothing yet re-renders title cards from a reload, only the text (see
 // ARCHITECTURE.md's data model and DECISIONS.md's "One socket per session").
+// fetchRecentMessages does read the column — that is where an account's
+// already-shown set comes from (chat.go's shownFromHistory) — and this shape
+// simply drops it.
 type conversationTurn struct {
 	UserText      string `json:"user_text"`
 	AssistantText string `json:"assistant_text"`
 }
 
 // fetchRecentMessages returns up to limit of one conversation's most recent
-// messages, oldest-first. Shared by loadConversation (which only ever needs
-// windowHistory's own small window) and loadConversationTurns (which shows
-// the caller much more) — same query and scan, different caps.
+// messages, oldest-first. Shared by loadConversation (which reads deeper than
+// windowHistory needs, because the shown set rides along — see there) and
+// loadConversationTurns (the reload-render path) — same query and scan,
+// different caps.
 func fetchRecentMessages(ctx context.Context, tx pgx.Tx, conversationID string, limit int) ([]historyTurn, error) {
 	// Newest-first with a limit, then reversed below, so the cap keeps the
 	// most recent messages rather than the oldest ones. Ordered by seq, not
@@ -39,7 +43,7 @@ func fetchRecentMessages(ctx context.Context, tx pgx.Tx, conversationID string, 
 	// statement, so both get the exact same now() value, and two rows with a
 	// tied timestamp have no guaranteed order — the identity column does.
 	rows, err := tx.Query(ctx, `
-		select role, content from messages
+		select role, content, title_refs from messages
 		where conversation_id = $1
 		order by seq desc
 		limit $2`,
@@ -51,8 +55,20 @@ func fetchRecentMessages(ctx context.Context, tx pgx.Tx, conversationID string, 
 	var history []historyTurn
 	for rows.Next() {
 		var t historyTurn
-		if err := rows.Scan(&t.Role, &t.Text); err != nil {
+		// jsonb null for a user row and for an assistant row that showed no
+		// cards (see saveMessages), so nil is the ordinary case, not an error.
+		var refsJSON []byte
+		if err := rows.Scan(&t.Role, &t.Text, &refsJSON); err != nil {
 			return nil, err
+		}
+		if len(refsJSON) > 0 {
+			if err := json.Unmarshal(refsJSON, &t.TitleRefs); err != nil {
+				// Logged, not fatal: the text of this turn is still good
+				// history, and losing one turn's refs costs a repeated title,
+				// where failing the load costs the whole conversation.
+				slog.WarnContext(ctx, "message title_refs decode failed",
+					"conversation", conversationID, "error", err.Error())
+			}
 		}
 		history = append(history, t)
 	}
@@ -151,16 +167,17 @@ func trimToGraphemeBoundary(runes []rune) []rune {
 // fresh WS connection's in-memory context (TASKS.md T20), or nil for a
 // conversation with nothing saved yet — a brand-new "new chat" id and a
 // foreign id both resolve the same way, via RLS filtering fetchRecentMessages
-// down to zero rows. Capped at windowHistory's own window, not
-// maxStoredHistoryMessages: nothing else ever reads more of this than
-// windowHistory(history) forwards to the agent, so loading further would be
-// discarded work on every connect or conversation switch.
+// down to zero rows. Capped at maxSeededMessages rather than
+// maxStoredHistoryMessages: this load has two consumers with different
+// appetites — windowHistory trims the text it forwards to the agent, and
+// shownFromHistory wants every stored title_ref it can get — so the cap is
+// the deeper of the two and each consumer windows its own half.
 func loadConversation(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID string) ([]historyTurn, error) {
 	return func(ctx context.Context, userID, conversationID string) ([]historyTurn, error) {
 		var history []historyTurn
 		err := withUser(ctx, db, userID, func(tx pgx.Tx) error {
 			var err error
-			history, err = fetchRecentMessages(ctx, tx, conversationID, maxHistoryExchanges*2)
+			history, err = fetchRecentMessages(ctx, tx, conversationID, maxSeededMessages)
 			return err
 		})
 		return history, err

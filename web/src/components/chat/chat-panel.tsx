@@ -36,6 +36,8 @@ interface Turn {
   userText: string
   interpreting?: string
   picks?: AgentPick[]
+  // Why this list was widened, when it was — see the agent's _relaxed_note.
+  note?: string
   tokenText?: string
   error?: string
 }
@@ -45,7 +47,7 @@ function applyEvent(turn: Turn, ev: ChatEvent): Turn {
     case "interpreting":
       return { ...turn, interpreting: ev.text }
     case "results":
-      return { ...turn, picks: ev.picks }
+      return { ...turn, picks: ev.picks, note: ev.note }
     case "token":
       return { ...turn, tokenText: ev.text }
     case "error":
@@ -148,6 +150,9 @@ function TurnView({
         </p>
       )}
       {pending && <p className="text-xs text-muted-foreground">Thinking…</p>}
+      {turn.note && (
+        <p className="text-xs text-muted-foreground">{turn.note}</p>
+      )}
       {turn.picks && turn.picks.length > 0 && (
         <div className="-mx-4 flex snap-x gap-3 overflow-x-auto px-4 pb-2">
           {turn.picks.map((pick) => {

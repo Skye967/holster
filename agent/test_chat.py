@@ -8,7 +8,7 @@ covered there and not re-tested here.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock
 
 import httpx2
@@ -16,11 +16,20 @@ import pytest
 from pydantic import ValidationError
 
 import tmdb
-from catalog_tool import DiscoverIntent, RankedPick, RankResult, TitleVerdict
+from catalog_tool import (
+    DiscoverIntent,
+    RankedPick,
+    RankResult,
+    RelaxedConstraint,
+    TitleRef,
+    TitleVerdict,
+)
 from chat import (
+    _RELAXED_LABELS,
     ChatRequest,
     HistoryTurn,
     _nothing_found_message,
+    _relaxed_note,
     _title_not_found_message,
     stream_chat,
 )
@@ -235,11 +244,11 @@ def test_intent_event_arrives_before_rank_is_called() -> None:
 
     async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
         order.append("rank")
-        return RankResult(picks=[])
+        return RankResult(picks=[RankedPick(tmdb_id=101, blurb="fits")])
 
     events = asyncio.run(_collect(req, fake_tmdb.client(), fake_interpret, fake_rank))
 
-    assert [e["type"] for e in events] == ["intent", "message", "done"]
+    assert [e["type"] for e in events] == ["intent", "results", "done"]
     assert order == ["interpret", "rank"]
 
 
@@ -259,9 +268,9 @@ def test_no_candidates_after_ladder_emits_a_message_naming_what_was_relaxed() ->
     )
 
     assert [e["type"] for e in events] == ["intent", "message", "done"]
-    # "how long and the mood", not "how long, the mood" — _human_join, same
+    # "the mood and how long", not "the mood, how long" — _human_join, same
     # as the capability answer's provider-name grammar.
-    assert "how long and the mood" in events[1]["text"]
+    assert "the mood and how long" in events[1]["text"]
 
 
 def test_tmdb_unavailable_maps_to_a_closed_reason(
@@ -442,10 +451,16 @@ def test_chat_request_defaults_verdicts_when_the_gateway_omits_them() -> None:
 def test_all_judged_message_replaces_the_loosening_advice() -> None:
     """all_judged wins over relaxed: if the ladder ran and the survivors were
     all already rated, "even after loosening how long" names the wrong cause."""
-    assert "rated all of them" in _nothing_found_message([], all_judged=True)
-    assert "rated all of them" in _nothing_found_message(["runtime"], all_judged=True)
-    assert "loosening" in _nothing_found_message([], all_judged=False)
-    assert "how long" in _nothing_found_message(["runtime"], all_judged=False)
+    assert "rated all of them" in _nothing_found_message(
+        [], all_judged=True, all_shown=False
+    )
+    assert "rated all of them" in _nothing_found_message(
+        ["runtime"], all_judged=True, all_shown=False
+    )
+    assert "loosening" in _nothing_found_message([], all_judged=False, all_shown=False)
+    assert "how long" in _nothing_found_message(
+        ["runtime"], all_judged=False, all_shown=False
+    )
 
 
 def test_title_not_found_message_quotes_the_name_back() -> None:
@@ -568,3 +583,132 @@ def test_intent_event_carries_the_title_for_the_gateways_line() -> None:
 
     assert events[0]["type"] == "intent"
     assert events[0]["intent"]["title"] == "Heat"
+
+
+# --- the widening, said out loud (T30) --------------------------------------
+
+
+def test_all_shown_message_is_not_the_all_judged_one() -> None:
+    """A query run dry by re-asking is not one whose every result the user
+    rated, and saying so would be false."""
+    shown = _nothing_found_message([], all_judged=False, all_shown=True)
+    assert "rated" not in shown
+    assert "already shown you" in shown
+
+
+def test_all_shown_message_does_not_claim_the_catalog_is_exhausted() -> None:
+    """search() reads MAX_DISCOVER_PAGES pages, and verdicts exclude on top of
+    the shown window, so a fully-excluded result set means this search found
+    nothing new — not that TMDB is out of rows. Claiming the latter is the
+    same class of false statement all_judged/all_shown were split to avoid."""
+    shown = _nothing_found_message([], all_judged=False, all_shown=True)
+    assert "everything I found" in shown
+    assert "everything I could find" not in shown
+
+
+def test_all_judged_still_wins_over_all_shown() -> None:
+    both = _nothing_found_message([], all_judged=True, all_shown=True)
+    assert "rated all of them" in both
+
+
+def test_relaxed_note_names_what_was_widened_and_how_far_it_is_exact() -> None:
+    note = _relaxed_note(["genres"], exact_matches=2, total=5)
+    assert "the first 2" in note
+    assert "the genre" in note
+
+
+def test_relaxed_note_reads_naturally_for_a_single_exact_match() -> None:
+    assert "the first matches" in _relaxed_note(["runtime"], exact_matches=1, total=5)
+
+
+def test_relaxed_note_claims_no_count_when_nothing_matched_exactly() -> None:
+    """Counting survivors, not catalog rows: "only two matched" would be false
+    for a page the user had simply already rated."""
+    note = _relaxed_note(["runtime"], exact_matches=0, total=5)
+    # "nothing left", not "nothing matched": the exact matches may simply have
+    # all been shown on an earlier turn, and saying they never existed would
+    # contradict the results still on screen above.
+    assert "Nothing left that matches exactly" in note
+    assert "the first" not in note
+
+
+def test_every_relaxable_constraint_has_a_label() -> None:
+    """The table is hand-synced with catalog_tool.RelaxedConstraint, and an
+    unlabelled rung falls back to its raw code in user-facing copy —
+    "loosening vote_average.desc". Cheap to assert, so the sync is checked
+    rather than remembered."""
+    assert set(get_args(RelaxedConstraint)) <= _RELAXED_LABELS.keys()
+
+
+def test_the_rating_bar_is_spoken_in_both_sentences() -> None:
+    """One rung, two places it can surface: above a widened list, and in the
+    nothing-found reply."""
+    assert "the rating bar" in _relaxed_note(["rating"], exact_matches=1, total=5)
+    assert "the rating bar" in _nothing_found_message(
+        ["rating"], all_judged=False, all_shown=False
+    )
+
+
+def test_no_note_when_nothing_was_relaxed() -> None:
+    assert _relaxed_note([], exact_matches=5, total=5) == ""
+
+
+def test_no_note_when_widening_changed_nothing_on_screen() -> None:
+    """A note about a wider search that contributed no pick sends the user
+    looking for results that are not there."""
+    assert _relaxed_note(["runtime"], exact_matches=5, total=5) == ""
+
+
+def test_results_event_carries_the_note_for_a_widened_search() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": []})
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    req = ChatRequest(message="something short", watch_region="US", watch_providers=[8])
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(picks=[RankedPick(tmdb_id=101, blurb="fits")])
+
+    events = asyncio.run(_collect(req, fake_tmdb.client(), fake_interpret, fake_rank))
+    results = next(e for e in events if e["type"] == "results")
+
+    assert results["relaxed"] == ["runtime"]
+    assert "how long" in results["note"]
+
+
+def test_results_event_note_is_empty_when_nothing_was_relaxed() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    req = ChatRequest(message="something", watch_region="US", watch_providers=[8])
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(picks=[RankedPick(tmdb_id=101, blurb="fits")])
+
+    events = asyncio.run(_collect(req, fake_tmdb.client(), ok_interpret, fake_rank))
+    results = next(e for e in events if e["type"] == "results")
+
+    assert results["note"] == ""
+
+
+def test_shown_reaches_search_and_keeps_a_title_off_the_screen() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    req = ChatRequest(
+        message="show me more",
+        watch_region="US",
+        watch_providers=[8],
+        shown=[TitleRef(tmdb_id=101, media_type="movie")],
+    )
+
+    events = asyncio.run(
+        _collect(
+            req,
+            fake_tmdb.client(),
+            ok_interpret,
+            rank_must_not_run(NO_CANDIDATES),
+        )
+    )
+
+    assert [e["type"] for e in events] == ["intent", "message", "done"]

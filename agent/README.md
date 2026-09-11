@@ -72,9 +72,17 @@ minted, so a request can be followed across services.
 `tmdb.py` wraps the catalog API: title search, `discover` (filter by streaming
 service, region, runtime, year, genre, cast, crew, keywords), "more like this", and
 per-title streaming availability. Callers pass names — "Tilda Swinton", "heist" — and
-the client resolves them to TMDB IDs and caches the mapping. A `vote_count` floor is
-always applied to `discover` and cannot be lowered; subscription matches are
-`flatrate` only. No results is an empty list; only TMDB being unreachable or 429/5xx
+the client resolves them to TMDB IDs and caches the mapping. Results are ordered by
+`vote_count` — most watched — by default, or by rating when the user asks for the best;
+TMDB's own `popularity` is deliberately not offered, being a rolling trend metric that
+ranked a 4.0-rated title above The Dark Knight. A `vote_count` floor is always applied
+to `discover` and no caller can set it: it is derived from the sort, and is higher for
+the rating sort, which is the only one a low floor actually misorders. (`search()`'s
+last rung drops the rating sort for a query too narrow to fill under it, which lowers
+the floor as a consequence — the sort is the only thing it sets.) Multiple cast or
+crew names mean *all* of them; multiple mood keywords mean *any*, because TMDB's tag
+data is far too sparse to survive an AND. Subscription matches are `flatrate` only. No
+results is an empty list; only TMDB being unreachable or 429/5xx
 raises `TMDBUnavailable`. It takes no URL, endpoint, or raw query from its caller —
 every path is built here from a validated media type or a literal — and reads no
 environment — the token is passed to `TMDBClient(...)`.
@@ -89,14 +97,45 @@ it on, so "Star Wars" reaches the sequels too.
 parameters, with no `watch_region`/`watch_providers` field, so the model can never
 choose which streaming services results come from. `search()` calls `discover()` with
 those parameters plus the caller's real region and providers, and `rank()` has the
-model pick and explain up to `intent.limit` of the *real* candidates that came back —
-its output schema carries no title metadata, only a selected id and a blurb, so a
-manipulated overview can win a bad blurb at worst, never assert a fake title.
-When the first query returns nothing, `search()` retries with soft constraints
-dropped in a fixed order — runtime, then year, then mood keywords — never the
-user's services, region, or exclusions, and records what it dropped in
-`CatalogResult.relaxed` for the chat layer to explain ("nothing under 90 minutes
-— here are the closest").
+model pick and explain the *real* candidates that came back — its output schema carries
+no title metadata, only a selected id and a blurb, so a manipulated overview can win a
+bad blurb at worst, never assert a fake title. `rank()` says nothing about how many
+picks a turn shows; `search()` owns the whole size band.
+A recommendation list aims for `RESULT_FLOOR`..`RESULT_CEILING` titles. Paging reads
+toward the ceiling, up to `MAX_DISCOVER_PAGES` — a thin page usually means exclusion ate
+it, and the answer to that is more of what the user asked for, never a looser question.
+Only once the query itself is out of rows does `search()` retry with soft constraints
+dropped in `RelaxedConstraint`'s order, recording what it dropped in
+`CatalogResult.relaxed` for the chat layer to explain. Never the user's services,
+region, or exclusions, and never cast or crew: a named person is the request itself, so
+padding two genuine matches with three unrelated films buys a count and loses the
+answer. Genres bend only while a *resolved* cast or crew name still says what the search
+is about — "a horror movie" widened to "any movie" answers a different question, and a
+name TMDB could not resolve never reached the query, so it says nothing. Every rung is
+guarded the same way on its own constraint: a keyword TMDB doesn't carry, or a genre
+outside the media type's vocabulary (`horror` is a movie genre; TV has no equivalent),
+never filtered anything, so dropping it would re-send an identical query and claim a
+drop that never happened. The last rung is the rating sort itself, which carries a
+higher vote floor — a query too narrow to fill at that floor falls back to the default
+sort rather than answering short.
+
+Rungs **accumulate**: a wider query's rows are appended to the narrower query's, never
+substituted for them, so the titles that matched exactly survive being widened past.
+Surviving is not the same as being picked, though: `rank()`'s candidate list carries no
+rung marker, so it can name only widened titles. `search()` therefore guarantees every
+exact match a place itself, tops the picks up to the floor, stable-sorts by the rung
+they came from, and only then cuts to the limit — in that order, because cutting in
+`rank()`'s own fit order could discard every exact match a widened query found. Both
+the guarantee and the floor carry no blurb, being properties of this code rather than
+requests made of the model, for the same reason `rank()` validates ids rather than
+asking for valid ones.
+
+The widening is bounded by `LADDER_BUDGET_SECONDS`, not run to exhaustion: paging
+plus rungs is up to nine sequential `discover()` calls under the gateway's 30s turn
+deadline. It is a deadline around the whole widening, so a call already in flight is
+cancelled rather than left to finish its own retries; page 1 sits outside it, being
+the answer rather than the widening. What accumulated is then the reply — which makes
+it a real answer rather than a truncated one.
 LangChain is confined to `google_interpreter()`/`google_ranker()`; everything
 else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`.
 
@@ -125,6 +164,23 @@ agent still never reads that table itself, only the windowed slice handed to it 
 call. It is folded into the text handed to `interpret()`/`rank()` rather than changing
 `catalog_tool.py`'s `message: str` contract.
 
+`shown` in the request body is what the gateway has already put on screen for this
+conversation — read back from `messages.title_refs` for an account, kept on the
+connection for a guest, who has no rows. It joins the same exclusion set as verdicts — but
+unconditionally, including `want_to_watch` titles that verdicts alone deliberately keep
+— so "show me 10 more" means ten *different* titles. It never reaches `all_judged`:
+a query run dry by re-asking is not one whose every result the user rated, and that
+case is `all_shown` instead. Like verdicts, it does not filter a named-title lookup —
+and, symmetrically, a lookup turn does not *feed* the set either, nor does a turn whose
+cards the gateway dropped as cancelled — for a guest. An account's set is read back from
+`messages.title_refs`, which records neither distinction, so there a looked-up title can
+be suppressed from a later recommendation; TASKS.md T30 accepts that, and the clean fix
+is a column rather than a heuristic on the stored text. The gateway keeps this window
+deliberately shorter than `MAX_DISCOVER_PAGES` pages of rows, so the window alone cannot
+outgrow what one query reaches past — verdicts exclude on top of it, though, so
+`all_shown` means this search found nothing new, not that TMDB ran out. The copy says
+exactly that.
+
 `verdicts` in the request body is the caller's whole `title_verdicts` set, loaded by the
 gateway with the message. The gateway only reads the rows; what each verdict *means* for
 a recommendation is decided here, in `search()`:
@@ -133,9 +189,9 @@ a recommendation is decided here, in `search()`:
   sees** (on the discover path; a named-title lookup runs no `rank()` and applies no
   verdict filter, because a factual question about a title is not a recommendation) —
   the four judgments are settled opinions, `want_to_watch` is an open
-  intention. A set filter applied after the relaxation ladder, never a prompt
-  instruction, so it holds whatever the model does. An unrecognised verdict excludes
-  too, which is the safe direction.
+  intention. A set filter applied once, after paging and the relaxation ladder, never
+  a prompt instruction, so it holds whatever the model does. An unrecognised verdict
+  excludes too, which is the safe direction.
 - **`liked` titles of the search's own media type become a hint prepended to `rank()`'s
   message**, and are never given to `interpret()` — that step sets hard TMDB filters,
   and a past like is a preference, not a constraint the user asked for. The hint is the
@@ -158,10 +214,11 @@ colloquial first message, which is why `DiscoverIntent.keywords`'s field descrip
 `catalog_tool.py` explicitly tells the model to infer a mood-driven value rather than
 leaving it empty on a vague-sounding request. It's the one field `_INTERPRET_SYSTEM_PROMPT`
 names as an exception to its own "leave empty when unmentioned" rule — deliberately
-keywords only, not genres: an unresolved keyword is dropped harmlessly, but `genres` has no
-relaxation rung (`RelaxedConstraint` in `catalog_tool.py` never includes it), so a wrong
-genre guess can zero out a cold-start user's first results entirely. The `genres` field's
-own description carries a stricter "only when unambiguous" caveat instead.
+keywords only, not genres: an unresolved keyword is dropped harmlessly, but `genres`
+relaxes only when a cast or crew name TMDB actually resolved survives the drop, so on a
+cold-start message naming no one — the common case — a wrong genre guess still zeroes
+out the first results entirely. The `genres` field's own description carries a stricter
+"only when unambiguous" caveat instead.
 
 ## Tests
 
@@ -170,7 +227,6 @@ uv run pytest
 uv run ruff check . && uv run ruff format --check . && uv run mypy .
 ```
 
-`test_tmdb.py` and `test_catalog_tool.py` run offline, against a mock transport and
-fake models respectively. `test_tmdb_live.py` and `test_catalog_tool_live.py` make
-real calls and skip unless `TMDB_API_KEY`/`GOOGLE_API_KEY` is set — the same
-pattern as the gateway's `TEST_DATABASE_URL` tests.
+The suite runs offline: `test_tmdb.py` against a mock transport, `test_catalog_tool.py`
+against that plus fake interpret/rank callables. Nothing here calls TMDB or the model —
+prompt behaviour is checked by running the app, not by asserting on a model's output.

@@ -2,9 +2,6 @@
 fake TMDB transport (same FakeTMDB shape as test_tmdb.py). No LangChain
 import here: interpret()/rank()/search() depend on plain callables, so a
 fake is just an ``async def``, matching TMDBClient's ``transport=`` seam.
-
-The live LLM path is in test_catalog_tool_live.py, which skips without
-GOOGLE_API_KEY — same shape as test_tmdb_live.py.
 """
 
 from __future__ import annotations
@@ -22,8 +19,11 @@ import catalog_tool
 import tmdb
 from catalog_tool import (
     _UNAVAILABLE_PLACEHOLDER,
+    MAX_DISCOVER_PAGES,
     MAX_TASTE_TITLES,
     MAX_TITLE_MATCHES,
+    RESULT_CEILING,
+    RESULT_FLOOR,
     TASTE_HEADER,
     CatalogResult,
     CatalogToolError,
@@ -36,6 +36,8 @@ from catalog_tool import (
     TitleVerdict,
     _format_candidates,
     _matching_titles,
+    _with_target_count,
+    _with_taste,
     enrich_known_title,
     enrich_watchlist,
     interpret,
@@ -60,7 +62,7 @@ from testutil import (
     raw_movie_full,
     raw_named,
 )
-from tmdb import Title, TMDBUnavailable
+from tmdb import PAGE_SIZE, Title, TMDBUnavailable
 
 
 def run[T](coro: Coroutine[Any, Any, T]) -> T:
@@ -108,11 +110,13 @@ def test_rank_drops_ids_outside_candidates() -> None:
             ]
         )
 
-    picks = run(rank("mood", candidates, limit=5, model=fake))
+    picks = run(rank("mood", candidates, model=fake))
     assert [p.tmdb_id for p in picks] == [1]
 
 
-def test_rank_dedupes_and_truncates_to_limit() -> None:
+def test_rank_dedupes_but_does_not_size_the_list() -> None:
+    """Sizing lives in search(): cutting here would cut in the model's fit
+    order, before search() can put the exact matches first."""
     candidates = [_title(1), _title(2), _title(3)]
 
     async def fake(message: str, cands: list[Title]) -> RankResult:
@@ -125,8 +129,8 @@ def test_rank_dedupes_and_truncates_to_limit() -> None:
             ]
         )
 
-    picks = run(rank("mood", candidates, limit=2, model=fake))
-    assert [p.tmdb_id for p in picks] == [1, 2]
+    picks = run(rank("mood", candidates, model=fake))
+    assert [p.tmdb_id for p in picks] == [1, 2, 3]
 
 
 def test_rank_short_circuits_on_empty_candidates() -> None:
@@ -137,7 +141,7 @@ def test_rank_short_circuits_on_empty_candidates() -> None:
         called = True
         return RankResult(picks=[])
 
-    assert run(rank("mood", [], limit=5, model=fake)) == []
+    assert run(rank("mood", [], model=fake)) == []
     assert not called
 
 
@@ -479,9 +483,9 @@ def test_search_relaxes_runtime_when_the_first_query_is_empty() -> None:
 def test_search_skips_a_rung_with_nothing_to_drop() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/search/keyword", {"results": [{"id": 42, "name": "cozy"}]})
-    fake_tmdb.ok("/discover/movie", {"results": []})  # first pass
-    fake_tmdb.ok("/discover/movie", {"results": []})  # runtime dropped
-    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # keywords dropped
+    fake_tmdb.ok("/discover/movie", {"results": []})  # as asked
+    fake_tmdb.ok("/discover/movie", {"results": []})  # keywords dropped
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # runtime dropped
 
     async def fake_interpret(message: str) -> DiscoverIntent:
         return make_intent(max_runtime_minutes=90, keywords=["cozy"])
@@ -498,11 +502,11 @@ def test_search_skips_a_rung_with_nothing_to_drop() -> None:
     )
 
     calls = fake_tmdb.all_params_for("/discover/movie")
-    assert len(calls) == 3  # first, -runtime, -keywords; the year rung is skipped
+    assert len(calls) == 3  # first, -keywords, -runtime; the year rung is skipped
     assert "with_runtime.lte" in calls[0] and "with_keywords" in calls[0]
-    assert "with_runtime.lte" not in calls[1] and "with_keywords" in calls[1]
-    assert "with_keywords" not in calls[2]
-    assert result.relaxed == ["runtime", "keywords"]
+    assert "with_keywords" not in calls[1] and "with_runtime.lte" in calls[1]
+    assert "with_runtime.lte" not in calls[2]
+    assert result.relaxed == ["keywords", "runtime"]
 
 
 def test_search_skips_keywords_rung_when_nothing_resolved() -> None:
@@ -559,7 +563,7 @@ def test_search_never_relaxes_services_region_or_exclusions() -> None:
 
     calls = fake_tmdb.all_params_for("/discover/movie")
     assert len(calls) == 4  # first + three rungs, then the ladder is exhausted
-    assert result.relaxed == ["runtime", "year", "keywords"]
+    assert result.relaxed == ["keywords", "runtime", "year"]
     assert result.picks == []
     for params in calls:
         assert params["watch_region"] == "GB"
@@ -569,9 +573,14 @@ def test_search_never_relaxes_services_region_or_exclusions() -> None:
         assert params["without_genres"] == "27"  # horror, from the frozen table
 
 
-def test_search_does_not_relax_when_the_first_query_returns_results() -> None:
+def test_search_does_not_relax_when_the_first_query_fills_the_floor() -> None:
+    """RESULT_FLOOR results, not one: the ladder now works toward a floor, so
+    a page that already clears it is the "nothing to loosen" case."""
     fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    fake_tmdb.ok(
+        "/discover/movie",
+        {"results": [raw_movie(101 + i) for i in range(RESULT_FLOOR)]},
+    )
 
     async def fake_interpret(message: str) -> DiscoverIntent:
         return make_intent(max_runtime_minutes=90)
@@ -689,9 +698,14 @@ def test_search_available_on_excludes_providers_the_user_does_not_have() -> None
 
 
 def test_search_enrichment_only_runs_for_final_ranked_picks() -> None:
-    movie_b = {**MOVIE_A, "id": 202, "title": "Second Movie"}
+    """More candidates than RESULT_FLOOR, so the floor top-up cannot be what
+    keeps the last one out: rank() picked one, the top-up filled to the floor,
+    and the candidate past that is enriched by nothing."""
     fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A, movie_b]})
+    extra = RESULT_FLOOR + 2
+    fake_tmdb.ok(
+        "/discover/movie", {"results": [raw_movie(101 + i) for i in range(extra)]}
+    )
 
     result = run(
         search(
@@ -704,9 +718,10 @@ def test_search_enrichment_only_runs_for_final_ranked_picks() -> None:
         )
     )
 
-    assert [p["tmdb_id"] for p in result.picks] == [101]
+    assert [p["tmdb_id"] for p in result.picks] == [101, 102, 103, 104, 105]
     assert fake_tmdb.count("/movie/101") == 1
-    assert fake_tmdb.count("/movie/202") == 0
+    assert fake_tmdb.count("/movie/105") == 1
+    assert fake_tmdb.count("/movie/106") == 0
 
 
 async def _rank_both(message: str, candidates: list[Title]) -> RankResult:
@@ -994,18 +1009,17 @@ def test_search_verdict_excludes_only_its_own_media_type() -> None:
     assert [c["tmdb_id"] for c in seen[0]] == [101]
 
 
-def test_search_does_not_relax_when_every_candidate_is_judged() -> None:
-    """Exclusion happens after the ladder, not inside discover(): a page the
-    user has entirely judged must not be reported as constraints having been
-    loosened, which would make chat.py tell them nothing matched "even after
-    loosening how long" when plenty matched.
+def test_search_relaxes_for_a_page_the_user_has_entirely_judged() -> None:
+    """The ladder's count is exclusion-aware (T30), so a page whose every row
+    the user has rated reads as below the floor and the rungs fire. That is
+    the useful answer — offering longer heist films beats a dead end — and it
+    is safe because rungs accumulate: a rung that finds nothing changes
+    nothing, and chat.py still gives all_judged precedence over `relaxed`, so
+    the user is never told nothing matched "even after loosening how long"
+    when plenty matched and they had simply seen it all.
 
-    The top-up still fires here (exclusion is non-empty and the page had a
-    real candidate) — it's the second discover() call, and FakeTMDB's
-    unqueued-path default ({"results": []}) means it rescues nothing, so
-    all_judged stays true. That second call is exactly the behaviour this
-    task adds; see the top-up tests below for the case where it does find
-    something."""
+    FakeTMDB's unqueued-path default ({"results": []}) means neither the
+    runtime rung nor the top-up rescues anything here, so all_judged holds."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
 
@@ -1020,20 +1034,26 @@ def test_search_does_not_relax_when_every_candidate_is_judged() -> None:
     )
 
     assert result.picks == []
-    assert result.relaxed == []
+    assert result.all_judged is True
+    assert result.all_shown is False
+    assert result.relaxed == ["runtime"]
+    # Page 1 is short, so there is no page 2 to read: the one-row page, then
+    # the runtime rung.
     assert fake_tmdb.count("/discover/movie") == 2
 
 
 # --- verdicts: pagination top-up (T19.5) ------------------------------------
 
 
-def test_search_tops_up_from_the_next_page_when_exclusion_leaves_too_few() -> None:
-    """A judged-out first page still returns a full set of picks — the
-    done-when this task adds. Exclusion trimming below intent.limit pulls
-    exactly one more page and merges it in before rank()."""
+def test_search_reads_the_next_page_when_exclusion_leaves_too_few() -> None:
+    """A judged-out first page still returns a full set of picks. Reading page
+    2 of the query as asked is the answer to a thin page — never a wider
+    question (T30) — so this runs before the relaxation ladder, not after it."""
     fake_tmdb = FakeTMDB()
+    # A full page is the only kind TMDB has more rows after.
     fake_tmdb.ok(
-        "/discover/movie", {"results": [raw_movie(i) for i in range(101, 106)]}
+        "/discover/movie",
+        {"results": [raw_movie(i) for i in range(101, 101 + PAGE_SIZE)]},
     )
     fake_tmdb.ok(
         "/discover/movie", {"results": [raw_movie(i) for i in range(201, 204)]}
@@ -1042,23 +1062,20 @@ def test_search_tops_up_from_the_next_page_when_exclusion_leaves_too_few() -> No
 
     _search_with_verdicts(
         fake_tmdb,
-        [
-            _verdict(101, "seen"),
-            _verdict(102, "disliked"),
-            _verdict(103, "not_interested"),
-        ],
+        [_verdict(i, "seen") for i in range(101, 101 + PAGE_SIZE - 2)],
         _capture_rank(seen),
     )
 
     assert fake_tmdb.count("/discover/movie") == 2
     assert fake_tmdb.all_params_for("/discover/movie")[1]["page"] == "2"
-    assert [c["tmdb_id"] for c in seen[0]] == [104, 105, 201, 202, 203]
+    # The two survivors of page 1, then page 2 in order.
+    assert [c["tmdb_id"] for c in seen[0]] == [119, 120, 201, 202, 203]
 
 
-def test_search_does_not_top_up_when_nothing_was_excluded() -> None:
-    """The top-up guard is scoped to exclusion, not any short page — a query
-    that legitimately has few results elsewhere must not spend an extra
-    round trip chasing a fuller page that was never taken away."""
+def test_search_does_not_read_a_second_page_after_a_short_one() -> None:
+    """A page short of PAGE_SIZE is the last page TMDB has, so a query that
+    legitimately returns few rows must not spend a round trip being told so —
+    and narrow queries are most of them."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
 
@@ -1067,11 +1084,9 @@ def test_search_does_not_top_up_when_nothing_was_excluded() -> None:
     assert fake_tmdb.count("/discover/movie") == 1
 
 
-def test_search_does_not_top_up_when_this_page_lost_nothing_to_exclusion() -> None:
+def test_a_verdict_on_an_unrelated_title_costs_no_extra_page() -> None:
     """A returning user with verdicts on *other* titles must not pay for a
-    top-up just because their verdict history is non-empty — the guard has
-    to check whether this page actually lost anything, not just whether the
-    user has judged something somewhere before."""
+    second page just because their verdict history is non-empty."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
     seen: list[list[Title]] = []
@@ -1082,16 +1097,17 @@ def test_search_does_not_top_up_when_this_page_lost_nothing_to_exclusion() -> No
     assert [c["tmdb_id"] for c in seen[0]] == [101]
 
 
-def test_search_stays_all_judged_when_the_topped_up_page_is_also_excluded() -> None:
-    """Rescue only counts when the second page adds something eligible — if
-    it's judged too, the page is still fully judged, not "found more"."""
+def test_search_stays_all_judged_when_the_next_page_is_also_excluded() -> None:
+    """Rescue only counts when a later page adds something eligible — if it's
+    judged too, the query is still fully judged, not "found more"."""
     fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
-    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(102)]})
+    full = [raw_movie(i) for i in range(101, 101 + PAGE_SIZE)]
+    fake_tmdb.ok("/discover/movie", {"results": full})
+    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(201)]})
 
     result = _search_with_verdicts(
         fake_tmdb,
-        [_verdict(101, "seen"), _verdict(102, "seen")],
+        [_verdict(i, "seen") for i in list(range(101, 101 + PAGE_SIZE)) + [201]],
         rank_must_not_run(ALL_JUDGED),
     )
 
@@ -1103,12 +1119,17 @@ def test_search_rescues_an_all_excluded_page_from_the_next_one() -> None:
     """Nothing survives page 1, but page 2 has a fresh, unjudged title —
     all_judged must reflect the rescue, not the page-1 wipeout."""
     fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
+    fake_tmdb.ok(
+        "/discover/movie",
+        {"results": [raw_movie(i) for i in range(101, 101 + PAGE_SIZE)]},
+    )
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(201)]})
     seen: list[list[Title]] = []
 
     result = _search_with_verdicts(
-        fake_tmdb, [_verdict(101, "seen")], _capture_rank(seen)
+        fake_tmdb,
+        [_verdict(i, "seen") for i in range(101, 101 + PAGE_SIZE)],
+        _capture_rank(seen),
     )
 
     assert result.all_judged is False
@@ -1138,7 +1159,10 @@ def test_search_gives_liked_titles_to_rank_but_never_to_interpret() -> None:
 
     assert "Heat" in rank_saw[0]
     assert "Crime" in rank_saw[0]  # genres resolved from the full-title shape
-    assert rank_saw[0].endswith("something good")  # the request stays last
+    # The hint sits above the request, and the request above the count line
+    # rank() is given last — see _with_taste and _with_target_count.
+    assert rank_saw[0].index("Heat") < rank_saw[0].index("something good")
+    assert rank_saw[0].index("something good") < rank_saw[0].index("Return ")
     assert "Heat" not in interpret_saw[0]
 
 
@@ -1343,15 +1367,17 @@ def test_search_drops_only_the_bad_taste_line_not_the_whole_hint() -> None:
 def test_search_with_no_verdicts_sends_rank_the_bare_message() -> None:
     """A brand-new account has no verdicts at all. That must not merely fail
     to inject a taste hint — with zero liked titles, taste is [] and
-    _with_taste is a no-op, so rank() sees exactly the caller's message and
-    nothing else. This is what "leans on what the user typed" rests on."""
+    _with_taste is a no-op, so rank() sees the caller's message and nothing
+    else about them. This is what "leans on what the user typed" rests on.
+    (The count line _with_target_count adds is about the reply's shape, not
+    about the user, so it is not what this guards against.)"""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
     rank_saw: list[str] = []
 
     _search_with_verdicts(fake_tmdb, [], _capture_message(rank_saw, pick=101))
 
-    assert rank_saw[0] == "something good"
+    assert rank_saw[0].startswith("something good")
     assert TASTE_HEADER not in rank_saw[0]
 
 
@@ -2195,3 +2221,851 @@ def test_title_lookup_ignores_an_explicit_limit() -> None:
     )
 
     assert len(result.picks) == MAX_TITLE_MATCHES
+
+
+# --- result sizing: the floor, the ceiling, and accumulation (T30) ----------
+
+
+def _page(*ids: int) -> dict[str, Any]:
+    return {"results": [raw_movie(i) for i in ids]}
+
+
+def _search(
+    fake_tmdb: FakeTMDB,
+    *,
+    interpret_model: Interpreter = ok_interpret,
+    rank_model: Ranker = _rank_both,
+    shown: list[TitleRef] | None = None,
+    verdicts: list[TitleVerdict] | None = None,
+) -> CatalogResult:
+    return run(
+        search(
+            "something good",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=interpret_model,
+            rank_model=rank_model,
+            shown=shown,
+            verdicts=verdicts,
+        )
+    )
+
+
+def test_search_relaxes_a_partial_page_not_only_an_empty_one() -> None:
+    """The T30 change to T13.5's ladder: three results is a short answer, not
+    a satisfied one, so the rungs fire below RESULT_FLOOR rather than at nil."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == ["runtime"]
+    assert len(result.picks) >= RESULT_FLOOR
+
+
+def test_relaxing_keeps_the_titles_that_matched_exactly_and_leads_with_them() -> None:
+    """Rungs accumulate rather than replace. Without this the three films that
+    genuinely matched are discarded the moment the query is widened past them,
+    and the user loses precisely what they asked for by being given more."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    ids = [p["tmdb_id"] for p in result.picks]
+    assert ids[:3] == [101, 102, 103]
+    assert set(ids) >= {101, 102, 103}
+    assert result.exact_matches == 3
+
+
+def test_relaxing_orders_exact_matches_first_however_rank_returned_them() -> None:
+    """rank() cannot know a candidate reached the list only because a
+    constraint was dropped, so the ordering is applied here, not asked for."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    async def rank_reversed(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(
+            picks=[
+                RankedPick(tmdb_id=c["tmdb_id"], blurb="ok")
+                for c in reversed(candidates)
+            ]
+        )
+
+    result = _search(
+        fake_tmdb, interpret_model=fake_interpret, rank_model=rank_reversed
+    )
+
+    assert [p["tmdb_id"] for p in result.picks][0] == 101
+
+
+def test_relaxing_keeps_exact_matches_the_cut_would_otherwise_discard() -> None:
+    """The cut has to fall after the exactness sort. rank() is told to order
+    best-first and cannot see rungs, so a widened row can outrank an exact one;
+    cutting in its order — which is what passing a limit into rank() did —
+    threw away every title the user actually asked for and then told them
+    nothing matched."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
+    fake_tmdb.ok("/discover/movie", _page(*range(201, 221)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    async def rank_widened_first(message: str, candidates: list[Title]) -> RankResult:
+        wide = [c for c in candidates if c["tmdb_id"] >= 201]
+        exact = [c for c in candidates if c["tmdb_id"] < 201]
+        return RankResult(
+            picks=[RankedPick(tmdb_id=c["tmdb_id"], blurb="ok") for c in wide + exact]
+        )
+
+    result = _search(
+        fake_tmdb, interpret_model=fake_interpret, rank_model=rank_widened_first
+    )
+
+    ids = [p["tmdb_id"] for p in result.picks]
+    assert ids[:3] == [101, 102, 103]
+    assert len(ids) == RESULT_CEILING
+    assert result.exact_matches == 3
+
+
+def test_paging_reads_toward_the_ceiling_not_merely_the_floor() -> None:
+    """ "Show me 10 more" has to mean ten. Stopping the paging loop at the floor
+    answered it with five while the next page sat one call away."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
+    fake_tmdb.ok("/discover/movie", _page(*range(201, 221)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(limit=10)
+
+    # Fifteen of page 1's twenty rows are already on screen, leaving five —
+    # over the floor, under the ceiling.
+    shown = [TitleRef(tmdb_id=i, media_type="movie") for i in range(101, 116)]
+    result = _search(fake_tmdb, interpret_model=fake_interpret, shown=shown)
+
+    assert len(result.picks) == RESULT_CEILING
+    assert fake_tmdb.count("/discover/movie") == 2
+    # Reached by paging the query as asked, never by loosening it.
+    assert result.relaxed == []
+
+
+def test_a_full_first_page_still_costs_one_call() -> None:
+    """Paging toward the ceiling must stay free on an ordinary query: one page
+    is twenty rows, so the target is met before a second call is considered."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
+    fake_tmdb.ok("/discover/movie", _page(*range(201, 221)))
+
+    result = _search(fake_tmdb)
+
+    assert fake_tmdb.count("/discover/movie") == 1
+    assert len(result.picks) == RESULT_CEILING
+
+
+def test_genres_holds_when_the_named_person_did_not_resolve() -> None:
+    """A name TMDB cannot resolve never reached the query, so it says nothing
+    about what the search is about. Dropping the genre on the strength of it
+    turns "a horror movie with <typo>" into "any movie"."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/person", {"results": []})
+    fake_tmdb.ok("/discover/movie", _page(101))
+    fake_tmdb.ok("/discover/movie", _page(*range(301, 321)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(genres=["horror"], cast=["Jonn Smyth"])
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == []
+    assert fake_tmdb.count("/discover/movie") == 1
+
+
+def test_search_stops_relaxing_once_the_floor_is_met() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90, release_year_gte=1990)
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    # The runtime rung cleared the floor, so the year rung never ran.
+    assert result.relaxed == ["runtime"]
+    assert fake_tmdb.count("/discover/movie") == 2
+
+
+def test_an_explicit_count_lowers_the_floor_instead_of_firing_a_rung() -> None:
+    """ "Just one" must not relax anything to hunt for five — the floor tracks
+    the caller's own limit."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90, limit=1)
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == []
+    assert [p["tmdb_id"] for p in result.picks] == [101]
+    assert fake_tmdb.count("/discover/movie") == 1
+
+
+def test_search_never_returns_more_than_the_ceiling() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(limit=20)
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert len(result.picks) == RESULT_CEILING
+
+
+def test_search_tops_up_to_the_floor_when_the_model_underdelivers() -> None:
+    """The floor is a property of the code, not a request made of the model —
+    same reason rank() validates ids rather than asking for valid ones."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 109)))
+
+    async def rank_one(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(picks=[RankedPick(tmdb_id=101, blurb="fits")])
+
+    result = _search(fake_tmdb, rank_model=rank_one)
+
+    assert [p["tmdb_id"] for p in result.picks] == [101, 102, 103, 104, 105]
+    assert result.picks[0]["blurb"] == "fits"
+    # Nothing here is explaining a fit, so nothing claims to.
+    assert [p["blurb"] for p in result.picks[1:]] == ["", "", "", ""]
+
+
+def test_search_top_up_never_exceeds_an_explicit_count() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 109)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(limit=2)
+
+    async def rank_none(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(picks=[])
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret, rank_model=rank_none)
+
+    assert [p["tmdb_id"] for p in result.picks] == [101, 102]
+
+
+def test_what_reaches_rank_is_bounded_by_the_paging_stop() -> None:
+    """No separate cap is needed, and one here would be dead code: paging
+    stops once `limit` rows survive, and a rung only fires below `floor`, so
+    the most rank() can ever be handed is one page on top of a survivor count
+    that was still short of the limit."""
+    seen: list[int] = []
+
+    async def counting_rank(message: str, candidates: list[Title]) -> RankResult:
+        seen.append(len(candidates))
+        return RankResult(picks=[])
+
+    fake_tmdb = FakeTMDB()
+    for start in (101, 201, 301):
+        fake_tmdb.ok("/discover/movie", _page(*range(start, start + 20)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        # Two rungs available, and no page clears the floor after exclusion.
+        return make_intent(max_runtime_minutes=90, release_year_gte=1990)
+
+    _search(
+        fake_tmdb,
+        interpret_model=fake_interpret,
+        rank_model=counting_rank,
+        shown=[TitleRef(tmdb_id=i, media_type="movie") for i in range(101, 141)],
+    )
+
+    assert seen and seen[0] <= RESULT_CEILING - 1 + PAGE_SIZE
+
+
+# --- genres: the one rung that needs a subject to survive (T30) -------------
+
+
+def test_genres_bends_when_an_actor_still_says_what_the_search_is_about() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(genres=["horror"], cast=["Tom Hanks"])
+
+    fake_tmdb.ok("/search/person", {"results": [{"id": 31, "name": "Tom Hanks"}]})
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    assert result.relaxed == ["genres"]
+    assert "with_genres" in calls[0]
+    assert "with_genres" not in calls[1]
+    # The person is the request, so it survives the rung that drops the genre.
+    assert calls[1]["with_cast"] == "31"
+
+
+def test_genres_holds_when_dropping_it_would_leave_no_subject() -> None:
+    """ "A horror movie" widened to "any movie" answers a different question.
+    A short, honest answer is the right one here."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(genres=["horror"])
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == []
+    assert fake_tmdb.count("/discover/movie") == 1
+
+
+def test_genres_holds_when_the_genre_never_reached_the_query() -> None:
+    """The movie and TV vocabularies differ, so "horror" is dropped by
+    _genres_into on a TV search and never filters anything. Clearing it then
+    would re-send an identical query and claim the genre was widened."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/person", {"results": [{"id": 66, "name": "Bryan Cranston"}]})
+    fake_tmdb.ok("/discover/tv", _page(101))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        # A resolved subject, so genres_applied is the only thing holding the
+        # rung — "horror" is a movie genre, TV's nearest is nothing at all.
+        return DiscoverIntent(
+            media_type="tv", genres=["horror"], cast=["Bryan Cranston"]
+        )
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == []
+    assert fake_tmdb.count("/discover/tv") == 1
+    assert "with_genres" not in fake_tmdb.all_params_for("/discover/tv")[0]
+
+
+# --- the rating bar: the last rung, and the only one about ordering (T31) ----
+
+
+def test_the_rating_bar_bends_for_a_narrow_best_query() -> None:
+    """Ordering by rating carries a 1000-vote floor, and on a narrow request
+    that floor is most of the result set. Falling back to the default sort
+    restores the rest at the ordinary floor."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(sort_by="vote_average.desc")
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    assert result.relaxed == ["rating"]
+    assert calls[0]["sort_by"] == "vote_average.desc"
+    assert calls[0]["vote_count.gte"] == str(tmdb.MIN_VOTE_COUNT_TOP_RATED)
+    # The bar bends; the ordering the user asked for does not. rank() never
+    # sees a rating, so a most-watched page could not be put back in rating
+    # order downstream.
+    assert calls[1]["sort_by"] == "vote_average.desc"
+    assert calls[1]["vote_count.gte"] == str(tmdb.MIN_VOTE_COUNT)
+
+
+def test_the_rating_bar_holds_when_the_query_was_not_sorted_by_rating() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))
+
+    result = _search(fake_tmdb)
+
+    assert result.relaxed == []
+    assert fake_tmdb.count("/discover/movie") == 1
+
+
+def test_the_rating_bar_bends_after_every_constraint_the_user_stated() -> None:
+    """Last on purpose: these rows are the small-sample ratings the floor
+    exists to suppress, so they must land behind the confidently-rated ones
+    rather than interleaving with them."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))  # as asked
+    fake_tmdb.ok("/discover/movie", _page(102))  # runtime dropped
+    fake_tmdb.ok("/discover/movie", _page(103))  # rating bar dropped
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90, sort_by="vote_average.desc")
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == ["runtime", "rating"]
+    assert [p["tmdb_id"] for p in result.picks] == [101, 102, 103]
+    assert result.exact_matches == 1
+
+
+# --- the ladder's own budget (T31) ------------------------------------------
+
+
+def test_the_ladder_stops_widening_once_its_budget_is_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paging plus rungs is up to nine sequential TMDB calls under the
+    gateway's 30s turnDeadline. Past the budget the ladder answers with what
+    it has, which accumulation makes a real answer."""
+    monkeypatch.setattr(catalog_tool, "LADDER_BUDGET_SECONDS", -1.0)
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == []
+    assert fake_tmdb.count("/discover/movie") == 1
+    # The rows the query as asked did find are still the answer.
+    assert [p["tmdb_id"] for p in result.picks] == [101]
+
+
+def test_paging_stops_at_the_budget_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three of the eight calls the budget bounds are pages, not rungs. A full
+    page whose rows are nearly all already shown is the case that keeps paging
+    going, so it is the one that can prove the deadline reaches it: without
+    that check this reads MAX_DISCOVER_PAGES pages before the rungs are even
+    considered, and a degraded TMDB spends the gateway's whole turnDeadline
+    here."""
+    monkeypatch.setattr(catalog_tool, "LADDER_BUDGET_SECONDS", -1.0)
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 101 + PAGE_SIZE)))
+
+    # All but two of page 1 already on screen, so `surviving()` stays under
+    # `limit` and the loop would otherwise go back for pages 2 and 3.
+    shown = [TitleRef(tmdb_id=i, media_type="movie") for i in range(101, 119)]
+
+    result = _search(fake_tmdb, shown=shown)
+
+    assert fake_tmdb.count("/discover/movie") == 1
+    # And the two rows it did find are still the answer.
+    assert [p["tmdb_id"] for p in result.picks] == [119, 120]
+
+
+def test_the_budget_cancels_a_discover_already_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deadline, not a check between calls. One discover() carries its own
+    retries and backoff, so a budget that only decides whether the *next* call
+    starts still lets a single slow one run past the gateway's turnDeadline
+    and lose the whole turn. Page 1 is deliberately exempt — it is the answer,
+    not the widening — so the call this cancels is the one after it."""
+    calls = 0
+
+    async def slow_transport(request: httpx2.Request) -> httpx2.Response:
+        nonlocal calls
+        if "/discover/" not in request.url.path:
+            return httpx2.Response(200, json={"results": {}})
+        calls += 1
+        if calls == 1:
+            return httpx2.Response(200, json=_page(*range(101, 101 + PAGE_SIZE)))
+        # Longer than any budget: the test hangs rather than fails if the
+        # deadline ever goes back to being a between-calls check.
+        await asyncio.sleep(30)
+        return httpx2.Response(200, json=_page(*range(201, 201 + PAGE_SIZE)))
+
+    monkeypatch.setattr(catalog_tool, "LADDER_BUDGET_SECONDS", 0.05)
+
+    async def go() -> CatalogResult:
+        return await search(
+            "something good",
+            client=tmdb.TMDBClient("t", transport=httpx2.MockTransport(slow_transport)),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=ok_interpret,
+            rank_model=_rank_both,
+            # All but two of page 1 on screen, so the loop wants page 2.
+            shown=[TitleRef(tmdb_id=i, media_type="movie") for i in range(101, 119)],
+        )
+
+    result = asyncio.run(asyncio.wait_for(go(), timeout=10))
+
+    assert calls == 2, "page 2 should have been attempted"
+    # Cancelled, so none of its rows reached the answer — and page 1's did.
+    assert [p["tmdb_id"] for p in result.picks] == [119, 120]
+
+
+def test_a_deep_session_pages_further_rather_than_widening() -> None:
+    """The gateway's shown window is 40, and verdicts exclude on top of it, so
+    the pages read have to reach past both — otherwise a "show me 10 more"
+    several rounds in comes back thin and the ladder drops a year the user
+    actually typed while unshown rows sit one page away (TASKS.md T31)."""
+    fake_tmdb = FakeTMDB()
+    for start in (101, 121, 141, 161):
+        fake_tmdb.ok("/discover/movie", _page(*range(start, start + PAGE_SIZE)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(release_year_gte=1990, release_year_lte=1999)
+
+    result = _search(
+        fake_tmdb,
+        interpret_model=fake_interpret,
+        # A full window, plus enough rated titles to sink the first pages.
+        shown=[TitleRef(tmdb_id=i, media_type="movie") for i in range(101, 141)],
+        verdicts=[
+            TitleVerdict(tmdb_id=i, media_type="movie", verdict="disliked")
+            for i in range(141, 157)
+        ],
+    )
+
+    assert result.relaxed == []
+    for params in fake_tmdb.all_params_for("/discover/movie"):
+        assert params["primary_release_date.gte"].startswith("1990")
+
+
+# --- what was asked for keeps its place in the list (T30) -------------------
+
+
+def test_a_widened_query_never_loses_an_exact_match() -> None:
+    """rank() cannot see rungs, so it can name ten widened picks and never
+    mention the two that actually matched. Ordering alone cannot fix that —
+    there has to be something exact in the list to order."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/keyword", {"results": [{"id": 42, "name": "slow burn"}]})
+    fake_tmdb.ok("/discover/movie", _page(101, 102))
+    fake_tmdb.ok("/discover/movie", _page(*range(201, 201 + PAGE_SIZE)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(keywords=["slow burn"])
+
+    async def rank_widened_only(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(
+            picks=[
+                RankedPick(tmdb_id=c["tmdb_id"], blurb="ok")
+                for c in candidates
+                if c["tmdb_id"] >= 200
+            ]
+        )
+
+    result = _search(
+        fake_tmdb, interpret_model=fake_interpret, rank_model=rank_widened_only
+    )
+
+    ids = [p["tmdb_id"] for p in result.picks]
+    assert result.relaxed == ["keywords"]
+    # Both exact matches present, and leading.
+    assert ids[:2] == [101, 102]
+    assert result.exact_matches == 2
+    assert len(ids) == RESULT_CEILING
+
+
+def test_a_reserved_exact_match_carries_no_blurb() -> None:
+    """Same shape the floor top-up already returns. A blurb would mean a
+    second rank() call, against a 15 req/min free tier."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/keyword", {"results": [{"id": 42, "name": "slow burn"}]})
+    fake_tmdb.ok("/discover/movie", _page(101))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(keywords=["slow burn"])
+
+    async def rank_widened_only(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(
+            picks=[
+                RankedPick(tmdb_id=c["tmdb_id"], blurb="ok")
+                for c in candidates
+                if c["tmdb_id"] >= 200
+            ]
+        )
+
+    result = _search(
+        fake_tmdb, interpret_model=fake_interpret, rank_model=rank_widened_only
+    )
+
+    assert result.picks[0]["tmdb_id"] == 101
+    assert result.picks[0]["blurb"] == ""
+    assert result.picks[1]["blurb"] == "ok"
+
+
+def test_nothing_is_reserved_when_the_query_was_never_widened() -> None:
+    """With no rung fired every candidate is rung 0, so an unguarded
+    reservation would hand back the whole page instead of rank()'s picks."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 101 + PAGE_SIZE)))
+
+    async def rank_a_few(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(
+            picks=[RankedPick(tmdb_id=c["tmdb_id"], blurb="ok") for c in candidates[:6]]
+        )
+
+    result = _search(fake_tmdb, rank_model=rank_a_few)
+
+    assert result.relaxed == []
+    assert len(result.picks) == 6
+    assert all(p["blurb"] == "ok" for p in result.picks)
+
+
+def test_the_shown_window_stays_shorter_than_this_paging_reach() -> None:
+    """services/gateway/chat.go's maxShownRefs, mirrored. Its own
+    TestShownWindowStaysShorterThanTheAgentsPagingReach can only see the Go
+    side, so a change to MAX_DISCOVER_PAGES or PAGE_SIZE would break the pair
+    with every suite still green. Both sides assert it; either edit fails."""
+    gateway_max_shown_refs = 40
+    spare = MAX_DISCOVER_PAGES * PAGE_SIZE - gateway_max_shown_refs
+    assert spare >= RESULT_CEILING, (
+        f"maxShownRefs leaves only {spare} unshown rows; "
+        f"a 'show me more' run past that reports all_shown for a query "
+        f"that still has pages"
+    )
+
+
+def test_a_named_person_is_never_a_rung() -> None:
+    """Padding two genuine matches with three unrelated films buys a count and
+    loses the answer — cast and crew stay out of the ladder entirely."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/person", {"results": [{"id": 31, "name": "Tom Hanks"}]})
+    fake_tmdb.ok("/discover/movie", _page(101, 102))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(cast=["Tom Hanks"])
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == []
+    for params in fake_tmdb.all_params_for("/discover/movie"):
+        assert params["with_cast"] == "31"
+
+
+# --- already shown: "show me 10 more" means ten different ones (T30) --------
+
+
+def test_shown_titles_never_come_back() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
+
+    result = _search(fake_tmdb, shown=[TitleRef(tmdb_id=102, media_type="movie")])
+
+    assert [p["tmdb_id"] for p in result.picks] == [101, 103]
+
+
+def test_shown_excludes_a_saved_title_that_verdicts_would_keep() -> None:
+    """want_to_watch deliberately stays eligible for future recommendations,
+    and just as deliberately is not handed back on the next "show me more"."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102))
+
+    result = _search(
+        fake_tmdb,
+        verdicts=[_verdict(101, "want_to_watch")],
+        shown=[TitleRef(tmdb_id=101, media_type="movie")],
+    )
+
+    assert [p["tmdb_id"] for p in result.picks] == [102]
+
+
+def test_shown_is_keyed_on_media_type_like_every_other_exclusion() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))
+
+    result = _search(fake_tmdb, shown=[TitleRef(tmdb_id=101, media_type="tv")])
+
+    assert [p["tmdb_id"] for p in result.picks] == [101]
+
+
+def test_an_exhausted_query_reports_all_shown_never_all_judged() -> None:
+    """Telling someone they have rated titles they were merely shown is false,
+    and a third "show me more" is exactly where that would surface."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102))
+
+    result = _search(
+        fake_tmdb,
+        shown=[TitleRef(tmdb_id=i, media_type="movie") for i in (101, 102)],
+        rank_model=rank_must_not_run(NO_CANDIDATES),
+    )
+
+    assert result.picks == []
+    assert result.all_shown is True
+    assert result.all_judged is False
+
+
+def test_the_next_page_rescues_a_wholly_shown_first_page() -> None:
+    """The third "show me 10 more": page 1 is entirely spent, and the answer
+    is page 2 of the same query rather than a looser one."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 101 + PAGE_SIZE)))
+    fake_tmdb.ok("/discover/movie", _page(201, 202))
+
+    result = _search(
+        fake_tmdb,
+        shown=[
+            TitleRef(tmdb_id=i, media_type="movie") for i in range(101, 101 + PAGE_SIZE)
+        ],
+    )
+
+    assert [p["tmdb_id"] for p in result.picks] == [201, 202]
+    assert result.all_shown is False
+    assert result.relaxed == []
+
+
+def test_a_named_title_is_answered_however_often_it_has_been_shown() -> None:
+    """Same reason verdicts do not filter this path: "is Dune on Netflix" is a
+    factual question, and the answer does not change on the second asking."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/multi", {"results": [{**MOVIE_A, "media_type": "movie"}]})
+    fake_tmdb.ok("/movie/101", raw_movie_full(101, "Fake Heist"))
+    fake_tmdb.ok("/movie/101/watch/providers", {"results": {}})
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(title="Fake Heist")
+
+    result = _search(
+        fake_tmdb,
+        interpret_model=fake_interpret,
+        rank_model=rank_must_not_run(NO_CANDIDATES),
+        shown=[TitleRef(tmdb_id=101, media_type="movie")],
+    )
+
+    assert [p["tmdb_id"] for p in result.picks] == [101]
+    assert result.kind == "lookup"
+
+
+def test_rank_is_told_how_many_picks_to_return() -> None:
+    """Never told a number, rank() answers a broad query with whatever it
+    feels like — five picks where twenty candidates were available."""
+    seen: list[str] = []
+
+    async def capture(message: str, candidates: list[Title]) -> RankResult:
+        seen.append(message)
+        return RankResult(picks=[])
+
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
+    _search(fake_tmdb, rank_model=capture)
+
+    assert f"Return {RESULT_CEILING} picks" in seen[0]
+    assert str(RESULT_FLOOR) in seen[0]
+
+
+def test_the_count_asked_of_rank_follows_an_explicit_request() -> None:
+    seen: list[str] = []
+
+    async def capture(message: str, candidates: list[Title]) -> RankResult:
+        seen.append(message)
+        return RankResult(picks=[])
+
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(limit=1)
+
+    _search(fake_tmdb, interpret_model=fake_interpret, rank_model=capture)
+
+    assert "exactly one pick" in seen[0]
+
+
+def test_the_count_line_sits_below_the_taste_hint_not_above_it() -> None:
+    """_with_taste's hint belongs above the request; this belongs below it,
+    as the last thing before the candidate list."""
+    folded = _with_target_count(
+        _with_taste("a heist movie", ["Heat"]), limit=10, floor=5
+    )
+    assert folded.index(TASTE_HEADER) < folded.index("a heist movie")
+    assert folded.index("a heist movie") < folded.index("Return 10 picks")
+
+
+def test_the_query_as_asked_is_read_before_anything_is_loosened() -> None:
+    """The ordering that matters: a full page spent by exclusion is answered
+    with page 2 of the same query, never by dropping the user's constraints.
+    Relaxing first drops the year off "a slow-burn thriller from the 90s"
+    while 96 unshown 90s thrillers sit one page away."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 101 + PAGE_SIZE)))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90, release_year_gte=1990)
+
+    result = _search(
+        fake_tmdb,
+        interpret_model=fake_interpret,
+        shown=[
+            TitleRef(tmdb_id=i, media_type="movie") for i in range(101, 101 + PAGE_SIZE)
+        ],
+    )
+
+    assert result.relaxed == []
+    assert [p["tmdb_id"] for p in result.picks] == [201, 202, 203, 204, 205]
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    assert [c["page"] for c in calls] == ["1", "2"]
+    # The constraints survived intact — nothing was traded for the second page.
+    assert all("with_runtime.lte" in c for c in calls)
+
+
+def test_paging_stops_at_the_bound_even_when_the_floor_is_never_met() -> None:
+    fake_tmdb = FakeTMDB()
+    for start in range(1, 6):
+        fake_tmdb.ok(
+            "/discover/movie", _page(*range(start * 100, start * 100 + PAGE_SIZE))
+        )
+
+    _search(
+        fake_tmdb,
+        rank_model=rank_must_not_run(NO_CANDIDATES),
+        shown=[TitleRef(tmdb_id=i, media_type="movie") for i in range(100, 600)],
+    )
+
+    assert fake_tmdb.count("/discover/movie") == MAX_DISCOVER_PAGES
+
+
+def test_a_rung_reads_one_page_not_the_whole_ladder_again() -> None:
+    """Depth is for the query as asked; a rung is for breadth, and a widened
+    query has no shortage of rows on page 1."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101))  # short: no page 2 to read
+    fake_tmdb.ok("/discover/movie", _page(*range(201, 201 + PAGE_SIZE)))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == ["runtime"]
+    assert fake_tmdb.count("/discover/movie") == 2
+
+
+def test_a_guessed_mood_is_dropped_before_a_stated_year() -> None:
+    """Mood is the only rung the model invents — the prompt has it read a mood
+    out of tone. Dropping the decade someone actually typed to rescue a tag the
+    model guessed is backwards, and it cost "a slow-burn thriller from the 90s"
+    its 90s while 96 unshown 90s thrillers sat one page away."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/keyword", {"results": [{"id": 42, "name": "slow burn"}]})
+    fake_tmdb.ok("/discover/movie", _page())  # mood zeroes the query
+    fake_tmdb.ok("/discover/movie", _page(101, 102, 103, 104, 105))
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(
+            keywords=["slow burn"],
+            genres=["thriller"],
+            release_year_gte=1990,
+            release_year_lte=1999,
+        )
+
+    result = _search(fake_tmdb, interpret_model=fake_interpret)
+
+    assert result.relaxed == ["keywords"]
+    calls = fake_tmdb.all_params_for("/discover/movie")
+    # The decade and the genre both survived; only the guess was spent.
+    assert calls[1]["primary_release_date.gte"] == "1990-01-01"
+    assert "with_genres" in calls[1]
+    assert "with_keywords" not in calls[1]
