@@ -312,6 +312,12 @@ type outboundEvent struct {
 	Text    string      `json:"text,omitempty"`
 	Picks   []agentPick `json:"picks,omitempty"`
 	Relaxed []string    `json:"relaxed,omitempty"`
+	// The agent's one-line explanation of a widened search (T30), empty
+	// whenever nothing was relaxed. Composed there, beside the rest of the
+	// relaxation copy, rather than templated here like interpretingLine:
+	// splitting it from agent/chat.py's _nothing_found_message would
+	// duplicate that file's label table across two services.
+	Note string `json:"note,omitempty"`
 }
 
 // historyTurn is both the connection's in-memory record of a completed turn
@@ -320,6 +326,12 @@ type outboundEvent struct {
 type historyTurn struct {
 	Role string `json:"role"`
 	Text string `json:"text"`
+	// The tmdb_id/media_type pairs this turn put on screen, from
+	// messages.title_refs — nil for a user row and for an assistant row that
+	// showed no cards. `json:"-"` deliberately: this rides along on the load
+	// so the already-shown set costs no second query, but the agent's history
+	// window is text only (see ChatRequest.history) and must stay that way.
+	TitleRefs []agentTitleRef `json:"-"`
 }
 
 // turnRecord is how a finished runTurn reports back to the connection's
@@ -348,6 +360,16 @@ type turnRecord struct {
 	// The tmdb_id/media_type pairs shown, from a "results" event; nil for a
 	// "message" turn, which showed no picks.
 	titleRefs []agentTitleRef
+	// Whether those refs should also join the connection's "already shown"
+	// set, which is a narrower question than whether they are worth
+	// persisting: only a rendered recommendation counts. Both reasons it can
+	// be false are recorded where they are known -- see the "results" case in
+	// runTurn.
+	//
+	// Guests only. An account's set is read back from messages.title_refs
+	// instead (shownFromHistory), which cannot see this field -- see there for
+	// what that costs.
+	countsAsShown bool
 }
 
 // Only the last few exchanges reach the agent — see agent/chat.py's
@@ -355,12 +377,35 @@ type turnRecord struct {
 // agent." "show me more"/pagination replaying a stored DiscoverIntent (T13's
 // own suggested mechanism) would serve that follow-up case better than raw
 // history text, but building it is out of scope here — see agent/README.md.
-const maxHistoryExchanges = 2
+//
+// Five, not two, because the interpret prompt now carries a follow-up's
+// parameters forward out of this history ("show me more" repeats the previous
+// request — agent/catalog_tool.py's _INTERPRET_SYSTEM_PROMPT), and maxShownRefs
+// below budgets for four such rounds. At two exchanges the original request
+// fell out of the window on the third one, and "show me more" quietly became
+// "show me anything". The extra cost is a handful of short lines per turn —
+// an assistant turn's stored text is one "Suggested: A, B, C" sentence.
+const maxHistoryExchanges = 5
 
-// The relaxation ladder in agent's search() has no combined deadline of its
-// own (TASKS.md T13.5's carried-forward note: "budget for it when wiring this
-// into a request path") — this is that budget. Generous relative to the
-// documented 4-8s normal case so it only ever fires on a genuinely stuck call.
+// How much of a conversation loadConversation reads back. Deep enough for both
+// of its consumers, neither of which may be silently starved by the other:
+// windowHistory forwards maxHistoryExchanges*2 messages to the agent, and
+// shownFromHistory needs about maxShownRefs/RESULT_FLOOR assistant rows to
+// refill the shown set, doubled for the user rows interleaved with them.
+//
+// Sized off the agent's *floor* rather than its ceiling, because the floor is
+// what a turn actually guarantees — sizing off ten refs a turn assumed every
+// turn fills, and a run of five-pick turns then forgot titles a guest would
+// still remember. A budget rather than a guarantee even so: a lookup turn
+// carries one ref and a message turn none. Written flat rather than derived
+// because the derivation is what encoded the wrong assumption;
+// TestSeededMessagesCoversBothItsConsumers holds both ends instead.
+const maxSeededMessages = 20
+
+// The backstop for a turn that never comes back. The agent bounds its own
+// widening (catalog_tool.py's LADDER_BUDGET_SECONDS), but not the first
+// TMDB call of a search, so this still has to catch a stuck one. Generous
+// relative to the documented 4-8s normal case.
 const turnDeadline = 30 * time.Second
 
 // Comfortably inside the 60s idle timeout common to proxies and load
@@ -371,6 +416,61 @@ const (
 	pingInterval = 30 * time.Second
 	pingTimeout  = 10 * time.Second
 )
+
+// Four rounds of "show me 10 more" before the oldest picks become eligible
+// again, and bounded so a long thread cannot grow the request body without
+// limit. Same discipline as windowHistory below.
+//
+// Held under the 80 rows the agent can page through (MAX_DISCOVER_PAGES *
+// PAGE_SIZE), so the window alone can never consume everything one query
+// reaches — verdicts exclude on top of it, which is why the agent's copy for
+// that case says "everything I found" rather than "everything there is". See
+// TestShownWindowStaysShorterThanTheAgentsPagingReach.
+const maxShownRefs = 40
+
+func windowShown(refs []agentTitleRef) []agentTitleRef {
+	refs = dedupeShown(refs)
+	if len(refs) <= maxShownRefs {
+		return refs
+	}
+	return refs[len(refs)-maxShownRefs:]
+}
+
+// shownFromHistory flattens a loaded conversation's stored title_refs,
+// oldest-first, into the already-shown set for an account. Read fresh per
+// message rather than kept on the connection — see the load in
+// runChatConnection for why, and historyTurn.TitleRefs for what the column
+// cannot record.
+func shownFromHistory(history []historyTurn) []agentTitleRef {
+	var refs []agentTitleRef
+	for _, t := range history {
+		refs = append(refs, t.TitleRefs...)
+	}
+	return refs
+}
+
+// dedupeShown keeps one entry per title, at its most recent position, so the
+// cap above counts distinct titles rather than sightings. A title re-offered
+// after sliding out of the window is stored twice, and so is every repeat
+// lookup of the same one; without this the window remembers fewer titles than
+// maxShownRefs budgets for, and "show me more" starts repeating earlier than
+// the four rounds that constant is sized for. windowShown calls this itself,
+// so no caller can cap a list without it.
+func dedupeShown(refs []agentTitleRef) []agentTitleRef {
+	seen := make(map[agentTitleRef]struct{}, len(refs))
+	out := make([]agentTitleRef, 0, len(refs))
+	// Newest first, so the surviving copy is the most recent sighting; the
+	// caller wants oldest-first, hence the reverse.
+	for i := len(refs) - 1; i >= 0; i-- {
+		if _, dup := seen[refs[i]]; dup {
+			continue
+		}
+		seen[refs[i]] = struct{}{}
+		out = append(out, refs[i])
+	}
+	slices.Reverse(out)
+	return out
+}
 
 func windowHistory(history []historyTurn) []historyTurn {
 	n := maxHistoryExchanges * 2
@@ -478,6 +578,15 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 	var guestConv string
 	var guestHistory []historyTurn
 	var guestTurns int
+	// The titles already shown on this connection (T30) — guests only. An
+	// account's are read back from messages.title_refs on every message
+	// instead, beside the history: see the load below for why connection
+	// memory is the wrong home for state the database already holds.
+	//
+	// Keyed on guestConv below rather than a conversation of its own: the
+	// panel forgets a thread's cards and its text together, so one reset has
+	// to govern both or the two come to disagree about which thread is live.
+	var shownRefs []agentTitleRef
 	// The one place a finished turn is handled, so the guest branch can't be
 	// missed at any of the three sites below: an account persists via
 	// finishTurn, a guest only remembers.
@@ -491,10 +600,17 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 		}
 		// Keyed on the turn's own conversation, not the coordinator's current
 		// one: a turn that finishes after the guest has moved on belongs to
-		// the thread it was dispatched for.
+		// the thread it was dispatched for. History and shown set reset
+		// together — the panel forgets both at the same moment.
 		if rec.conversation != guestConv {
 			guestConv = rec.conversation
 			guestHistory = nil
+			shownRefs = nil
+		}
+		// Narrower than the history beside it: only a rendered recommendation
+		// was actually offered (see runTurn's "results" case).
+		if rec.countsAsShown && len(rec.titleRefs) > 0 {
+			shownRefs = windowShown(append(shownRefs, rec.titleRefs...))
 		}
 		guestHistory = windowHistory(append(guestHistory,
 			historyTurn{Role: "user", Text: rec.userText},
@@ -686,6 +802,9 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 						// failure degrades to an empty history window
 						// instead of blocking the turn — the next message
 						// on this conversation simply retries the load.
+						// It costs the already-shown set too (that rides
+						// on this load), so the turn may re-offer a title;
+						// a repeat beats refusing to answer.
 						slog.ErrorContext(ctx, "conversation load failed", "error", dbError(err))
 						history = nil
 					}
@@ -695,7 +814,20 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				cancelCurrent = cancel
 				currentTurn = msg.Turn
 				outstanding++
-				go h.runTurn(turnCtx, ctx, conn, userID, msg.Turn, conversationID, msg.Text, providers, history, deletionGen, done)
+				// Only this conversation's own shown set: switching threads
+				// must not suppress a title in the new one because the old
+				// one showed it. An account's came from the load above (keyed
+				// on this conversation by the query itself); a guest's from
+				// the in-memory accumulation, which needs the check.
+				var shown []agentTitleRef
+				if guest {
+					if conversationID == guestConv {
+						shown = shownRefs
+					}
+				} else {
+					shown = windowShown(shownFromHistory(history))
+				}
+				go h.runTurn(turnCtx, ctx, conn, userID, msg.Turn, conversationID, msg.Text, providers, history, shown, deletionGen, done)
 			case "cancel":
 				if cancelCurrent != nil && currentTurn == msg.Turn {
 					cancelCurrent()
@@ -786,16 +918,22 @@ func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec
 // three real call sites always pass a live connection, but finishTurn is
 // also called directly (with no connection) from unit tests, where safety
 // shouldn't depend on every test fake correctly returning created == false.
-func (h *Handler) sendEvent(turnCtx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) {
+// Reports whether the event actually reached the browser. Most callers ignore
+// that — a dropped event is already the intended outcome here — but the
+// "results" case needs it: picks the user never saw must not join the
+// already-shown set.
+func (h *Handler) sendEvent(turnCtx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) bool {
 	if turnCtx.Err() != nil || conn == nil {
-		return
+		return false
 	}
 	ev.Turn = turn
 	writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := wsjson.Write(writeCtx, conn, ev); err != nil {
 		slog.WarnContext(turnCtx, "chat event write failed", "turn", turn, "error", err.Error())
+		return false
 	}
+	return true
 }
 
 const (
@@ -874,6 +1012,7 @@ func (h *Handler) runTurn(
 	userID, turnID, conversationID, text string,
 	guestProviders []int,
 	history []historyTurn,
+	shown []agentTitleRef,
 	deletionGen int,
 	done chan<- turnRecord,
 ) {
@@ -954,6 +1093,7 @@ func (h *Handler) runTurn(
 		WatchProviderNames: chatCtx.ProviderNames,
 		History:            windowHistory(history),
 		Verdicts:           verdicts,
+		Shown:              shown,
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -978,8 +1118,8 @@ func (h *Handler) runTurn(
 				slog.WarnContext(turnCtx, "chat intent decode failed", "turn", turnID, "error", err.Error())
 			}
 		case "results":
-			h.sendEvent(turnCtx, conn, turnID, outboundEvent{
-				Type: "results", Picks: ev.Picks, Relaxed: ev.Relaxed,
+			rendered := h.sendEvent(turnCtx, conn, turnID, outboundEvent{
+				Type: "results", Picks: ev.Picks, Relaxed: ev.Relaxed, Note: ev.Note,
 			})
 			// Guarded on a non-empty summary, not unconditional like
 			// "message" below: zero picks is a real, reachable state
@@ -996,6 +1136,13 @@ func (h *Handler) runTurn(
 				for i, p := range ev.Picks {
 					rec.titleRefs[i] = agentTitleRef{TMDBID: p.TMDBID, MediaType: p.MediaType}
 				}
+				// Narrower than the persist above: only a rendered
+				// recommendation was actually offered. A lookup is exempt for
+				// the same reason search() won't filter one ("is Dune on
+				// Netflix" is the same question however often it is asked), and
+				// cards that never reached the socket showed nothing to
+				// suppress.
+				rec.countsAsShown = rendered && ev.Kind != "lookup"
 			}
 		case "message":
 			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "token", Text: ev.Text})
@@ -1008,6 +1155,7 @@ func (h *Handler) runTurn(
 			// stream would leave rec.titleRefs pointing at picks that don't
 			// match rec.assistantText's replacement text.
 			rec.titleRefs = nil
+			rec.countsAsShown = false
 		case "error":
 			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "error", Text: friendlyError(ev.Reason)})
 			rec.ok = false
@@ -1069,7 +1217,12 @@ func interpretingLine(intent agentIntent, providerNames []string) string {
 		clauses = append(clauses, fmt.Sprintf("under %d minutes", *intent.MaxRuntimeMinutes))
 	}
 	if len(intent.Keywords) > 0 {
-		clauses = append(clauses, "about "+strings.Join(intent.Keywords, ", "))
+		// "or", not humanJoin's "and": tmdb.py sends with_keywords OR-joined,
+		// so a title carrying either tag qualifies, and the interpret prompt
+		// now actively encourages near-synonyms for one mood ("slow burn" and
+		// "tense" together). Read as a conjunction, this line promises a
+		// filter the results provably do not satisfy.
+		clauses = append(clauses, "about "+strings.Join(intent.Keywords, " or "))
 	}
 	if excl := slices.Concat(intent.WithoutGenres, intent.WithoutKeywords); len(excl) > 0 {
 		clauses = append(clauses, "excluding "+strings.Join(excl, ", "))
@@ -1241,6 +1394,12 @@ type agentChatRequest struct {
 	// The caller's whole verdict set (T19); agent/catalog_tool.py's search()
 	// decides what each value means.
 	Verdicts []Verdict `json:"verdicts,omitempty"`
+	// What has already been put on screen for this conversation (T30), so
+	// "show me 10 more" means ten different titles. An account's comes from
+	// messages.title_refs, read back on every message beside the history
+	// (shownFromHistory); a guest's, having no rows, accumulates on the
+	// connection. Windowed to maxShownRefs either way.
+	Shown []agentTitleRef `json:"shown,omitempty"`
 }
 
 // agentIntent mirrors DiscoverIntent.model_dump(exclude_none=True) — see
@@ -1335,6 +1494,7 @@ type agentEvent struct {
 	Intent  json.RawMessage `json:"intent,omitempty"`
 	Picks   []agentPick     `json:"picks,omitempty"`
 	Relaxed []string        `json:"relaxed,omitempty"`
+	Note    string          `json:"note,omitempty"`
 	Text    string          `json:"text,omitempty"`
 	Reason  string          `json:"reason,omitempty"`
 }

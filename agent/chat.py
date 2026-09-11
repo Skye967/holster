@@ -6,12 +6,13 @@ onto the queue as they become available (intent as soon as interpret()
 resolves, the final result once discover()/rank() finish); this generator
 drains the queue and yields each event to its caller in order. That is what
 lets an "intent" event reach the caller in ~1-2s while the full pipeline
-(up to four sequential TMDB calls, plus rank()) is still running.
+(up to nine sequential TMDB calls, plus rank()) is still running.
 
 Event shapes on the wire (one JSON object per line):
 
     {"type": "intent", "intent": {...DiscoverIntent fields...}}
     {"type": "results", "kind": "search" | "lookup", "relaxed": [...],
+        "note": str,
         "picks": [{...Title fields, "genre_names":
         [...], "runtime_minutes": int | None, "cast": [...], "available_on":
         [...Provider fields] | None, "blurb": str}]}
@@ -21,6 +22,9 @@ Event shapes on the wire (one JSON object per line):
         -- kind is which path search() took, recorded where the branch is
            taken rather than inferred from intent fields afterwards; the
            gateway writes it into stored history (chat.go's summarizePicks)
+        -- note is the one-line explanation of a widened search, empty
+           whenever nothing was relaxed; `relaxed` stays alongside it as the
+           machine-readable form
     {"type": "message", "text": str}   -- a plain reply with no candidates
                                            (no subscriptions, capability
                                            question, clarifying question, a
@@ -59,6 +63,7 @@ from catalog_tool import (
     DiscoverIntent,
     Interpreter,
     Ranker,
+    TitleRef,
     TitleVerdict,
     search,
 )
@@ -70,14 +75,36 @@ logger = logging.getLogger("holster.chat")
 # decides the window (ARCHITECTURE.md: "the gateway assembles the context...
 # the agent receives what it needs") — a bug upstream should cost a truncated
 # prompt, not an unbounded one.
-MAX_HISTORY_TURNS = 6
+#
+# Counted in messages, not exchanges: HistoryTurn is one row. Deliberately well
+# clear of services/gateway's windowHistory (maxHistoryExchanges*2 = 10), which
+# is the real policy. A backstop sitting at the operating point stops being a
+# backstop and becomes a second window — that is how this silently cut the
+# gateway's five exchanges back to three.
+MAX_HISTORY_TURNS = 20
+
+# The same backstop for `shown`, and sized the same way: the gateway sends at
+# most maxShownRefs (40), and this has to stay clear of that without reaching
+# catalog_tool's paging depth — at MAX_DISCOVER_PAGES * PAGE_SIZE (80) an
+# oversized set would exclude every row a query can read and report
+# "everything I found" for all of them.
+MAX_SHOWN = 60
 
 NO_PROVIDERS_MESSAGE = (
     "You haven't picked any streaming services yet. Head to Connections to "
     "set them up and I'll be able to find something for you."
 )
 
-_RELAXED_LABELS = {"runtime": "how long", "year": "the year", "keywords": "the mood"}
+# Keep the keys in sync with catalog_tool.RelaxedConstraint by hand — .get()
+# below falls back to the raw code, so a missed label reads oddly rather than
+# raising, the same trade friendlyError() makes against _error_reason().
+_RELAXED_LABELS = {
+    "runtime": "how long",
+    "year": "the year",
+    "keywords": "the mood",
+    "genres": "the genre",
+    "rating": "the rating bar",
+}
 
 
 class HistoryTurn(BaseModel):
@@ -108,6 +135,11 @@ class ChatRequest(BaseModel):
     # message (TASKS.md T19). Passed straight through; catalog_tool.search()
     # decides what each value means.
     verdicts: list[TitleVerdict] = Field(default_factory=list)
+    # What the gateway has already shown on this connection, so "show me 10
+    # more" means ten different titles (TASKS.md T30). Bounded and windowed
+    # by the gateway, the same division of labour as `history` above; this
+    # agent holds nothing between turns.
+    shown: list[TitleRef] = Field(default_factory=list)
 
 
 def _with_history(message: str, history: list[HistoryTurn]) -> str:
@@ -115,10 +147,12 @@ def _with_history(message: str, history: list[HistoryTurn]) -> str:
     than changing catalog_tool.py's message: str contract. Keeps that
     shipped, tested module untouched for a concern that is still settling.
 
-    One of two folding sites now: catalog_tool's _with_taste prepends the
-    liked-title hint to the same string, for rank() only. It prepends
-    precisely because this function leaves "Current message: ..." at the
-    end, and that has to stay the last thing before the candidate list."""
+    One of three folding sites now: catalog_tool's _with_taste prepends the
+    liked-title hint to the same string, for rank() only, precisely because
+    this function leaves "Current message: ..." at the end. _with_target_count
+    then appends one line after it — the one thing that may come between the
+    current message and the candidate list, and see its docstring for why it
+    is worth the exception."""
     if not history:
         return message
     lines = [
@@ -130,7 +164,7 @@ def _with_history(message: str, history: list[HistoryTurn]) -> str:
 
 
 def _human_join(items: Sequence[str]) -> str:
-    """"Netflix, Hulu and Max" — mirrors services/gateway/chat.go's
+    """ "Netflix, Hulu and Max" — mirrors services/gateway/chat.go's
     humanJoin so the same kind of list reads the same way wherever it
     reaches the user (the interpreting line, a capability answer, here)."""
     if not items:
@@ -138,6 +172,13 @@ def _human_join(items: Sequence[str]) -> str:
     if len(items) == 1:
         return items[0]
     return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def _relaxed_labels(relaxed: Sequence[str]) -> str:
+    """What the ladder dropped, in the caller's words. The only reader of
+    _RELAXED_LABELS, so the two sentences below can't come to describe the
+    same relaxation differently."""
+    return _human_join([_RELAXED_LABELS.get(r, r) for r in relaxed])
 
 
 def _title_not_found_message(title: str) -> str:
@@ -155,23 +196,73 @@ def _title_not_found_message(title: str) -> str:
     )
 
 
-def _nothing_found_message(relaxed: Sequence[str], all_judged: bool) -> str:
-    """Why nothing came back, in the caller's words. all_judged takes
-    precedence over relaxed: when every title found was already rated, the
-    relaxation story is beside the point. The copy names no constraint,
-    deliberately - the ladder may already have dropped runtime or year to get
-    this page, so "drop the runtime" can be advice to redo what was already
-    done; and this text becomes assistant history feeding the next turn's
-    interpret(), the same hazard _capability_message documents below."""
+def _nothing_found_message(
+    relaxed: Sequence[str], all_judged: bool, all_shown: bool
+) -> str:
+    """Why nothing came back, in the caller's words. all_judged and all_shown
+    both take precedence over relaxed: when every title found was already
+    rated, or already put on screen this conversation, the relaxation story is
+    beside the point. They are separate cases because the advice differs and
+    because telling someone they rated titles they were only shown is false.
+    Otherwise the copy names no constraint, deliberately - the ladder may
+    already have dropped runtime or year to get this page, so "drop the
+    runtime" can be advice to redo what was already done; and this text
+    becomes assistant history feeding the next turn's interpret(), the same
+    hazard _capability_message documents below."""
     if all_judged:
         return (
             "I found things, but you've rated all of them already. Try "
             "asking for something different."
         )
+    if all_shown:
+        # "everything I found", not "everything there is": the search reads a
+        # bounded number of pages, so a fully-excluded result set means this
+        # search has nothing new, not that the catalog is out of rows.
+        return (
+            "I've already shown you everything I found for that. Try "
+            "something different and I'll keep looking."
+        )
     if not relaxed:
         return "Nothing matched that. Try loosening what you're looking for."
-    labels = _human_join([_RELAXED_LABELS.get(r, r) for r in relaxed])
+    labels = _relaxed_labels(relaxed)
     return f"Nothing matched, even after loosening {labels}. Try a different request."
+
+
+def _relaxed_note(relaxed: Sequence[str], exact_matches: int, total: int) -> str:
+    """The line above a result set the ladder had to widen to fill.
+
+    Composed here, beside _nothing_found_message, rather than in the gateway
+    where interpretingLine lives: this is the same relaxation story that
+    function tells, reading the same labels, and splitting the two across
+    services would duplicate _RELAXED_LABELS and let the halves drift.
+
+    Without this the widening is invisible and reads as the assistant
+    ignoring half the request. It describes what is on screen rather than
+    claiming anything about the catalog — "only the first two match exactly"
+    is true whether the narrow query found nothing or found things the user
+    had already rated, where "only two matched" would be false in the second
+    case. search() orders picks exactness-first, so "the first" is accurate.
+
+    Empty when nothing was relaxed, and also when widening changed nothing
+    that reached the screen — a note about a wider search that contributed no
+    pick would send the user looking for results that aren't there.
+
+    The zero-exact wording says "nothing left" rather than "nothing matched":
+    a query can be widened because the exact matches were all shown on an
+    earlier turn, and telling that user nothing matched their request
+    contradicts the results they are still scrolled past.
+    """
+    if not relaxed or exact_matches >= total:
+        return ""
+    labels = _relaxed_labels(relaxed)
+    if exact_matches == 0:
+        return f"Nothing left that matches exactly, so I widened past {labels}."
+    lead = (
+        "Only the first matches"
+        if exact_matches == 1
+        else f"Only the first {exact_matches} match"
+    )
+    return f"{lead} exactly what you asked for — I widened past {labels}."
 
 
 def _capability_message(provider_names: Sequence[str]) -> str:
@@ -186,7 +277,7 @@ def _capability_message(provider_names: Sequence[str]) -> str:
     return (
         f"I can find something to watch{where} — try something like "
         '"something funny and short" or "a slow-burn thriller with '
-        '[actor]." Tell me what you\'re in the mood for.'
+        "[actor].\" Tell me what you're in the mood for."
     )
 
 
@@ -258,6 +349,7 @@ async def stream_chat(
                 rank_model=rank_model,
                 on_intent=on_intent,
                 verdicts=req.verdicts,
+                shown=req.shown[-MAX_SHOWN:],
             )
         except Exception as exc:
             # Not `except BaseException` — a cancelled turn (asyncio.CancelledError)
@@ -292,6 +384,9 @@ async def stream_chat(
                     "type": "results",
                     "kind": result.kind,
                     "relaxed": result.relaxed,
+                    "note": _relaxed_note(
+                        result.relaxed, result.exact_matches, len(result.picks)
+                    ),
                     "picks": result.picks,
                 }
             )
@@ -310,7 +405,9 @@ async def stream_chat(
             await queue.put(
                 {
                     "type": "message",
-                    "text": _nothing_found_message(result.relaxed, result.all_judged),
+                    "text": _nothing_found_message(
+                        result.relaxed, result.all_judged, result.all_shown
+                    ),
                 }
             )
         await queue.put({"type": "done"})

@@ -59,12 +59,41 @@ LANGUAGE = "en-US"
 # tier rather than gating (see lookup_title).
 MIN_VOTE_COUNT = 200
 
+# The same hazard one tier up, and only on the one sort that is exposed to it.
+# 200 votes is enough to keep an obscure short out of a *filtered* list, and
+# not nearly enough to keep it off the top of a list ordered by rating: with
+# this floor at 200, "best TV drama" returns Teach You a Lesson (9.4 from 888
+# votes) and Perfect Crown (9.1 from 205) above Breaking Bad (8.9 from 18,579).
+# At 1000 the same query returns Breaking Bad, Chernobyl, Better Call Saul and
+# The Sopranos.
+#
+# Deliberately not applied to every sort. Raising the global floor would answer
+# "highest rated" better and every narrow request worse — Korean horror on a
+# six-service account is 15 titles at 200 and 3 at 1000 — so this is scoped to
+# the sort whose ordering the floor actually protects. 1000 rather than higher
+# because 3000 starts dropping genuine classics with modest vote counts (High
+# and Low, 1190).
+MIN_VOTE_COUNT_TOP_RATED = 1000
+
+# TMDB's fixed page size for every list endpoint. Callers read it to tell
+# "this page is all there is" from "there is another page" without spending a
+# request to find out — a page short of this is the last one.
+PAGE_SIZE = 20
+
 REQUEST_TIMEOUT = 10.0
 MAX_RETRIES = 2
 MAX_RETRY_WAIT = 10.0
 
 MediaType = Literal["movie", "tv"]
-DiscoverSort = Literal["popularity.desc", "vote_average.desc"]
+# "Most watched" and "best reviewed". TMDB's own `popularity.desc` used to be
+# the default here and is deliberately no longer offered at all: it is a
+# rolling trend metric, not a quality one, and it ranked War of the Worlds
+# (2025), rated 4.0, fourth among thrillers, above The Dark Knight. Removed
+# rather than demoted because there is no request it answers better — even
+# "what's new" reads better ordered by vote count, which returns titles people
+# recognise instead of whatever is spiking this week. A real "what's new" would
+# be a release-date window on top of vote_count.desc, not this.
+DiscoverSort = Literal["vote_count.desc", "vote_average.desc"]
 SearchKind = Literal["person", "keyword"]
 
 # From /genre/movie/list and /genre/tv/list, 2026-09. Frozen rather than fetched:
@@ -352,6 +381,23 @@ def _trim_region_provider(raw: dict[str, Any], region: str) -> RegionProvider | 
         _unusable("provider entry", exc)
 
 
+def _genre_id(media_type: MediaType, name: str) -> int | None:
+    """One genre name against the frozen table for ``media_type``, or None if
+    it isn't in that vocabulary. The two tables differ — TV has no `horror`,
+    movies have no `sci-fi & fantasy` — so the media type decides."""
+    table = MOVIE_GENRES if media_type == "movie" else TV_GENRES
+    return table.get(name.strip().lower())
+
+
+def is_genre_resolved(media_type: MediaType, name: str) -> bool:
+    """True if `name` is a real genre for `media_type`. Callers use it to tell
+    a genre that filtered the query from one _genres_into dropped, the same
+    question TMDBClient.is_keyword_resolved answers for keywords — a module
+    function rather than a method because the genre tables are frozen
+    constants, where the keyword and person caches are per-request state."""
+    return _genre_id(media_type, name) is not None
+
+
 def _genres_into(
     params: dict[str, Any], key: str, names: list[str] | None, media_type: MediaType
 ) -> None:
@@ -359,10 +405,9 @@ def _genres_into(
     IDs to ``params`` under ``key``. Unknown names are dropped with a warning."""
     if not names:
         return
-    table = MOVIE_GENRES if media_type == "movie" else TV_GENRES
     ids: list[int] = []
     for name in names:
-        gid = table.get(name.strip().lower())
+        gid = _genre_id(media_type, name)
         if gid is None:
             logger.warning("tmdb genre unresolved, constraint dropped (%s)", media_type)
         else:
@@ -499,22 +544,34 @@ class TMDBClient:
         with "failed to resolve" — both read as False."""
         return self._keyword_ids.get(name.strip().lower()) is not None
 
+    def is_person_resolved(self, name: str) -> bool:
+        """True if `name` resolved to a real TMDB person. Same cache-only
+        contract as is_keyword_resolved above — call it only for a name the
+        current request has already passed through discover()."""
+        return self._person_ids.get(name.strip().lower()) is not None
+
     async def _resolve_into(
         self,
         params: dict[str, Any],
         key: str,
         names: list[str] | None,
         kind: SearchKind,
+        join: str = ",",
     ) -> None:
         """Resolve a list of names to IDs and add them to ``params`` under
-        ``key``, comma-joined. Names that do not resolve are dropped; if none
-        resolve, the parameter is omitted entirely."""
+        ``key``, joined by ``join``. Names that do not resolve are dropped; if
+        none resolve, the parameter is omitted entirely.
+
+        TMDB reads "," as AND and "|" as OR, so ``join`` is which of those a
+        multi-value constraint means. It defaults to AND because that is what
+        naming two people means — "with Hanks and Ryan" is both, not either —
+        and only ``with_keywords`` passes "|". See discover()."""
         if not names:
             return
         resolved = await gather_all(*(self._resolve_name(kind, n) for n in names))
         ids = [i for i in resolved if i is not None]
         if ids:
-            params[key] = ",".join(map(str, ids))
+            params[key] = join.join(map(str, ids))
 
     async def search_titles(self, query: str) -> list[Title]:
         """Find titles by name, in TMDB's own relevance order.
@@ -572,7 +629,8 @@ class TMDBClient:
         max_runtime_minutes: int | None = None,
         release_year_gte: int | None = None,
         release_year_lte: int | None = None,
-        sort_by: DiscoverSort = "popularity.desc",
+        sort_by: DiscoverSort = "vote_count.desc",
+        min_vote_count: int | None = None,
         page: int = 1,
     ) -> list[Title]:
         """The workhorse. TMDB applies every hard constraint here; the model's
@@ -596,7 +654,18 @@ class TMDBClient:
             "include_adult": "false",
             "language": LANGUAGE,
             "page": page,
-            "vote_count.gte": MIN_VOTE_COUNT,
+            # Ordering by rating is the one thing this floor has to protect,
+            # and 200 does not protect it — see MIN_VOTE_COUNT_TOP_RATED.
+            # Caller-only, like watch_region above: the default follows the
+            # sort, and search()'s last rung overrides it to bend the bar
+            # without giving up the ordering the user asked for.
+            "vote_count.gte": (
+                min_vote_count
+                if min_vote_count is not None
+                else MIN_VOTE_COUNT_TOP_RATED
+                if sort_by == "vote_average.desc"
+                else MIN_VOTE_COUNT
+            ),
         }
 
         if watch_providers is not None:
@@ -617,7 +686,19 @@ class TMDBClient:
         await gather_all(
             self._resolve_into(params, "with_cast", cast, "person"),
             self._resolve_into(params, "with_crew", crew, "person"),
-            self._resolve_into(params, "with_keywords", keywords, "keyword"),
+            # OR, uniquely. Keywords are how a mood becomes a filter, and
+            # TMDB's tag data is far too sparse to survive an AND: "thriller"
+            # is 1459 titles, "thriller AND slow-burn" is zero, and
+            # "thriller AND (slow-burn OR tense)" is 19. Zero then loses the
+            # mood entirely to the relaxation ladder, so ANDing them meant a
+            # mood was silently discarded on almost every request. OR lets
+            # some noise in (Tokyo Drift is not a slow burn) and rank() is
+            # what filters that, reading the user's actual words against 19
+            # mood-adjacent candidates instead of a page of anything.
+            self._resolve_into(params, "with_keywords", keywords, "keyword", join="|"),
+            # Left as AND: TMDB returns the same rows either way here (1456 of
+            # 1459 for "without gore, bleak" under both), so there is no
+            # behaviour to buy by changing it.
             self._resolve_into(params, "without_keywords", without_keywords, "keyword"),
         )
         _genres_into(params, "with_genres", genres, media_type)

@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,7 @@ import (
 // are client-generated, opaque UUIDs), only used where a test isn't itself
 // about multi-conversation behavior.
 const testConversationID = "11111111-1111-1111-1111-111111111111"
+const otherConversationID = "22222222-2222-2222-2222-222222222222"
 
 // --- ticketStore -------------------------------------------------------
 
@@ -77,9 +79,18 @@ func TestTicketExpires(t *testing.T) {
 
 // --- history windowing ---------------------------------------------------
 
+// sameTurns compares the role/text window, which is all the agent is sent —
+// historyTurn also carries TitleRefs (a slice, so the struct isn't
+// comparable), and that half is asserted by the shown-set tests instead.
+func sameTurns(a, b []historyTurn) bool {
+	return slices.EqualFunc(a, b, func(x, y historyTurn) bool {
+		return x.Role == y.Role && x.Text == y.Text
+	})
+}
+
 func TestWindowHistoryKeepsOnlyTheLastFewExchanges(t *testing.T) {
 	var history []historyTurn
-	for i := range 5 {
+	for i := range maxHistoryExchanges + 3 {
 		history = append(history,
 			historyTurn{Role: "user", Text: strings.Repeat("u", i)},
 			historyTurn{Role: "assistant", Text: strings.Repeat("a", i)},
@@ -89,7 +100,7 @@ func TestWindowHistoryKeepsOnlyTheLastFewExchanges(t *testing.T) {
 	if len(got) != maxHistoryExchanges*2 {
 		t.Fatalf("len(windowHistory(...)) = %d, want %d", len(got), maxHistoryExchanges*2)
 	}
-	if got[0] != history[len(history)-maxHistoryExchanges*2] {
+	if !sameTurns(got[:1], history[len(history)-maxHistoryExchanges*2:][:1]) {
 		t.Error("windowHistory did not keep the most recent exchanges")
 	}
 }
@@ -119,6 +130,20 @@ func TestInterpretingLineComposesGenreYearRuntimeAndProviders(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Errorf("interpretingLine() = %q, missing %q", line, want)
 		}
+	}
+}
+
+// tmdb.py OR-joins with_keywords, and the interpret prompt now encourages
+// near-synonyms for one mood, so a comma list here promised a conjunction the
+// results provably do not satisfy.
+func TestInterpretingLineReadsMultipleMoodsAsEitherNotBoth(t *testing.T) {
+	line := interpretingLine(agentIntent{
+		MediaType: "movie",
+		Keywords:  []string{"slow burn", "tense"},
+	}, nil)
+
+	if !strings.Contains(line, "about slow burn or tense") {
+		t.Errorf("interpretingLine() = %q, want the moods joined with \"or\"", line)
 	}
 }
 
@@ -735,7 +760,7 @@ func TestRunTurnDoesNotBlockSendingToAnUnreadDoneChannel(t *testing.T) {
 
 	finished := make(chan struct{})
 	go func() {
-		h.runTurn(turnCtx, connCtx, nil, "user_1", "t1", testConversationID, "hi", nil, nil, 0, done)
+		h.runTurn(turnCtx, connCtx, nil, "user_1", "t1", testConversationID, "hi", nil, nil, nil, 0, done)
 		close(finished)
 	}()
 
@@ -1041,7 +1066,7 @@ func TestChatConnectionHydratesHistoryFromStoredConversation(t *testing.T) {
 	}
 
 	want := []historyTurn{{Role: "user", Text: "a heist movie"}, {Role: "assistant", Text: "Suggested: Heat"}}
-	if !slices.Equal(got.History, want) {
+	if !sameTurns(got.History, want) {
 		t.Errorf("History sent to the agent = %+v, want the stored conversation %+v", got.History, want)
 	}
 }
@@ -1357,7 +1382,7 @@ func TestChatSwitchingConversationsDoesNotBleedHistoryOrPersistence(t *testing.T
 
 	select {
 	case req := <-gotYReq:
-		if !slices.Equal(req.History, ySeed) {
+		if !sameTurns(req.History, ySeed) {
 			t.Errorf("B's History = %+v, want conv Y's own seed %+v (not A's exchange)", req.History, ySeed)
 		}
 	case <-time.After(2 * time.Second):
@@ -2242,7 +2267,7 @@ func TestGuestHistoryIsPerConnection(t *testing.T) {
 		t.Errorf("first turn history = %+v, want empty", got[0].History)
 	}
 	want := []historyTurn{{Role: "user", Text: "one"}, {Role: "assistant", Text: "a reply"}}
-	if !slices.Equal(got[1].History, want) {
+	if !sameTurns(got[1].History, want) {
 		t.Errorf("second turn history = %+v, want %+v", got[1].History, want)
 	}
 	if len(got[2].History) != 0 {
@@ -2331,5 +2356,371 @@ func TestGuestRejectsAMalformedProvidersList(t *testing.T) {
 	}
 	if n := len(requests()); n != 0 {
 		t.Errorf("agent called %d times for malformed frames, want 0", n)
+	}
+}
+
+// --- what the socket has already shown (T30) --------------------------------
+
+func picksEvent(ids ...int) agentEvent {
+	picks := make([]agentPick, len(ids))
+	for i, id := range ids {
+		picks[i] = agentPick{TMDBID: id, MediaType: "movie", Title: fmt.Sprintf("Film %d", id)}
+	}
+	return agentEvent{Type: "results", Picks: picks}
+}
+
+func newShownTestServer(t *testing.T, reply ...agentEvent) (*httptest.Server, func() []agentChatRequest) {
+	t.Helper()
+	caller, requests := captureAgentRequests(reply...)
+	loadGuest := func(_ context.Context, providers []int) (chatContext, error) {
+		return chatContext{Region: guestRegion, Providers: providers, ProviderNames: []string{"Netflix"}}, nil
+	}
+	return newGuestTestServer(t, caller, loadGuest), requests
+}
+
+// The T30 done-when: a second "show me more" must not re-offer what the first
+// turn already put on screen.
+func TestShownTitlesAreSentBackToTheAgentOnTheNextTurn(t *testing.T) {
+	srv, requests := newShownTestServer(t, picksEvent(101, 102))
+	conn := dialGuest(t, srv)
+
+	sendAndDrain(t, conn, guestMessage("t1", "a heist", []int{8}))
+	sendAndDrain(t, conn, guestMessage("t2", "show me more", []int{8}))
+
+	got := requests()
+	if len(got) != 2 {
+		t.Fatalf("agent called %d times, want 2", len(got))
+	}
+	if len(got[0].Shown) != 0 {
+		t.Errorf("first turn Shown = %v, want none", got[0].Shown)
+	}
+	want := []agentTitleRef{{TMDBID: 101, MediaType: "movie"}, {TMDBID: 102, MediaType: "movie"}}
+	if !slices.Equal(got[1].Shown, want) {
+		t.Errorf("second turn Shown = %+v, want %+v", got[1].Shown, want)
+	}
+}
+
+// A lookup answers a factual question about a title the user named. The agent
+// already refuses to filter that path on the shown set; feeding it is the same
+// asymmetry the other way round, and it would make the obvious answer to a
+// later recommendation request the one title guaranteed to be missing from it.
+//
+// Guests, which is where countsAsShown is read. An account's set comes from
+// messages.title_refs, which does not record that distinction — see
+// shownFromHistory for why that is accepted rather than worked around.
+func TestALookupTurnDoesNotFeedTheShownSet(t *testing.T) {
+	lookup := picksEvent(603)
+	lookup.Kind = "lookup"
+	srv, requests := newShownTestServer(t, lookup)
+	conn := dialGuest(t, srv)
+
+	sendAndDrain(t, conn, guestMessage("t1", "is Heat on Netflix", []int{8}))
+	sendAndDrain(t, conn, guestMessage("t2", "recommend a heist movie", []int{8}))
+
+	got := requests()
+	if len(got) != 2 {
+		t.Fatalf("agent called %d times, want 2", len(got))
+	}
+	if len(got[1].Shown) != 0 {
+		t.Errorf("Shown = %+v after a lookup turn, want none", got[1].Shown)
+	}
+}
+
+// captureAgentRequestsPerCall is captureAgentRequests with a different reply
+// per call, for the tests that need one turn to differ from the next.
+func captureAgentRequestsPerCall(replies ...[]agentEvent) (agentCaller, func() []agentChatRequest) {
+	var mu sync.Mutex
+	var got []agentChatRequest
+	caller := func(_ context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		mu.Lock()
+		n := len(got)
+		got = append(got, req)
+		mu.Unlock()
+		var reply []agentEvent
+		if n < len(replies) {
+			reply = replies[n]
+		}
+		ch := make(chan agentEvent, len(reply)+1)
+		for _, ev := range reply {
+			ch <- ev
+		}
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	return caller, func() []agentChatRequest {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(got)
+	}
+}
+
+// A guest's shown set and history are two halves of one memory, and the panel
+// drops both when it remounts on a conversation switch. They therefore have to
+// reset on the same event: gating the shown reset on the turn having picks
+// left a pickless turn in another thread moving one and not the other, so
+// going back showed an empty thread that still suppressed its own titles.
+func TestAGuestsShownSetAndHistoryForgetTheSameThread(t *testing.T) {
+	const convA = "aaaaaaaa-1111-1111-1111-111111111111"
+	const convB = "bbbbbbbb-2222-2222-2222-222222222222"
+
+	caller, requests := captureAgentRequestsPerCall(
+		[]agentEvent{picksEvent(101)},                              // conv A shows a title
+		[]agentEvent{{Type: "message", Text: "I can find films."}}, // conv B, no picks
+		nil, // back to conv A
+	)
+	loadGuest := func(_ context.Context, providers []int) (chatContext, error) {
+		return chatContext{Region: guestRegion, Providers: providers, ProviderNames: []string{"Netflix"}}, nil
+	}
+	conn := dialGuest(t, newGuestTestServer(t, caller, loadGuest))
+
+	send := func(turn, text, conversation string) {
+		sendAndDrain(t, conn, inboundMessage{
+			Type: "message", Turn: turn, Text: text,
+			Conversation: conversation, Providers: []int{8},
+		})
+	}
+	send("t1", "a heist movie", convA)
+	send("t2", "what can you do", convB)
+	send("t3", "a heist movie", convA)
+
+	got := requests()
+	if len(got) != 3 {
+		t.Fatalf("agent called %d times, want 3", len(got))
+	}
+	// The panel shows conv A as an empty thread here, so nothing in it may be
+	// suppressed: whatever history forgot, the shown set has to have forgotten.
+	if len(got[2].History) == 0 && len(got[2].Shown) > 0 {
+		t.Errorf("conv A has no history yet still suppresses %+v", got[2].Shown)
+	}
+}
+
+// maxShownRefs is sized in titles, so the window has to hold distinct ones.
+func TestTheShownWindowCountsTitlesNotSightings(t *testing.T) {
+	var history []historyTurn
+	// The same title looked up over and over, then genuinely new ones.
+	for range 20 {
+		history = append(history, historyTurn{Role: "assistant", TitleRefs: []agentTitleRef{
+			{TMDBID: 1, MediaType: "movie"},
+		}})
+	}
+	for i := range 10 {
+		history = append(history, historyTurn{Role: "assistant", TitleRefs: []agentTitleRef{
+			{TMDBID: 100 + i, MediaType: "movie"},
+		}})
+	}
+
+	refs := windowShown(shownFromHistory(history))
+	distinct := make(map[agentTitleRef]struct{}, len(refs))
+	for _, r := range refs {
+		distinct[r] = struct{}{}
+	}
+	if len(distinct) != len(refs) {
+		t.Errorf("window holds %d entries but only %d titles", len(refs), len(distinct))
+	}
+	// And the copy that survives is the most recent one, so a title shown a
+	// moment ago is not the one the window forgets first.
+	if want := (agentTitleRef{TMDBID: 109, MediaType: "movie"}); refs[len(refs)-1] != want {
+		t.Errorf("newest ref = %+v, want %+v", refs[len(refs)-1], want)
+	}
+}
+
+// The window has to stay shorter than how far the agent can page into a query,
+// or a "show me more" run past it reports all_shown — "that's everything I
+// could find" — about a query that simply had more pages. Guarding the two
+// constants against each other because they live in different services and
+// nothing else ties them together.
+func TestShownWindowStaysShorterThanTheAgentsPagingReach(t *testing.T) {
+	// agent/catalog_tool.py's MAX_DISCOVER_PAGES times tmdb.py's PAGE_SIZE.
+	const agentPagingReach = 4 * 20
+	// agent/catalog_tool.py's RESULT_CEILING: what paging works toward.
+	const agentResultCeiling = 10
+	if spare := agentPagingReach - maxShownRefs; spare < agentResultCeiling {
+		t.Fatalf("maxShownRefs = %d leaves only %d of %d rows unshown; want at least %d",
+			maxShownRefs, spare, agentPagingReach, agentResultCeiling)
+	}
+}
+
+// The agent applies its own backstop to whatever history we send
+// (agent/chat.py's MAX_HISTORY_TURNS), and silently: a gateway window wider
+// than that backstop is re-truncated with no error anywhere, which is exactly
+// how this window was once cut from five exchanges back to three. Only this
+// direction needs guarding — the agent's cap sits deliberately at twice the
+// operating point, so lowering it is not a realistic edit.
+func TestTheAgentDoesNotSilentlyRetruncateOurHistoryWindow(t *testing.T) {
+	// agent/chat.py's MAX_HISTORY_TURNS, counted in messages like this one.
+	const agentMaxHistoryTurns = 20
+	if maxHistoryExchanges*2 > agentMaxHistoryTurns {
+		t.Errorf("windowHistory sends %d messages; the agent keeps only %d",
+			maxHistoryExchanges*2, agentMaxHistoryTurns)
+	}
+}
+
+// The load has two consumers with different appetites, and starving either is
+// silent: too shallow for windowHistory and the agent loses conversation, too
+// shallow for shownFromHistory and "show me more" starts repeating.
+func TestSeededMessagesCoversBothItsConsumers(t *testing.T) {
+	if maxSeededMessages < maxHistoryExchanges*2 {
+		t.Errorf("maxSeededMessages = %d, too shallow for windowHistory's %d",
+			maxSeededMessages, maxHistoryExchanges*2)
+	}
+	if maxSeededMessages > maxStoredHistoryMessages {
+		t.Errorf("maxSeededMessages = %d exceeds what is stored (%d)",
+			maxSeededMessages, maxStoredHistoryMessages)
+	}
+	// The other consumer. A budget, not a guarantee — a lookup row carries one
+	// ref and a message row none, so a chatty thread refills less than this.
+	// It still has to hold at the recommendation-only end, or "show me more"
+	// repeats a title the guest path would still be suppressing.
+	const agentResultFloor = 5
+	if refs := (maxSeededMessages / 2) * agentResultFloor; refs < maxShownRefs {
+		t.Errorf("maxSeededMessages = %d budgets only %d refs at the agent's floor of %d, short of maxShownRefs %d",
+			maxSeededMessages, refs, agentResultFloor, maxShownRefs)
+	}
+}
+
+func TestShownFromHistoryFlattensStoredRefsOldestFirst(t *testing.T) {
+	history := []historyTurn{
+		{Role: "user", Text: "a heist"},
+		{Role: "assistant", Text: "Suggested: Heat", TitleRefs: []agentTitleRef{
+			{TMDBID: 101, MediaType: "movie"},
+		}},
+		{Role: "user", Text: "show me more"},
+		{Role: "assistant", Text: "Suggested: Ronin", TitleRefs: []agentTitleRef{
+			{TMDBID: 102, MediaType: "movie"},
+			{TMDBID: 103, MediaType: "movie"},
+		}},
+	}
+	want := []agentTitleRef{
+		{TMDBID: 101, MediaType: "movie"},
+		{TMDBID: 102, MediaType: "movie"},
+		{TMDBID: 103, MediaType: "movie"},
+	}
+	if got := shownFromHistory(history); !slices.Equal(got, want) {
+		t.Errorf("shownFromHistory(...) = %+v, want %+v", got, want)
+	}
+}
+
+// The T30 gap this closes: an account's shown set used to live only in the
+// connection, so a dropped socket — which chat-socket.ts reconnects on next
+// use, with the cards still on screen — re-offered exactly what the user was
+// looking at. Reading it back from messages.title_refs makes a reconnect cost
+// an account nothing here, the same promise loadConversation already makes for
+// the history beside it.
+func TestAnAccountsShownSetSurvivesAReconnect(t *testing.T) {
+	loadConversation := func(_ context.Context, _ string, _ string) ([]historyTurn, error) {
+		// What a previous connection persisted, as a fresh socket reads it.
+		return []historyTurn{
+			{Role: "user", Text: "a heist movie"},
+			{Role: "assistant", Text: "Suggested: Heat, Ronin", TitleRefs: []agentTitleRef{
+				{TMDBID: 101, MediaType: "movie"},
+				{TMDBID: 102, MediaType: "movie"},
+			}},
+		}, nil
+	}
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US"}, nil
+	}
+	// Through the shared helper, not a hand-rolled closure: the capture
+	// happens on the runTurn goroutine and the read on this one, so it needs
+	// the mutex captureAgentRequests already has.
+	callAgent, requests := captureAgentRequests()
+	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
+		loadConversation, noopSaveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	// The very first message on this socket, as a reconnect sends it.
+	wsjson.Write(t.Context(), conn, inboundMessage{
+		Type: "message", Turn: "t1", Text: "show me more", Conversation: testConversationID,
+	})
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+
+	got := requests()
+	if len(got) != 1 {
+		t.Fatalf("agent called %d times, want 1", len(got))
+	}
+	want := []agentTitleRef{{TMDBID: 101, MediaType: "movie"}, {TMDBID: 102, MediaType: "movie"}}
+	if !slices.Equal(got[0].Shown, want) {
+		t.Errorf("Shown on a fresh connection = %+v, want the stored refs %+v", got[0].Shown, want)
+	}
+}
+
+// title_refs rides along on the history load, and the agent's history window
+// is text only — see ChatRequest.history in agent/chat.py.
+func TestStoredTitleRefsNeverReachTheAgentsHistory(t *testing.T) {
+	body, err := json.Marshal(agentChatRequest{History: []historyTurn{
+		{Role: "assistant", Text: "Suggested: Heat", TitleRefs: []agentTitleRef{
+			{TMDBID: 101, MediaType: "movie"},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "101") {
+		t.Errorf("history carried title_refs to the agent: %s", body)
+	}
+}
+
+// Switching threads must not suppress a title in the new one because the old
+// one showed it — the same rule guestHistory follows.
+func TestShownTitlesDoNotCrossConversations(t *testing.T) {
+	srv, requests := newShownTestServer(t, picksEvent(101))
+	conn := dialGuest(t, srv)
+
+	sendAndDrain(t, conn, guestMessage("t1", "a heist", []int{8}))
+	other := inboundMessage{Type: "message", Turn: "t2", Text: "something else", Conversation: otherConversationID, Providers: []int{8}}
+	sendAndDrain(t, conn, other)
+
+	got := requests()
+	if len(got) != 2 {
+		t.Fatalf("agent called %d times, want 2", len(got))
+	}
+	if len(got[1].Shown) != 0 {
+		t.Errorf("Shown = %+v after a conversation switch, want none", got[1].Shown)
+	}
+}
+
+// A turn that showed nothing — an error, or a plain message reply — leaves the
+// set alone rather than clearing it: the earlier picks are still on screen.
+func TestATurnWithNoPicksLeavesTheShownSetIntact(t *testing.T) {
+	agent, requests := captureAgentRequestsPerCall(
+		[]agentEvent{picksEvent(101)},
+		[]agentEvent{{Type: "message", Text: "Nothing matched that."}},
+		[]agentEvent{{Type: "message", Text: "Nothing matched that."}},
+	)
+	loadGuest := func(_ context.Context, providers []int) (chatContext, error) {
+		return chatContext{Region: guestRegion, Providers: providers}, nil
+	}
+	srv := newGuestTestServer(t, agent, loadGuest)
+	conn := dialGuest(t, srv)
+
+	sendAndDrain(t, conn, guestMessage("t1", "a heist", []int{8}))
+	sendAndDrain(t, conn, guestMessage("t2", "something else", []int{8}))
+	sendAndDrain(t, conn, guestMessage("t3", "show me more", []int{8}))
+
+	got := requests()
+	if len(got) != 3 {
+		t.Fatalf("agent called %d times, want 3", len(got))
+	}
+	want := []agentTitleRef{{TMDBID: 101, MediaType: "movie"}}
+	if !slices.Equal(got[2].Shown, want) {
+		t.Errorf("Shown = %+v after a pickless turn, want %+v", got[2].Shown, want)
+	}
+}
+
+func TestShownSetIsBoundedAcrossManyTurns(t *testing.T) {
+	refs := make([]agentTitleRef, maxShownRefs+10)
+	for i := range refs {
+		refs[i] = agentTitleRef{TMDBID: i, MediaType: "movie"}
+	}
+	got := windowShown(refs)
+	if len(got) != maxShownRefs {
+		t.Fatalf("len(windowShown(...)) = %d, want %d", len(got), maxShownRefs)
+	}
+	if got[len(got)-1].TMDBID != refs[len(refs)-1].TMDBID {
+		t.Error("windowShown did not keep the most recently shown titles")
 	}
 }

@@ -1126,7 +1126,7 @@ func TestLoadConversationOrdersAndCapsHistory(t *testing.T) {
 
 	// One more pair than the cap allows, tagged by index so ordering is
 	// verifiable — content isn't otherwise unique.
-	const pairs = maxHistoryExchanges + 1
+	const pairs = maxSeededMessages/2 + 1
 	for i := range pairs {
 		if _, err := pool.Exec(ctx, `
 			insert into messages (conversation_id, role, content) values
@@ -1140,8 +1140,8 @@ func TestLoadConversationOrdersAndCapsHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if len(history) != maxHistoryExchanges*2 {
-		t.Fatalf("history length = %d, want %d", len(history), maxHistoryExchanges*2)
+	if len(history) != maxSeededMessages {
+		t.Fatalf("history length = %d, want %d", len(history), maxSeededMessages)
 	}
 	// The oldest pair (q0/a0) must have been dropped by the cap, and what
 	// remains must still be oldest-first.
@@ -1151,6 +1151,55 @@ func TestLoadConversationOrdersAndCapsHistory(t *testing.T) {
 	last := history[len(history)-1]
 	if last.Text != fmt.Sprintf("a%d", pairs-1) {
 		t.Errorf("last history entry = %q, want the most recent assistant text", last.Text)
+	}
+}
+
+// TestLoadConversationCarriesStoredTitleRefs proves the already-shown set
+// (T30) round-trips through the database, which is what makes a reconnect cost
+// an account nothing: the refs a previous connection persisted come back on
+// the next message's load, keyed on the conversation by the query itself. A
+// user row's null title_refs must read as nil, not an error.
+func TestLoadConversationCarriesStoredTitleRefs(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	load := loadConversation(pool)
+
+	const id = "conv_refs_test"
+	newTestUser(t, pool, ctx, id)
+
+	convID := uuid.NewString()
+	if _, err := pool.Exec(ctx,
+		`insert into conversations (id, user_id) values ($1, $2)`, convID, id); err != nil {
+		t.Fatal(err)
+	}
+
+	refs := []agentTitleRef{{TMDBID: 101, MediaType: "movie"}, {TMDBID: 205, MediaType: "tv"}}
+	refsJSON, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		insert into messages (conversation_id, role, content, title_refs) values
+			($1, 'user', 'a heist movie', null), ($1, 'assistant', 'Suggested: Heat', $2)`,
+		convID, refsJSON); err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := load(ctx, id, convID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history length = %d, want 2", len(history))
+	}
+	if history[0].TitleRefs != nil {
+		t.Errorf("user row TitleRefs = %+v, want nil", history[0].TitleRefs)
+	}
+	if !slices.Equal(history[1].TitleRefs, refs) {
+		t.Errorf("assistant row TitleRefs = %+v, want %+v", history[1].TitleRefs, refs)
+	}
+	if !slices.Equal(shownFromHistory(history), refs) {
+		t.Errorf("shownFromHistory(...) = %+v, want %+v", shownFromHistory(history), refs)
 	}
 }
 

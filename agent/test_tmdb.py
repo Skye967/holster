@@ -15,7 +15,12 @@ import pytest
 
 import tmdb
 from testutil import FakeTMDB
-from tmdb import MIN_VOTE_COUNT, TMDBError, TMDBUnavailable
+from tmdb import (
+    MIN_VOTE_COUNT,
+    MIN_VOTE_COUNT_TOP_RATED,
+    TMDBError,
+    TMDBUnavailable,
+)
 
 
 def run(coro: Any) -> Any:
@@ -352,6 +357,20 @@ def test_genre_names_drops_unknown_ids() -> None:
     assert tmdb.genre_names("movie", [80, 999999]) == ["Crime"]
 
 
+def test_is_genre_resolved_is_per_media_type() -> None:
+    """The two vocabularies genuinely differ, which is what callers need to
+    know before treating a genre as a filter that was applied."""
+    assert tmdb.is_genre_resolved("movie", "horror")
+    assert not tmdb.is_genre_resolved("tv", "horror")
+    assert tmdb.is_genre_resolved("tv", "sci-fi & fantasy")
+    assert not tmdb.is_genre_resolved("movie", "sci-fi & fantasy")
+
+
+def test_is_genre_resolved_normalizes_like_the_query_does() -> None:
+    assert tmdb.is_genre_resolved("movie", "  Science Fiction ")
+    assert not tmdb.is_genre_resolved("movie", "sciencefiction")
+
+
 def test_watch_providers_splits_monetization() -> None:
     fake = FakeTMDB()
     fake.ok(
@@ -584,3 +603,78 @@ def test_search_titles_makes_one_request_not_one_per_media_type() -> None:
     assert fake.count("/search/multi") == 1
     assert fake.count("/search/movie") == 0
     assert fake.count("/search/tv") == 0
+
+
+# --- candidate quality: sort, floor, and how multi-value filters join (T31) --
+
+
+def test_the_default_sort_is_most_watched_not_most_trending() -> None:
+    """popularity.desc is not offered at all. It is a rolling trend metric, and
+    it put War of the Worlds (2025), rated 4.0, above The Dark Knight."""
+    fake = FakeTMDB()
+    run(fake.client().discover(media_type="movie", watch_region="US"))
+    assert fake.params_for("/discover/movie")["sort_by"] == "vote_count.desc"
+
+
+def test_ordering_by_rating_raises_the_vote_floor() -> None:
+    """200 votes is enough to keep an obscure title out of a filtered list and
+    nowhere near enough to keep it off the top of a list ordered by rating."""
+    fake = FakeTMDB()
+    run(
+        fake.client().discover(
+            media_type="tv", watch_region="US", sort_by="vote_average.desc"
+        )
+    )
+    params = fake.params_for("/discover/tv")
+    assert params["vote_count.gte"] == str(MIN_VOTE_COUNT_TOP_RATED)
+    assert MIN_VOTE_COUNT_TOP_RATED > MIN_VOTE_COUNT
+
+
+def test_the_raised_floor_is_scoped_to_the_rating_sort() -> None:
+    """Raising it globally would answer "highest rated" better and every narrow
+    request worse — Korean horror is 15 titles at 200 and 3 at 1000."""
+    fake = FakeTMDB()
+    run(
+        fake.client().discover(
+            media_type="movie", watch_region="US", sort_by="vote_count.desc"
+        )
+    )
+    assert fake.params_for("/discover/movie")["vote_count.gte"] == str(MIN_VOTE_COUNT)
+
+
+def test_mood_keywords_are_ored_so_a_mood_does_not_zero_the_query() -> None:
+    """TMDB's tag data is far too sparse for an AND: "thriller" is 1459 titles,
+    "thriller AND slow-burn" is 0, and 0 loses the mood to the relaxation
+    ladder — which is how a mood came to be silently dropped on almost every
+    request."""
+    fake = FakeTMDB()
+    fake.ok("/search/keyword", {"results": [{"id": 11, "name": "slow burn"}]})
+    fake.ok("/search/keyword", {"results": [{"id": 22, "name": "tense"}]})
+
+    run(
+        fake.client().discover(
+            media_type="movie",
+            watch_region="US",
+            keywords=["slow burn", "tense"],
+        )
+    )
+
+    assert fake.params_for("/discover/movie")["with_keywords"] == "11|22"
+
+
+def test_naming_two_people_still_means_both_of_them() -> None:
+    """The OR above is scoped to keywords. "With Hanks and Ryan" is both, and
+    joining cast with "|" would quietly turn every such request into either."""
+    fake = FakeTMDB()
+    fake.ok("/search/person", {"results": [{"id": 31, "name": "Tom Hanks"}]})
+    fake.ok("/search/person", {"results": [{"id": 32, "name": "Meg Ryan"}]})
+
+    run(
+        fake.client().discover(
+            media_type="movie",
+            watch_region="US",
+            cast=["Tom Hanks", "Meg Ryan"],
+        )
+    )
+
+    assert fake.params_for("/discover/movie")["with_cast"] == "31,32"
