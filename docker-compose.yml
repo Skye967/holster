@@ -1,20 +1,41 @@
-# Local development topology.
-#
-# Services are commented out until they exist — uncomment each one as it lands so
-# that `docker compose up` always works on a fresh clone rather than failing on a
-# missing build context. Services that need secrets also need their `.env`
-# entries filled in; they refuse to start without them, by design.
+# Local development topology. Every service the app needs is here:
+# `docker compose up --build` from a filled-in `.env` starts the whole stack.
+# `--build` rather than a bare `up` because web compiles its NEXT_PUBLIC_*
+# values in — see `.env.example` beside NEXT_PUBLIC_GATEWAY_URL for why.
 
 services:
   # --- Frontend -------------------------------------------------------------
-  # web:
-  #   build: ./web
-  #   ports: ["3000:3000"]
-  #   environment:
-  #     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
-  #     CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
-  #     NEXT_PUBLIC_GATEWAY_URL: ${NEXT_PUBLIC_GATEWAY_URL}
-  #   depends_on: [gateway]
+  # NEXT_PUBLIC_* are compiled into the client bundle, so they are build args
+  # rather than environment; web/Dockerfile rejects an empty or placeholder
+  # value at build time. Both default from GATEWAY_PORT so the gateway's port
+  # is named once, not copied into a URL that can drift out of step with it.
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+        NEXT_PUBLIC_GATEWAY_URL: ${NEXT_PUBLIC_GATEWAY_URL:-http://localhost:${GATEWAY_PORT:-8080}}
+        # Passed through so editing them in `.env` actually takes effect;
+        # web/Dockerfile's defaults apply when they are unset.
+        NEXT_PUBLIC_CLERK_SIGN_IN_URL: ${NEXT_PUBLIC_CLERK_SIGN_IN_URL:-/sign-in}
+        NEXT_PUBLIC_CLERK_SIGN_UP_URL: ${NEXT_PUBLIC_CLERK_SIGN_UP_URL:-/sign-up}
+    ports: ["${WEB_PORT:-3000}:3000"]
+    environment:
+      # Listed explicitly rather than env_file: .env so this container never
+      # receives the agent's API keys or the database credentials.
+      #
+      # CLERK_SECRET_KEY is read by Clerk's SDK per request, not at startup, so
+      # an empty one starts cleanly and 500s on the first authenticated call.
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
+      # Server components and route handlers run in here, where the browser's
+      # localhost URL is this container. See web/src/lib/gateway.ts.
+      GATEWAY_SERVICE_URL: ${GATEWAY_SERVICE_URL:-http://gateway:${GATEWAY_PORT:-8080}}
+    depends_on:
+      # Health, not start: web calls the gateway from server components on the
+      # signed-in path, and a gateway that died on bad config would otherwise
+      # leave a frontend serving pages that fail one request at a time.
+      gateway:
+        condition: service_healthy
 
   # --- API gateway: the only exposed service, and the only writer -----------
   gateway:
@@ -36,6 +57,14 @@ services:
       # Container-network address — see agent's own block below. Not published
       # on the host: the gateway is the only thing that ever calls it.
       AGENT_SERVICE_URL: ${AGENT_SERVICE_URL:-http://agent:8000}
+    healthcheck:
+      # /health is unauthenticated and touches nothing (T7), so it answers
+      # whether the process is listening — which is exactly what web waits on.
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:${GATEWAY_PORT:-8080}/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     depends_on:
       # db-init, not postgres: gateway_app is created NOLOGIN by the migration and
       # only gets a local login once db-init runs. Starting sooner just fails fast.
