@@ -51,6 +51,34 @@ Dockerfile; `docker-compose.yml` wires them together for local development.
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for request flows, trust boundaries, and the
 data model.
 
+## Patterns considered and declined
+
+- **OAuth to every app a user already uses** — the original idea was one search box
+  over everything people use daily: Netflix, DoorDash, Uber. It doesn't survive contact
+  with how OAuth works. A provider must register a client in advance, so "connect
+  anything" is impossible in principle, not merely unbuilt — and most of what was
+  wanted publishes no user-data API at all, only merchant and logistics ones. Browser
+  automation was considered as a workaround and rejected: it inherits a logged-in
+  session with no scopes, so there's no way to guarantee the agent never writes to a
+  connected service, and running it server-side would need the user's password.
+  Gmail/Outlook unified search was rejected too: Gmail's restricted scope caps out at
+  100 test users, and Outlook has its own friction — no evaluator will connect a work
+  account to try either. **Revisit:** only as a narrow per-provider fallback behind the
+  existing interface, never as the primary path.
+- **Spotify and YouTube as OAuth-connected taste signals** — built, then cut: two Go
+  services, a master encryption key with a rotation story, encrypted columns, PKCE, and
+  a permanent 25-user cap from Spotify's development mode, all protecting a signal that
+  only ever nudged recommendations. Music taste is a weak predictor of film taste.
+  Holster builds its own signal instead — in-app verdicts on titles (liked, disliked,
+  seen, not interested) plus watchlist saves (want to watch). **Revisit:** if that
+  in-app signal proves too sparse for a new user to get good recommendations.
+- **A sign-in wall in front of the app** — the two things that make Holster worth
+  trying, picking services and asking for something to watch, need no identity. Guests
+  get both; Watchlist and rating are sign-in prompts once there's something worth
+  keeping. **Revisit:** if guests turn out to be mostly abuse rather than trial, or if
+  accounts ever gain a country setting — guests are hard-wired to the same `US` default
+  every account gets today.
+
 ## Security
 
 The interesting risk here is not credential storage — Holster stores no credentials.
