@@ -1,4 +1,6 @@
 import { auth } from "@clerk/nextjs/server"
+import { cookies } from "next/headers"
+import { redirect } from "next/navigation"
 import type { NextRequest } from "next/server"
 
 import {
@@ -6,7 +8,6 @@ import {
   readGuestProviders,
   safeNext,
 } from "@/lib/guest"
-import { redirectTo } from "@/lib/redirect"
 import { setSubscription } from "@/lib/subscriptions"
 
 // Where every sign-in and sign-up lands (the fallbackRedirectUrl on both
@@ -17,6 +18,14 @@ import { setSubscription } from "@/lib/subscriptions"
 // that can both write and clear the cookie. Cookie picks are always added,
 // never removed — an account's existing subscriptions are not the guest
 // session's to drop.
+//
+// redirect() here, never NextResponse.redirect(new URL(path,
+// request.nextUrl)) — the second mistake of that exact shape caught in
+// review on this route. An absolute URL trusts the server's own Host, which
+// this app's self-hosted runtime can get wrong; every target below is
+// same-origin, so nothing needs one. `next` is the one value here with
+// outside input, and it's safeNext() that makes it safe to redirect to, not
+// this call — safeNext already collapsed it to a same-origin path above.
 export async function GET(request: NextRequest) {
   const next = safeNext(
     request.nextUrl.searchParams.get("next"),
@@ -29,9 +38,8 @@ export async function GET(request: NextRequest) {
     // a cookie still set means picks that were never carried over, and the
     // next person to sign in on this device would inherit them. Losing a
     // guest's own picks beats writing them into someone else's account.
-    const res = redirectTo(next)
-    res.cookies.delete(GUEST_PROVIDERS_COOKIE)
-    return res
+    ;(await cookies()).delete(GUEST_PROVIDERS_COOKIE)
+    redirect(next)
   }
 
   // setSubscription carries the module's timeout, so a hung gateway can't
@@ -52,7 +60,6 @@ export async function GET(request: NextRequest) {
   // A partial failure is made visible instead: /onboarding is the picker,
   // account-backed by now, showing exactly which picks landed so the rest
   // can be re-ticked in one screen rather than silently lost or inherited.
-  const res = redirectTo(failed.length > 0 ? "/onboarding" : next)
-  res.cookies.delete(GUEST_PROVIDERS_COOKIE)
-  return res
+  ;(await cookies()).delete(GUEST_PROVIDERS_COOKIE)
+  redirect(failed.length > 0 ? "/onboarding" : next)
 }
