@@ -152,6 +152,33 @@ func TestRLSEnabledOnUsers(t *testing.T) {
 	}
 }
 
+// TestVerifyRoleIsSafeRejectsTheMigrationRole proves main.go's startup check
+// (T34) actually rejects a role that bypasses RLS: testPool's own connection
+// is the TEST_DATABASE_URL superuser and the owner of every migrated table
+// (see TestRLSEnabledOnUsers' comment), exactly the shape production must
+// never boot as.
+func TestVerifyRoleIsSafeRejectsTheMigrationRole(t *testing.T) {
+	pool := testPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := verifyRoleIsSafe(ctx, pool); err == nil {
+		t.Error("verifyRoleIsSafe = nil for the migration/superuser role, want an error")
+	}
+}
+
+// TestVerifyRoleIsSafeAcceptsGatewayApp proves the check passes for the role
+// production actually connects as, using asRole the same way every other
+// gateway_app-scoped test in this file does.
+func TestVerifyRoleIsSafeAcceptsGatewayApp(t *testing.T) {
+	pool := testPool(t)
+	asRole(t, pool, "gateway_app", func(ctx context.Context, tx pgx.Tx) {
+		if err := verifyRoleIsSafe(ctx, tx); err != nil {
+			t.Errorf("verifyRoleIsSafe = %v for gateway_app, want nil", err)
+		}
+	})
+}
+
 // asRole runs fn inside a rolled-back transaction with the session role dropped
 // to role. The suite connects as the migration/superuser role, which bypasses
 // RLS and every grant; SET ROLE is what makes the T10 policies and grants under
@@ -1275,13 +1302,14 @@ func TestLoadConversationTurnsReportsNotExistsForAnUnknownID(t *testing.T) {
 	}
 }
 
-// TestLoadConversationTurnsHidesAForeignConversation proves the RLS half of
-// loadConversationTurns' exists check directly, the same way
-// TestSaveMessagesRejectsForeignConversationID proves it for the write side:
-// testPool connects as the migration/superuser role, which bypasses RLS
-// entirely, so this replicates loadConversationTurns' own `select exists(...)`
-// query under an explicit asRole("gateway_app") with holster.user_id bound to
-// the *other* user, the way the real gateway pool always runs it.
+// TestLoadConversationTurnsHidesAForeignConversation proves RLS still
+// independently blocks this on its own, as a second layer behind
+// loadConversationTurns' own explicit user_id filter (T34,
+// TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel below) —
+// with a naive, unfiltered `select exists(...)` of the shape the query used
+// before T34, run under an explicit asRole("gateway_app") with
+// holster.user_id bound to the *other* user, the only way to make RLS apply
+// at all (testPool otherwise connects as the table owner, which bypasses it).
 func TestLoadConversationTurnsHidesAForeignConversation(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -1309,6 +1337,52 @@ func TestLoadConversationTurnsHidesAForeignConversation(t *testing.T) {
 			t.Errorf("%s's conversation is visible while acting as %s, want hidden by RLS", uA, uB)
 		}
 	})
+}
+
+// TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel proves
+// T34's explicit user_id join independently of RLS: unlike the
+// asRole-based tests above, this calls loadConversation and
+// loadConversationTurns directly through testPool, which connects as the
+// migration/superuser role and bypasses RLS entirely. Before T34 this would
+// have returned the other user's history; now the join itself, not RLS,
+// is what has to fail this.
+func TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const uA, uB = "conv_app_level_a", "conv_app_level_b"
+	newTestUser(t, pool, ctx, uA)
+	newTestUser(t, pool, ctx, uB)
+
+	convA := uuid.NewString()
+	if _, err := pool.Exec(ctx,
+		`insert into conversations (id, user_id) values ($1, $2)`, convA, uA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`insert into messages (conversation_id, role, content) values ($1, 'user', 'a-only')`,
+		convA); err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := loadConversation(pool)(ctx, uB, convA)
+	if err != nil {
+		t.Fatalf("loadConversation: %v", err)
+	}
+	if history != nil {
+		t.Errorf("loadConversation(uB, convA) = %#v, want nil (convA belongs to uA)", history)
+	}
+
+	turns, exists, err := loadConversationTurns(pool)(ctx, uB, convA)
+	if err != nil {
+		t.Fatalf("loadConversationTurns: %v", err)
+	}
+	if exists {
+		t.Error("loadConversationTurns(uB, convA) exists = true, want false (convA belongs to uA)")
+	}
+	if len(turns) != 0 {
+		t.Errorf("loadConversationTurns(uB, convA) turns = %+v, want empty", turns)
+	}
 }
 
 // TestSaveMessagesCreatesConversationOnFirstUseThenAppends proves the
@@ -1544,15 +1618,15 @@ func TestSaveMessagesReportsWhetherItCreatedTheConversation(t *testing.T) {
 	}
 }
 
-// TestSaveMessagesRejectsForeignConversationID proves the trust argument in
-// saveMessages' own doc comment: a client-generated id that happens to
-// collide with another user's existing conversation must not let the second
-// user's message attach to it. Modeled on
-// TestMessagePolicyEnforcesUserIsolation — an explicit asRole("gateway_app")
-// is what makes RLS apply at all (testPool otherwise connects as the table
-// owner, which bypasses it) — issuing the exact two-statement pattern
-// saveMessages runs, since testPool's connection can't run the production
-// closure itself under a switched role.
+// TestSaveMessagesRejectsForeignConversationID proves message_isolation's RLS
+// policy still independently blocks this on its own, as a second layer
+// behind saveMessages' own explicit join (T34,
+// TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel below) — not by
+// calling the production closure (whose current statement text this no
+// longer mirrors), but with a plain, naive multi-row insert of the shape
+// saveMessages used before T34, run under an explicit
+// asRole("gateway_app") — the only way to make RLS apply at all, since
+// testPool otherwise connects as the table owner, which bypasses it.
 func TestSaveMessagesRejectsForeignConversationID(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -1576,10 +1650,11 @@ func TestSaveMessagesRejectsForeignConversationID(t *testing.T) {
 		if _, err := tx.Exec(ctx, `select set_config('holster.user_id', $1, true)`, uB); err != nil {
 			t.Fatalf("set_config: %v", err)
 		}
-		// Mirrors saveMessages' own two statements exactly: the conversations
-		// insert's DO NOTHING silently no-ops against uA's pre-existing row
-		// (RLS never blocks that — the row simply isn't touched), so it's the
-		// messages insert immediately after that must fail.
+		// The conversations insert's DO NOTHING silently no-ops against uA's
+		// pre-existing row (RLS never blocks that — the row simply isn't
+		// touched), so it's the naive messages insert immediately after that
+		// must fail — proving RLS alone would still catch this even without
+		// saveMessages' own join.
 		if _, err := tx.Exec(ctx, `
 			insert into conversations (id, user_id, title) values ($1, $2, $3)
 			on conflict (id) do nothing`,
@@ -1600,6 +1675,42 @@ func TestSaveMessagesRejectsForeignConversationID(t *testing.T) {
 	}
 	if msgCount != 1 {
 		t.Errorf("messages in %s's conversation = %d, want 1 (only %s's own message)", uA, msgCount, uA)
+	}
+}
+
+// TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel proves T34's
+// explicit join, independently of RLS: it calls the real saveMessages
+// closure directly through testPool, which connects as the migration/
+// superuser role and bypasses RLS entirely (see TestRLSEnabledOnUsers'
+// comment). Before T34 this call would have silently succeeded; now the
+// join itself, not RLS, is what has to reject it.
+func TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	save := saveMessages(pool)
+
+	const uA, uB = "conv_app_level_save_a", "conv_app_level_save_b"
+	newTestUser(t, pool, ctx, uA)
+	newTestUser(t, pool, ctx, uB)
+
+	convA := uuid.NewString()
+	if _, err := pool.Exec(ctx,
+		`insert into conversations (id, user_id) values ($1, $2)`, convA, uA); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := save(ctx, uB, convA, "intrusion", "should never be saved", nil)
+	if !errors.Is(err, errConversationNotWritable) {
+		t.Errorf("save(uB, convA, ...) err = %v, want errConversationNotWritable", err)
+	}
+
+	var msgCount int
+	if err := pool.QueryRow(ctx,
+		`select count(*) from messages where conversation_id = $1`, convA).Scan(&msgCount); err != nil {
+		t.Fatal(err)
+	}
+	if msgCount != 0 {
+		t.Errorf("messages in %s's conversation after uB's rejected save = %d, want 0", uA, msgCount)
 	}
 }
 

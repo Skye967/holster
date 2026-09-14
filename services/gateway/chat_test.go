@@ -1622,6 +1622,57 @@ func TestFinishTurnSurfacesAnRLSViolationAsAVisibleError(t *testing.T) {
 	}
 }
 
+// TestFinishTurnSurfacesANotWritableConversationAsAVisibleError proves the
+// T34 path alongside TestFinishTurnSurfacesAnRLSViolationAsAVisibleError:
+// saveMessages' own explicit ownership check (errConversationNotWritable) is
+// what actually fires for a foreign or deleted conversation id today, and it
+// must reach the browser exactly like the RLS backstop does — logged under a
+// stable message (not the generic, error-text-carrying "message persist
+// failed" line), so an operator's alert on this case survives regardless of
+// which of the two independent layers caught it.
+func TestFinishTurnSurfacesANotWritableConversationAsAVisibleError(t *testing.T) {
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil))) })
+
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8}}, nil
+	}
+	callAgent := fakeAgentEvents(
+		agentEvent{Type: "results", Picks: []agentPick{{TMDBID: 550, MediaType: "movie", Title: "Fight Club"}}},
+		agentEvent{Type: "done"},
+	)
+	saveMessages := func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+		return false, errConversationNotWritable
+	}
+	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []outboundEvent
+	for range 3 { // "results", "done", then the persist-failure error
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatalf("read event[%d]: %v (got so far: %+v)", len(got), err, got)
+		}
+		got = append(got, ev)
+	}
+	last := got[len(got)-1]
+	if last.Type != "error" || last.Text == "" {
+		t.Fatalf("last event = %+v, want a non-empty visible error", last)
+	}
+	if last.Text == genericErrorText {
+		t.Errorf("error text = %q, want the specific rejection copy, not the generic fallback", last.Text)
+	}
+	if !strings.Contains(buf.String(), "message persist rejected: conversation not writable") {
+		t.Errorf("log = %q, want the stable rejection message", buf.String())
+	}
+}
+
 // --- conversationDeletions -------------------------------------------------
 
 // TestConversationDeletionsNeverForgetsARealDelete is the regression guard
