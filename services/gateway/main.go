@@ -139,6 +139,9 @@ type Handler struct {
 	// test lowering it mutates one handler rather than process state — the
 	// latter can never run in parallel with another guest test.
 	guestTurnCap int
+	// chat.go's per-IP guest message rate limit (TASKS.md T33) — a field for
+	// the same reason as guestTurnCap above.
+	guestLimiters *guestRateLimiters
 
 	// providers.go (T15): the region catalog cache and the per-user
 	// subscription write, injected the same way as ensureUser/loadChatCtx
@@ -283,6 +286,7 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 		tickets:                   newChatTicketStore(),
 		conversationDeletions:     newConversationDeletions(),
 		guestTurnCap:              defaultGuestTurnCap,
+		guestLimiters:             newGuestRateLimiters(rootCtx, defaultGuestRateLimit, defaultGuestRateBurst, defaultGuestLimiterIdleTTL, defaultGuestLimiterSweepInterval),
 		originPatterns:            origins,
 		rootCtx:                   rootCtx,
 		loadProviders:             loadProviders,

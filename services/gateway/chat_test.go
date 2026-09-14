@@ -24,6 +24,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/time/rate"
 )
 
 // testConversationID is the conversation id most tests below send on every
@@ -457,9 +458,9 @@ func fakeAgentEvents(events ...agentEvent) agentCaller {
 // newChatTestServer wires a full Handler (real ticket store, real WS routing)
 // with fake loadChatCtx/callAgent, and returns an httptest.Server plus a
 // ready-to-use Bearer token for its one test user.
-func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chatContext, error), callAgent agentCaller, loadVerdicts func(context.Context, string) ([]Verdict, error)) (*httptest.Server, string) {
+func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chatContext, error), callAgent agentCaller, loadVerdicts func(context.Context, string) ([]Verdict, error), opts ...func(*Handler)) (*httptest.Server, string) {
 	t.Helper()
-	return newChatTestServerWithConversations(t, loadCtx, callAgent, loadVerdicts, noopLoadConversation, noopSaveMessages)
+	return newChatTestServerWithConversations(t, loadCtx, callAgent, loadVerdicts, noopLoadConversation, noopSaveMessages, opts...)
 }
 
 // newChatTestServerWithConversations is newChatTestServer plus the two T20/
@@ -474,6 +475,7 @@ func newChatTestServerWithConversations(
 	loadVerdicts func(context.Context, string) ([]Verdict, error),
 	loadConversation func(context.Context, string, string) ([]historyTurn, error),
 	saveMessages func(context.Context, string, string, string, string, []agentTitleRef) (bool, error),
+	opts ...func(*Handler),
 ) (*httptest.Server, string) {
 	t.Helper()
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -499,6 +501,9 @@ func newChatTestServerWithConversations(
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, opt := range opts {
+		opt(h)
 	}
 
 	srv := httptest.NewServer(h.routes())
@@ -2230,6 +2235,12 @@ func newGuestTestServer(t *testing.T, callAgent agentCaller, loadGuestChatCtx fu
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Unlimited by default: only tests about the rate limit itself need to
+	// override this, via opts below. Every other guest test would otherwise
+	// have to know to opt out of a production default it has nothing to do
+	// with, on pain of an unrelated, confusing failure the day it grows one
+	// provider-carrying message past the real burst.
+	h.guestLimiters = newGuestRateLimiters(t.Context(), rate.Inf, 1000, time.Hour, time.Hour)
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -2301,6 +2312,14 @@ func sendAndDrain(t *testing.T, conn *websocket.Conn, msg inboundMessage) []outb
 
 func guestMessage(turn, text string, providers []int) inboundMessage {
 	return inboundMessage{Type: "message", Turn: turn, Text: text, Conversation: testConversationID, Providers: providers}
+}
+
+// oneShotGuestRateLimiter allows exactly one guest message ever (rate 0
+// never refills), deterministically — no real wait needed.
+func oneShotGuestRateLimiter(t *testing.T) func(*Handler) {
+	return func(h *Handler) {
+		h.guestLimiters = newGuestRateLimiters(t.Context(), 0, 1, time.Hour, time.Hour)
+	}
 }
 
 func TestGuestSocketTouchesNoUserTables(t *testing.T) {
@@ -2501,6 +2520,134 @@ func TestGuestTurnCapCountsOnlyTurnsThatReachTheModel(t *testing.T) {
 	}
 	if n := len(requests()); n != 5 {
 		t.Errorf("agent called %d times, want 5 — the capped turn must never reach it", n)
+	}
+}
+
+// A rate of 0 never refills, so burst 1 allows exactly one message ever —
+// deterministic, no real wait needed.
+func TestGuestRateLimitBlocksAfterTheBucketIsSpent(t *testing.T) {
+	callAgent, requests := captureAgentRequests()
+	srv := newGuestTestServer(t, callAgent, noopLoadGuestChatCtx, oneShotGuestRateLimiter(t))
+	conn := dialGuest(t, srv)
+
+	if events := sendAndDrain(t, conn, guestMessage("t1", "hi", []int{8})); events[len(events)-1].Type != "done" {
+		t.Fatalf("first message: events = %+v, want done", events)
+	}
+	events := sendAndDrain(t, conn, guestMessage("t2", "hi", []int{8}))
+	if len(events) != 1 || events[0].Type != "error" || events[0].Turn != "t2" || events[0].Text != guestRateLimitText {
+		t.Errorf("second message: events = %+v, want one error with guestRateLimitText", events)
+	}
+	if n := len(requests()); n != 1 {
+		t.Errorf("agent called %d times, want 1 — the rate-limited message must never reach it", n)
+	}
+}
+
+// The bucket is per-IP, not per-socket (TASKS.md T33): a client opening a
+// fresh guest socket must not get a fresh budget.
+func TestGuestRateLimitIsSharedAcrossSocketsFromTheSameIP(t *testing.T) {
+	callAgent, requests := captureAgentRequests()
+	srv := newGuestTestServer(t, callAgent, noopLoadGuestChatCtx, oneShotGuestRateLimiter(t))
+
+	first := dialGuest(t, srv)
+	if events := sendAndDrain(t, first, guestMessage("t1", "hi", []int{8})); events[len(events)-1].Type != "done" {
+		t.Fatalf("first socket: events = %+v, want done", events)
+	}
+
+	second := dialGuest(t, srv)
+	events := sendAndDrain(t, second, guestMessage("t2", "hi", []int{8}))
+	if len(events) != 1 || events[0].Type != "error" || events[0].Text != guestRateLimitText {
+		t.Errorf("second socket: events = %+v, want one error with guestRateLimitText — the bucket must be shared per IP, not per socket", events)
+	}
+	if n := len(requests()); n != 1 {
+		t.Errorf("agent called %d times, want 1", n)
+	}
+}
+
+// Mirrors the turn cap's own carve-out: only a turn that can reach the model
+// should ever spend a token.
+func TestGuestRateLimitIgnoresMessagesWithNoProvidersPicked(t *testing.T) {
+	callAgent, requests := captureAgentRequests()
+	srv := newGuestTestServer(t, callAgent, noopLoadGuestChatCtx, oneShotGuestRateLimiter(t))
+	conn := dialGuest(t, srv)
+
+	for _, turn := range []string{"n1", "n2", "n3"} {
+		if events := sendAndDrain(t, conn, guestMessage(turn, "hi", nil)); events[len(events)-1].Type != "done" {
+			t.Fatalf("turn %s with no providers: events = %+v, want done", turn, events)
+		}
+	}
+	if events := sendAndDrain(t, conn, guestMessage("t1", "hi", []int{8})); events[len(events)-1].Type != "done" {
+		t.Errorf("first provider-carrying message: events = %+v, want done — the bucket's one token must still be available", events)
+	}
+	// The no-provider turns above still reach the agent (its own canned
+	// nudge) — what they must not do is spend the bucket's one token.
+	if n := len(requests()); n != 4 {
+		t.Errorf("agent called %d times, want 4", n)
+	}
+}
+
+// The rate limit and the turn cap must stay distinguishable on the wire —
+// neither may masquerade as the other. Regression guard for the check
+// order in runChatConnection: the cap is checked first, so it — not the
+// rate limit — is what a client sees when both are exhausted at once.
+func TestGuestRateLimitAndTurnCapReportDistinctErrors(t *testing.T) {
+	callAgent, _ := captureAgentRequests()
+	srv := newGuestTestServer(t, callAgent, noopLoadGuestChatCtx,
+		oneShotGuestRateLimiter(t),
+		func(h *Handler) { h.guestTurnCap = 1 })
+	conn := dialGuest(t, srv)
+
+	if events := sendAndDrain(t, conn, guestMessage("t1", "hi", []int{8})); events[len(events)-1].Type != "done" {
+		t.Fatalf("first message: events = %+v, want done", events)
+	}
+	// Both mechanisms are now spent — the cap is checked first, so this
+	// must come back as the sign-in nudge, not the rate limit's text.
+	events := sendAndDrain(t, conn, guestMessage("t2", "hi", []int{8}))
+	if len(events) != 1 || events[0].Text != guestTurnCapText {
+		t.Errorf("events = %+v, want guestTurnCapText, not guestRateLimitText", events)
+	}
+}
+
+// The guest bucket must gate only the `if guest` branch — an authenticated
+// socket must never consult it.
+func TestSignedInSocketIsNeverRateLimitedByTheGuestBucket(t *testing.T) {
+	var agentCalls atomic.Int32
+	callAgent := func(context.Context, agentChatRequest) (<-chan agentEvent, error) {
+		agentCalls.Add(1)
+		ch := make(chan agentEvent, 1)
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts, oneShotGuestRateLimiter(t))
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	for _, turn := range []string{"t1", "t2", "t3"} {
+		if events := sendAndDrain(t, conn, guestMessage(turn, "hi", nil)); events[len(events)-1].Type != "done" {
+			t.Fatalf("turn %s: events = %+v, want done — a spent guest bucket must never affect the signed-in path", turn, events)
+		}
+	}
+	if n := agentCalls.Load(); n != 3 {
+		t.Errorf("agent called %d times, want 3", n)
+	}
+}
+
+// Direct unit test of the janitor's sweep, no WS harness needed — proves the
+// map can't grow without bound over a long-running process.
+func TestGuestRateLimitersSweepEvictsIdleIPs(t *testing.T) {
+	g := newGuestRateLimiters(t.Context(), rate.Every(time.Second), 1, time.Minute, time.Hour)
+	g.allow("1.2.3.4")
+	if _, ok := g.byIP["1.2.3.4"]; !ok {
+		t.Fatal("allow did not create an entry")
+	}
+
+	g.sweep(time.Now().Add(30 * time.Second))
+	if _, ok := g.byIP["1.2.3.4"]; !ok {
+		t.Error("entry evicted before idleTTL elapsed")
+	}
+
+	g.sweep(time.Now().Add(2 * time.Minute))
+	if _, ok := g.byIP["1.2.3.4"]; ok {
+		t.Error("entry not evicted once idle past idleTTL")
 	}
 }
 
