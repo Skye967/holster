@@ -99,6 +99,30 @@ type ConnectResult = { socket: WebSocket } | { error: string }
 
 const UNREACHABLE_TEXT = "Can't reach the server right now — try again"
 
+// Mirrors services/gateway/chat.go's maxMessageLength — checked here so an
+// over-long message never leaves the browser at all, rather than reaching
+// the gateway and being rejected round-trip. Counted in code points, not
+// UTF-16 length, so a multi-byte character is never split — same reasoning
+// as the gateway's own rune count.
+export const MAX_MESSAGE_LENGTH = 4000
+
+// Reports whether text has more than max code points, without counting past
+// max — the composer has no maxLength of its own, so a pasted string can be
+// arbitrarily large, and `[...text].length` would walk and allocate over all
+// of it just to reject it. Drives the string iterator directly rather than
+// `for...of` only because the loop has no use for the yielded character
+// itself, and an unused `for...of` binding trips this project's lint config
+// (no `varsIgnorePattern` override) — same code-point-at-a-time semantics
+// either way, so this still exits as soon as the answer is known.
+function exceedsCodePointLength(text: string, max: number): boolean {
+  let count = 0
+  const iter = text[Symbol.iterator]()
+  while (!iter.next().done) {
+    if (++count > max) return true
+  }
+  return false
+}
+
 // Bounds the WebSocket open handshake — same order of magnitude as
 // GATEWAY_CALL_TIMEOUT_MS but a distinct concern (no HTTP retry involved),
 // so it gets its own constant rather than borrowing that one's semantics.
@@ -120,7 +144,22 @@ async function connect(
     }
   }
 
-  const socket = new WebSocket(wsURL(query))
+  let socket: WebSocket
+  try {
+    socket = new WebSocket(wsURL(query))
+  } catch {
+    // wsURL() throws when NEXT_PUBLIC_GATEWAY_URL is unset, and the
+    // WebSocket constructor itself can throw synchronously for a malformed
+    // URL. Without this catch, connect()'s returned promise rejects instead
+    // of resolving — and ensureSocket()'s connectingRef.current = connect(
+    // ...).then(...) has no .catch(), so a rejection leaves connectingRef
+    // pointing at a dead promise forever, silently wedging every future
+    // send() and reconnect attempt for the rest of the session (T32).
+    // Converting the throw into the same { error } shape every other
+    // reachable-failure path already returns keeps connect()'s contract —
+    // always resolves, never rejects — intact.
+    return { error: UNREACHABLE_TEXT }
+  }
   const opened = await new Promise<boolean>((resolve) => {
     // Without this, a connection attempt the browser silently black-holes
     // (TCP succeeds, the WS upgrade never completes) leaves this promise —
@@ -263,6 +302,26 @@ export function useChatSocket(
   const send = useCallback(
     (text: string, conversationId: string): string => {
       const turn = crypto.randomUUID()
+      if (exceedsCodePointLength(text, MAX_MESSAGE_LENGTH)) {
+        // Deferred to a microtask, not fired synchronously: chat-session-
+        // provider.tsx's wrapped send() reads this function's return value
+        // (turn) and marks it active *after* this call returns, so an
+        // error event dispatched before that point would clear nothing —
+        // the provider would then latch onto a turn that already finished,
+        // leaving the composer disabled forever (T32). queueMicrotask keeps
+        // this on the same "fires after send() returns" timing every other
+        // failure here already has (ensureSocket().then()), without
+        // actually opening a connection for a message that's rejected
+        // either way.
+        queueMicrotask(() => {
+          onEventRef.current({
+            type: "error",
+            turn,
+            text: "That message is too long — try something shorter.",
+          })
+        })
+        return turn
+      }
       ensureSocket().then((result) => {
         if ("error" in result) {
           onEventRef.current({ type: "error", turn, text: result.error })

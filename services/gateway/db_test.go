@@ -1227,9 +1227,12 @@ func TestLoadConversationTurnsPairsMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	turns, err := load(ctx, id, convID)
+	turns, exists, err := load(ctx, id, convID)
 	if err != nil {
 		t.Fatalf("load: %v", err)
+	}
+	if !exists {
+		t.Error("exists = false, want true for a conversation that was just inserted")
 	}
 	want := []conversationTurn{
 		{UserText: "a heist movie", AssistantText: "Suggested: Heat"},
@@ -1245,10 +1248,14 @@ func TestLoadConversationTurnsPairsMessages(t *testing.T) {
 	}
 }
 
-// TestLoadConversationTurnsReturnsEmptyArray mirrors
-// TestGetVerdictsReturnsEmptyArray (verdicts_test.go): the JSON wire contract
-// is `[]`, never `null`, for a conversation with nothing saved yet.
-func TestLoadConversationTurnsReturnsEmptyArray(t *testing.T) {
+// TestLoadConversationTurnsReportsNotExistsForAnUnknownID is the regression
+// guard for T32's 404: a conversation id nothing has ever written reports
+// exists=false (and, per that field's own contract, so does one belonging to
+// another user — see TestLoadConversationTurnsHidesAForeignConversation and
+// loadConversationTurns' own doc comment for why the two can't be told apart
+// here). turns stays the non-nil empty slice either way, matching the `[]`,
+// never `null`, wire contract every other list endpoint holds.
+func TestLoadConversationTurnsReportsNotExistsForAnUnknownID(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	load := loadConversationTurns(pool)
@@ -1256,13 +1263,52 @@ func TestLoadConversationTurnsReturnsEmptyArray(t *testing.T) {
 	const id = "conv_turns_empty_test"
 	newTestUser(t, pool, ctx, id)
 
-	turns, err := load(ctx, id, uuid.NewString())
+	turns, exists, err := load(ctx, id, uuid.NewString())
 	if err != nil {
 		t.Fatalf("load: %v", err)
+	}
+	if exists {
+		t.Error("exists = true, want false for a conversation id nothing has ever written")
 	}
 	if turns == nil || len(turns) != 0 {
 		t.Errorf("turns = %#v, want non-nil empty slice", turns)
 	}
+}
+
+// TestLoadConversationTurnsHidesAForeignConversation proves the RLS half of
+// loadConversationTurns' exists check directly, the same way
+// TestSaveMessagesRejectsForeignConversationID proves it for the write side:
+// testPool connects as the migration/superuser role, which bypasses RLS
+// entirely, so this replicates loadConversationTurns' own `select exists(...)`
+// query under an explicit asRole("gateway_app") with holster.user_id bound to
+// the *other* user, the way the real gateway pool always runs it.
+func TestLoadConversationTurnsHidesAForeignConversation(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const uA, uB = "conv_turns_foreign_a", "conv_turns_foreign_b"
+	newTestUser(t, pool, ctx, uA)
+	newTestUser(t, pool, ctx, uB)
+
+	convA := uuid.NewString()
+	if _, err := pool.Exec(ctx,
+		`insert into conversations (id, user_id) values ($1, $2)`, convA, uA); err != nil {
+		t.Fatal(err)
+	}
+
+	asRole(t, pool, "gateway_app", func(ctx context.Context, tx pgx.Tx) {
+		if _, err := tx.Exec(ctx, `select set_config('holster.user_id', $1, true)`, uB); err != nil {
+			t.Fatalf("set_config: %v", err)
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`select exists(select 1 from conversations where id = $1)`, convA).Scan(&exists); err != nil {
+			t.Fatalf("exists query: %v", err)
+		}
+		if exists {
+			t.Errorf("%s's conversation is visible while acting as %s, want hidden by RLS", uA, uB)
+		}
+	})
 }
 
 // TestSaveMessagesCreatesConversationOnFirstUseThenAppends proves the

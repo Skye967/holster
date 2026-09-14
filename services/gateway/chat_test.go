@@ -22,6 +22,8 @@ import (
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // testConversationID is the conversation id most tests below send on every
@@ -685,6 +687,11 @@ func TestChatCancelStopsTheAgentCall(t *testing.T) {
 	}
 }
 
+// TestChatNewMessageSupersedesTheInFlightTurn also proves T32's fix: a
+// superseded turn is not just cancelled, it sends its own terminal event
+// (never left silently unresolved on the client) — so both t1's error and
+// t2's done must reach the browser, in whichever order the two goroutines
+// happen to write them.
 func TestChatNewMessageSupersedesTheInFlightTurn(t *testing.T) {
 	var firstCancelled atomic.Bool
 	firstBlocked := make(chan struct{})
@@ -716,12 +723,19 @@ func TestChatNewMessageSupersedesTheInFlightTurn(t *testing.T) {
 	<-firstBlocked
 	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t2", Text: "second", Conversation: testConversationID})
 
-	var ev outboundEvent
-	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
-		t.Fatal(err)
+	byTurn := make(map[string]outboundEvent, 2)
+	for len(byTurn) < 2 {
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatalf("read: %v (got so far: %+v)", err, byTurn)
+		}
+		byTurn[ev.Turn] = ev
 	}
-	if ev.Type != "done" || ev.Turn != "t2" {
-		t.Errorf("event = %+v, want done for t2", ev)
+	if got := byTurn["t1"]; got.Type != "error" {
+		t.Errorf("t1's terminal event = %+v, want type error", got)
+	}
+	if got := byTurn["t2"]; got.Type != "done" {
+		t.Errorf("t2's terminal event = %+v, want type done", got)
 	}
 
 	deadline := time.After(2 * time.Second)
@@ -1445,6 +1459,164 @@ func TestChatMessageRejectsAMalformedConversationID(t *testing.T) {
 	}
 }
 
+// TestChatMessageRejectsAnEmptyTurnID mirrors
+// TestChatMessageRejectsAMalformedConversationID for msg.Turn — the
+// regression guard for T32's nil-cancelCurrent panic, whose root cause was
+// letting "" (the coordinator's own "no turn active" sentinel) double as a
+// real turn id. Only emptiness is rejected — unlike conversationID, turn is
+// never parsed as a uuid, and the test suite's own convention of plain
+// placeholder ids ("t1", "t2", ...) is deliberately still valid.
+func TestChatMessageRejectsAnEmptyTurnID(t *testing.T) {
+	callAgent := func(context.Context, agentChatRequest) (<-chan agentEvent, error) {
+		t.Error("the agent must not be called for an empty turn id")
+		return nil, errors.New("unreachable")
+	}
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "", Text: "hi", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "error" || ev.Text != genericErrorText {
+		t.Errorf("event = %+v, want a generic error event", ev)
+	}
+}
+
+// TestChatDuplicateTurnIDsDoNotPanic is the direct regression guard for T32's
+// nil-cancelCurrent panic: two "message" frames sharing the same (now
+// UUID-valid) turn id must not crash the connection, even though only the
+// first should ever be "current" by the time the second's done-record
+// arrives.
+func TestChatDuplicateTurnIDsDoNotPanic(t *testing.T) {
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		ch := make(chan agentEvent, 1)
+		ch <- agentEvent{Type: "done"}
+		close(ch)
+		return ch, nil
+	}
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	turn := uuid.NewString()
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: turn, Text: "first", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var first outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: turn, Text: "second", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var second outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &second); err != nil {
+		t.Fatalf("connection did not survive a duplicate turn id: %v", err)
+	}
+	if second.Type != "done" {
+		t.Errorf("second event = %+v, want done", second)
+	}
+}
+
+// TestChatOverLongMessageIsRejected proves maxMessageLength is enforced
+// server-side, independent of whatever cap the client applies — a client bug
+// or a non-browser caller must not be able to send a frame large enough to
+// trip coder/websocket's own read limit and silently kill the connection.
+func TestChatOverLongMessageIsRejected(t *testing.T) {
+	callAgent := func(context.Context, agentChatRequest) (<-chan agentEvent, error) {
+		t.Error("the agent must not be called for an over-long message")
+		return nil, errors.New("unreachable")
+	}
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	over := strings.Repeat("a", maxMessageLength+1)
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: over, Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "error" {
+		t.Errorf("event = %+v, want type error", ev)
+	}
+}
+
+// TestChatTurnDeadlineSendsATerminalErrorEvent is the direct regression test
+// for T32's original bug: a turn that never comes back before turnDeadline
+// must still end with a terminal event, not silence. Shortens the package
+// var so the test doesn't wait a real 30s.
+func TestChatTurnDeadlineSendsATerminalErrorEvent(t *testing.T) {
+	original := turnDeadline
+	turnDeadline = 50 * time.Millisecond
+	t.Cleanup(func() { turnDeadline = original })
+
+	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
+		<-ctx.Done() // never replies before turnDeadline fires
+		return nil, ctx.Err()
+	}
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "anything", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != "error" || ev.Turn != "t1" {
+		t.Errorf("event = %+v, want a t1 error event", ev)
+	}
+}
+
+// TestFinishTurnSurfacesAnRLSViolationAsAVisibleError proves the other half
+// of T32's "foreign conversation id" fix: when saveMessages fails because
+// this session's RLS policy rejected the write (SQLSTATE 42501 — a
+// conversation foreign to this caller, or deleted between dispatch and
+// persist), the browser gets a clear, visible error rather than a silent
+// log — the turn's answer was already shown but will otherwise never be
+// saved with nothing to tell the user so.
+func TestFinishTurnSurfacesAnRLSViolationAsAVisibleError(t *testing.T) {
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8}}, nil
+	}
+	callAgent := fakeAgentEvents(
+		agentEvent{Type: "results", Picks: []agentPick{{TMDBID: 550, MediaType: "movie", Title: "Fight Club"}}},
+		agentEvent{Type: "done"},
+	)
+	saveMessages := func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
+		return false, &pgconn.PgError{Code: "42501", Message: "new row violates row-level security policy"}
+	}
+	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	if err := wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie", Conversation: testConversationID}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []outboundEvent
+	for range 3 { // "results", "done", then the persist-failure error
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatalf("read event[%d]: %v (got so far: %+v)", len(got), err, got)
+		}
+		got = append(got, ev)
+	}
+	last := got[len(got)-1]
+	if last.Type != "error" || last.Text == "" {
+		t.Fatalf("last event = %+v, want a non-empty visible error", last)
+	}
+	if last.Text == genericErrorText {
+		t.Errorf("error text = %q, want the specific RLS-rejection copy, not the generic fallback", last.Text)
+	}
+}
+
 // --- conversationDeletions -------------------------------------------------
 
 // TestConversationDeletionsNeverForgetsARealDelete is the regression guard
@@ -1952,8 +2124,8 @@ func TestChatConversationCreatedIsNotSentWhenPersistFails(t *testing.T) {
 
 // TestFinishTurnSkipsTheWebSocketSendOnceItsEventContextIsDone is the
 // regression guard for the shutdown-drain path silently defeating
-// sendEvent's own cancellation guard: finishTurn must still persist via
-// dbCtx even when eventCtx is already done, but must not attempt the WS
+// sendTerminalEvent's own cancellation guard: finishTurn must still persist
+// via dbCtx even when eventCtx is already done, but must not attempt the WS
 // send that eventCtx being done exists to suppress.
 func TestFinishTurnSkipsTheWebSocketSendOnceItsEventContextIsDone(t *testing.T) {
 	serverConnCh := make(chan *websocket.Conn, 1)

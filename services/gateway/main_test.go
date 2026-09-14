@@ -145,8 +145,8 @@ func noopCallAgentTitles(context.Context, agentTitlesRequest) ([]agentPick, erro
 func noopLoadConversation(context.Context, string, string) ([]historyTurn, error) {
 	return nil, nil
 }
-func noopLoadConversationTurns(context.Context, string, string) ([]conversationTurn, error) {
-	return nil, nil
+func noopLoadConversationTurns(context.Context, string, string) ([]conversationTurn, bool, error) {
+	return nil, true, nil
 }
 func noopSaveMessages(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
 	return false, nil

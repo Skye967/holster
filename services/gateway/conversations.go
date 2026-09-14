@@ -185,15 +185,27 @@ func loadConversation(db *pgxpool.Pool) func(ctx context.Context, userID, conver
 }
 
 // loadConversationTurns pairs one conversation's stored messages into
-// completed exchanges for GET /api/chat/history/{conversationID}. A foreign
-// or nonexistent id resolves to an empty slice, not an error — RLS's
-// message_isolation policy filters rows by conversation ownership before
-// this ever sees them, so there's nothing here to distinguish "not yours"
-// from "no messages yet," and no reason to.
-func loadConversationTurns(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID string) ([]conversationTurn, error) {
-	return func(ctx context.Context, userID, conversationID string) ([]conversationTurn, error) {
+// completed exchanges for GET /api/chat/history/{conversationID}, and also
+// reports whether the conversation exists at all from this caller's point of
+// view. A foreign id and a genuinely nonexistent one are indistinguishable
+// here on purpose — conversation_isolation's RLS policy
+// (20260904191046_conversations.sql) makes another user's row invisible, not
+// merely filtered, the same ambiguity deleteConversationHandler already
+// accepts for the same reason — so exists is false for both, and chatHistory
+// answers both the same way (404) rather than pretending to tell them apart.
+func loadConversationTurns(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error) {
+	return func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error) {
 		turns := []conversationTurn{}
+		var exists bool
 		err := withUser(ctx, db, userID, func(tx pgx.Tx) error {
+			if err := tx.QueryRow(ctx,
+				`select exists(select 1 from conversations where id = $1)`, conversationID,
+			).Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				return nil
+			}
 			flat, err := fetchRecentMessages(ctx, tx, conversationID, maxStoredHistoryMessages)
 			if err != nil {
 				return err
@@ -201,7 +213,7 @@ func loadConversationTurns(db *pgxpool.Pool) func(ctx context.Context, userID, c
 			turns = pairTurns(flat)
 			return nil
 		})
-		return turns, err
+		return turns, exists, err
 	}
 }
 
@@ -359,10 +371,19 @@ func (h *Handler) chatHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	conversationID = parsed.String()
 
-	turns, err := h.loadConversationTurns(r.Context(), userID, conversationID)
+	turns, exists, err := h.loadConversationTurns(r.Context(), userID, conversationID)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "chat history load failed", "error", dbError(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "temporarily unavailable"})
+		return
+	}
+	// Foreign and nonexistent are the same outcome here — see
+	// loadConversationTurns — so both 404, not 200 []. Safe for a brand-new
+	// "New chat" id's first hydration too: chat-history.ts's fetchChatHistory
+	// throws on any non-2xx, and chat-panel.tsx already treats that failure
+	// identically to an empty thread.
+	if !exists {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "conversation not found"})
 		return
 	}
 	// [] on the wire, never null — same guard as watchlist() and verdicts(),

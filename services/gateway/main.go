@@ -164,7 +164,7 @@ type Handler struct {
 	// its delete, and the write that persists one completed turn — injected
 	// the same way as loadVerdicts/saveVerdict above.
 	loadConversation          func(ctx context.Context, userID, conversationID string) ([]historyTurn, error)
-	loadConversationTurns     func(ctx context.Context, userID, conversationID string) ([]conversationTurn, error)
+	loadConversationTurns     func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error)
 	saveMessages              func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error)
 	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error)
 	deleteConversation        func(ctx context.Context, userID, conversationID string) (bool, error)
@@ -193,7 +193,7 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error),
 	callAgentTitles agentTitlesCaller,
 	loadConversation func(ctx context.Context, userID, conversationID string) ([]historyTurn, error),
-	loadConversationTurns func(ctx context.Context, userID, conversationID string) ([]conversationTurn, error),
+	loadConversationTurns func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error),
 	saveMessages func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error),
 	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error),
 	deleteConversation func(ctx context.Context, userID, conversationID string) (bool, error),
@@ -402,12 +402,33 @@ func upsertUser(db *pgxpool.Pool) func(context.Context, string, string) error {
 // SQLSTATE alone: PostgreSQL puts row values in a constraint violation's DETAIL,
 // so the message would carry the user's own data. Everything else — connection,
 // timeout, cancellation — has no row data in it and is logged as-is.
+//
+// For logging only — nothing should compare its string output against a
+// SQLSTATE to classify an error. That string has no stability contract (it's
+// free to change to suit a log line) and doing so would also skip the
+// non-PgError branch's meaning entirely, since a random error's own
+// err.Error() text could coincidentally match. isRLSRejection below is the
+// typed check for exactly the one case this package currently needs to branch
+// on, matching db_test.go's denied() and verdicts.go's sentinel-error idiom
+// for the same kind of decision instead of introducing a third way.
 func dbError(err error) string {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		return pgErr.Code
 	}
 	return err.Error()
+}
+
+// isRLSRejection reports whether err is a Postgres row-level-security
+// violation (SQLSTATE 42501, "insufficient_privilege") — the code a write
+// against a row this session's RLS policies don't allow it to touch returns.
+// chat.go's finishTurn is the current caller: a conversation id this session
+// can't write into (foreign, or deleted between dispatch and persist) is the
+// one persist failure that must reach the browser rather than stay a silent
+// log (T32/DECISIONS.md: "always a terminal frame").
+func isRLSRejection(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42501"
 }
 
 // originAllowed reports whether origin is one of the app's configured origins

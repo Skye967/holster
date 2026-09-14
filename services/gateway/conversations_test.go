@@ -22,7 +22,7 @@ import (
 // can inspect h.conversationDeletions directly (e.g. to prove a no-op delete
 // never bumped it).
 func newConversationsTestServer(t *testing.T,
-	loadConversationTurns func(context.Context, string, string) ([]conversationTurn, error),
+	loadConversationTurns func(context.Context, string, string) ([]conversationTurn, bool, error),
 	loadConversationSummaries func(context.Context, string) ([]conversationSummary, error),
 	deleteConversation func(context.Context, string, string) (bool, error),
 ) (*httptest.Server, string, *Handler) {
@@ -62,13 +62,13 @@ func newConversationsTestServer(t *testing.T,
 // --- GET /api/chat/history/{conversationID} ---------------------------------
 
 func TestChatHistoryReturnsTurns(t *testing.T) {
-	loadConversationTurns := func(_ context.Context, _ string, conversationID string) ([]conversationTurn, error) {
+	loadConversationTurns := func(_ context.Context, _ string, conversationID string) ([]conversationTurn, bool, error) {
 		if conversationID != testConversationID {
 			t.Errorf("loadConversationTurns called with %q, want %q", conversationID, testConversationID)
 		}
 		return []conversationTurn{
 			{UserText: "a heist movie", AssistantText: "Suggested: Heat"},
-		}, nil
+		}, true, nil
 	}
 	srv, token, _ := newConversationsTestServer(t, loadConversationTurns, noopLoadConversationSummaries, noopDeleteConversation)
 
@@ -92,11 +92,11 @@ func TestChatHistoryReturnsTurns(t *testing.T) {
 // form, not the raw path value — otherwise this 200s past validation only
 // to 503 at the database.
 func TestChatHistoryCanonicalizesTheConversationID(t *testing.T) {
-	loadConversationTurns := func(_ context.Context, _ string, conversationID string) ([]conversationTurn, error) {
+	loadConversationTurns := func(_ context.Context, _ string, conversationID string) ([]conversationTurn, bool, error) {
 		if conversationID != testConversationID {
 			t.Errorf("loadConversationTurns called with %q, want the canonical %q", conversationID, testConversationID)
 		}
-		return nil, nil
+		return nil, true, nil
 	}
 	srv, token, _ := newConversationsTestServer(t, loadConversationTurns, noopLoadConversationSummaries, noopDeleteConversation)
 
@@ -106,11 +106,30 @@ func TestChatHistoryCanonicalizesTheConversationID(t *testing.T) {
 	}
 }
 
+// TestChatHistoryReturns404WhenNotVisible is the regression guard for T32's
+// "return 404 for a conversation that is not the caller's": loadConversationTurns
+// reports exists=false for both a foreign conversation id and a genuinely
+// nonexistent one (RLS makes them indistinguishable — see that function's own
+// doc comment), and chatHistory must 404 either way rather than the 200 []
+// it used to return for "nothing saved yet."
+func TestChatHistoryReturns404WhenNotVisible(t *testing.T) {
+	loadConversationTurns := func(context.Context, string, string) ([]conversationTurn, bool, error) {
+		return nil, false, nil
+	}
+	srv, token, _ := newConversationsTestServer(t, loadConversationTurns, noopLoadConversationSummaries, noopDeleteConversation)
+
+	resp := doJSON(t, srv, token, http.MethodGet, "/api/chat/history/"+testConversationID)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
 // Mirrors TestWatchlistEmptySkipsAgentCall's nil-slice-marshals-to-null
-// guard, for the same reason (TestGetVerdictsReturnsEmptyArray et al.).
+// guard, for the same reason (TestGetVerdictsReturnsEmptyArray et al.) — for
+// a visible conversation whose loader still returns a nil turns slice.
 func TestChatHistoryReturnsEmptyArray(t *testing.T) {
-	loadConversationTurns := func(context.Context, string, string) ([]conversationTurn, error) {
-		return nil, nil
+	loadConversationTurns := func(context.Context, string, string) ([]conversationTurn, bool, error) {
+		return nil, true, nil
 	}
 	srv, token, _ := newConversationsTestServer(t, loadConversationTurns, noopLoadConversationSummaries, noopDeleteConversation)
 
@@ -129,8 +148,8 @@ func TestChatHistoryReturnsEmptyArray(t *testing.T) {
 }
 
 func TestChatHistoryDegradesOnLoadFailure(t *testing.T) {
-	loadConversationTurns := func(context.Context, string, string) ([]conversationTurn, error) {
-		return nil, errUnauthorizedParty // any non-nil error
+	loadConversationTurns := func(context.Context, string, string) ([]conversationTurn, bool, error) {
+		return nil, false, errUnauthorizedParty // any non-nil error
 	}
 	srv, token, _ := newConversationsTestServer(t, loadConversationTurns, noopLoadConversationSummaries, noopDeleteConversation)
 

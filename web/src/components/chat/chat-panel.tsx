@@ -186,20 +186,19 @@ function TurnView({
 
 export function ChatPanel({ conversationId }: { conversationId: string }) {
   const { getToken, isLoaded } = useAuth()
-  const { send, setListener, clearListener, guest, guestContextLost } =
-    useChatSession()
+  const {
+    send,
+    setListener,
+    clearListener,
+    guest,
+    guestContextLost,
+    activeTurn,
+  } = useChatSession()
   const router = useRouter()
   const pathname = usePathname()
   const [turns, setTurns] = useState<Turn[]>([])
-  const [activeTurnId, setActiveTurnId] = useState<string | null>(null)
   const [inputValue, setInputValue] = useState("")
   const listRef = useRef<HTMLDivElement>(null)
-  // Mirrors activeTurnId for handleDisconnect's benefit: that callback is
-  // invoked from chat-socket.ts's WebSocket "close" listener, outside
-  // React's render cycle, so it needs a value it can read synchronously
-  // and that's never stale — a ref, not a closure over state. Every write
-  // to activeTurnId has a paired write here.
-  const activeTurnIdRef = useRef<string | null>(null)
 
   // Every verdict the caller has set, hydrated once so a title's saved/judged
   // state is correct on first render rather than only after it's touched
@@ -420,43 +419,31 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
     [writeVerdict],
   )
 
+  // Only renders the event into the turn it belongs to — whether that turn
+  // is still the active one, and clearing busy when it isn't, is
+  // chat-session-provider.tsx's job now (T32): it's the one thing that
+  // outlives this panel across a conversation switch, so it's the only
+  // reliable owner of that state. A stale/superseded turn's terminal event
+  // still lands here and still renders (e.g. the error text on an earlier,
+  // superseded turn) — it just doesn't touch the composer's disabled state.
   const handleEvent = useCallback((ev: ChatEvent) => {
     setTurns((prev) =>
       prev.map((t) => (t.id === ev.turn ? applyEvent(t, ev) : t)),
     )
-    if (
-      (ev.type === "done" || ev.type === "error") &&
-      activeTurnIdRef.current === ev.turn
-    ) {
-      activeTurnIdRef.current = null
-      setActiveTurnId(null)
-    }
   }, [])
 
-  // Fires when the socket drops out from under an in-flight turn (network
-  // blip, proxy idle-kill, server restart) — none of chat-socket.ts's own
-  // events carry a turn id for this, since it isn't about any one turn.
-  // Synthesizes an "error" event for whatever turn is currently active, so
-  // handleEvent stays the single place that fails a turn and clears
-  // activeTurnId.
-  const handleDisconnect = useCallback(
-    (text: string) => {
-      const id = activeTurnIdRef.current
-      if (id !== null) {
-        handleEvent({ type: "error", turn: id, text })
-      }
-    },
-    [handleEvent],
-  )
-
   // Registers this mounted panel as the shared socket's current listener —
-  // ChatSessionProvider forwards every event/disconnect to whichever
-  // ChatPanel last called this, which is always the one for the
-  // conversation currently on screen.
+  // ChatSessionProvider forwards every event to whichever ChatPanel last
+  // called this, which is always the one for the conversation currently on
+  // screen. No onDisconnect: a disconnect mid-turn now reaches this panel as
+  // an ordinary "error" event on the turn it belongs to, synthesized by
+  // chat-session-provider.tsx (which is what actually knows which turn was
+  // active) and delivered through onEvent above like any other event — this
+  // panel has nothing else to do on a bare disconnect.
   useEffect(() => {
-    setListener({ onEvent: handleEvent, onDisconnect: handleDisconnect })
+    setListener({ onEvent: handleEvent })
     return () => clearListener()
-  }, [setListener, clearListener, handleEvent, handleDisconnect])
+  }, [setListener, clearListener, handleEvent])
 
   // The only send path — typing a new message and retrying a failed turn
   // both call this with the text to (re)send. A retry is nothing more than
@@ -466,13 +453,11 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
   const submit = useCallback(
     (text: string) => {
       const trimmed = text.trim()
-      if (!trimmed || activeTurnId) return
+      if (!trimmed || activeTurn) return
       const turnId = send(trimmed, conversationId)
-      activeTurnIdRef.current = turnId
       setTurns((prev) => [...prev, { id: turnId, userText: trimmed }])
-      setActiveTurnId(turnId)
     },
-    [activeTurnId, send, conversationId],
+    [activeTurn, send, conversationId],
   )
 
   const handleSubmit = useCallback(() => {
@@ -487,7 +472,7 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
     })
   }, [turns])
 
-  const disabled = activeTurnId !== null
+  const disabled = activeTurn !== null
 
   // One line, not a banner or a modal: the only thing a guest gives up in
   // chat is persistence, and this says so where the input is.
