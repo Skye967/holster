@@ -1055,26 +1055,30 @@ func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec
 	created, err := h.saveMessages(saveCtx, userID, rec.conversation, rec.userText, rec.assistantText, rec.titleRefs)
 	cancel()
 	if err != nil {
-		// Logged either way — an RLS rejection is still worth an operator's
-		// attention (a recurring one could mean a client bug or a race, not
-		// just one unlucky request) — but only a conversation id RLS won't
-		// let this session write into (foreign, or deleted between dispatch
-		// and this persist attempt — see saveMessages' own doc comment on
-		// this exact rejection) also reaches the browser. Every other
-		// persist failure stays a silent log: what the user already saw
-		// stays on screen, and the next message on this conversation
-		// self-heals through saveMessages' own conflict handling. This one
-		// is different — the turn's answer was shown but will never be
-		// saved, and nothing else will ever tell the user that (T32/
-		// DECISIONS.md: "always a terminal frame"). The agent has already
-		// spent its call by the time this is caught; checking ownership
-		// earlier would mean either bypassing RLS or duplicating
-		// saveMessages' own conflict logic ahead of the turn, both bigger
-		// changes than this task takes on.
-		slog.ErrorContext(dbCtx, "message persist failed", "turn", rec.turn, "conversation", rec.conversation, "error", dbError(err))
-		if isRLSRejection(err) {
+		// A conversation id this session can't write into (foreign, or
+		// deleted between dispatch and this persist attempt) is not a server
+		// failure — it's saveMessages' own explicit ownership check
+		// (errConversationNotWritable, T34) or, failing that, RLS's
+		// message_isolation policy as a second, independent backstop
+		// (isRLSRejection). Either way the browser must be told: the turn's
+		// answer was shown but will never be saved, and nothing else will
+		// ever tell the user that (T32/DECISIONS.md: "always a terminal
+		// frame"). The agent has already spent its call by the time this is
+		// caught; checking ownership earlier would mean either bypassing RLS
+		// or duplicating saveMessages' own conflict logic ahead of the turn,
+		// both bigger changes than this task takes on.
+		//
+		// Every other persist failure stays a silent log: what the user
+		// already saw stays on screen, and the next message on this
+		// conversation self-heals through saveMessages' own conflict
+		// handling.
+		if errors.Is(err, errConversationNotWritable) || isRLSRejection(err) {
+			slog.WarnContext(dbCtx, "message persist rejected: conversation not writable",
+				"turn", rec.turn, "conversation", rec.conversation)
 			h.sendTerminalEvent(eventCtx, conn, rec.turn, outboundEvent{Type: "error", Text: "This conversation isn't available."})
+			return
 		}
+		slog.ErrorContext(dbCtx, "message persist failed", "turn", rec.turn, "conversation", rec.conversation, "error", dbError(err))
 		return
 	}
 	if created {
@@ -1571,13 +1575,12 @@ func parseProviderNames(raw []byte, wanted []int) []string {
 
 // cachedProviderNames resolves wanted ids to names from the country's cached
 // streaming_providers row — the one read both loadChatContext (inside its
-// transaction) and loadGuestChatContext (straight off the pool) share, so
-// the interface is what pgx.Tx and *pgxpool.Pool have in common. No cached
-// row yet (T15 populates it lazily on read) degrades to no names, never an
-// error: the interpreting line drops its "on …" clause, the turn goes on.
-func cachedProviderNames(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, country string, wanted []int) ([]string, error) {
+// transaction) and loadGuestChatContext (straight off the pool) share, so it
+// takes queryRower (main.go), what pgx.Tx and *pgxpool.Pool have in common.
+// No cached row yet (T15 populates it lazily on read) degrades to no names,
+// never an error: the interpreting line drops its "on …" clause, the turn
+// goes on.
+func cachedProviderNames(ctx context.Context, q queryRower, country string, wanted []int) ([]string, error) {
 	var providersJSON []byte
 	err := q.QueryRow(ctx,
 		`select providers from streaming_providers where country = $1`, country).

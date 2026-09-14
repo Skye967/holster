@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -360,6 +361,47 @@ func (h *Handler) verifyToken(tokenString string) (*Claims, error) {
 	return claims, nil
 }
 
+// queryRower is what *pgxpool.Pool and pgx.Tx have in common, letting a
+// function run either straight off the pool or inside an existing
+// transaction — chat.go's cachedProviderNames and verifyRoleIsSafe below
+// both need this for the same reason: db_test.go's asRole can only exercise
+// a switched role inside a transaction.
+type queryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// verifyRoleIsSafe fails if the connecting role would bypass row-level
+// security entirely — a superuser, a role with the bypassrls attribute, or
+// the owner of any app table all skip every policy in
+// ../../supabase/migrations, turning RLS into dead code rather than a
+// backstop (T34). gateway_app is deliberately none of these
+// (20260831233121_rls_roles.sql); this catches a DATABASE_URL pointed at the
+// wrong role at startup, before it becomes a silent cross-user data leak.
+// Ownership is checked against every public table, not just users: table
+// ownership is per-object in Postgres, so a role need only own one table to
+// bypass RLS on it.
+func verifyRoleIsSafe(ctx context.Context, q queryRower) error {
+	var role string
+	var isSuperuser, bypassesRLS, ownsTable bool
+	err := q.QueryRow(ctx, `
+		select rolname, rolsuper, rolbypassrls,
+		       exists (select 1 from pg_tables
+		               where schemaname = 'public' and tableowner = rolname)
+		from pg_roles
+		where rolname = current_user`,
+	).Scan(&role, &isSuperuser, &bypassesRLS, &ownsTable)
+	if err != nil {
+		return err
+	}
+	if isSuperuser || bypassesRLS || ownsTable {
+		return fmt.Errorf(
+			"connected to the database as %q, which bypasses row-level security "+
+				"(superuser=%v bypassrls=%v table owner=%v) — connect as gateway_app instead",
+			role, isSuperuser, bypassesRLS, ownsTable)
+	}
+	return nil
+}
+
 // withUser runs fn inside a transaction with holster.user_id bound to id, so
 // the RLS policies from 20260831233121_rls_roles.sql scope every statement fn
 // issues. id is the authenticated caller's own Clerk ID on every
@@ -426,10 +468,14 @@ func dbError(err error) string {
 // isRLSRejection reports whether err is a Postgres row-level-security
 // violation (SQLSTATE 42501, "insufficient_privilege") — the code a write
 // against a row this session's RLS policies don't allow it to touch returns.
-// chat.go's finishTurn is the current caller: a conversation id this session
-// can't write into (foreign, or deleted between dispatch and persist) is the
-// one persist failure that must reach the browser rather than stay a silent
-// log (T32/DECISIONS.md: "always a terminal frame").
+// chat.go's finishTurn is the current caller, alongside
+// errConversationNotWritable (conversations.go): a conversation id this
+// session can't write into (foreign, or deleted between dispatch and
+// persist) is the one persist failure that must reach the browser rather
+// than stay a silent log (T32/DECISIONS.md: "always a terminal frame").
+// saveMessages' own explicit ownership check (T34) is what actually catches
+// this case now; RLS's message_isolation policy staying wired to the same
+// browser-visible path is the second, independent layer, not the only one.
 func isRLSRejection(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "42501"
@@ -742,6 +788,12 @@ func main() {
 	if !schemaReady {
 		log.Fatal("database has no users table; run 'docker compose down -v' to re-seed the " +
 			"local stack, or apply migrations to your configured database (see db/README.md)")
+	}
+	// Runs after schemaReady on purpose: a local dev superuser connecting
+	// before migrations exist gets the friendlier "no users table" message
+	// above, not a bypass-RLS one.
+	if err := verifyRoleIsSafe(startupCtx, db); err != nil {
+		log.Fatal(err)
 	}
 
 	// No client-level Timeout: a chat turn's own bound is turnDeadline (chat.go),

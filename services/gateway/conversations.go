@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -36,18 +37,25 @@ type conversationTurn struct {
 // windowHistory needs, because the shown set rides along — see there) and
 // loadConversationTurns (the reload-render path) — same query and scan,
 // different caps.
-func fetchRecentMessages(ctx context.Context, tx pgx.Tx, conversationID string, limit int) ([]historyTurn, error) {
+//
+// Joined through conversations on user_id explicitly (T34), not left to
+// RLS's message_isolation policy alone — messages carries no user_id of its
+// own, so a role that bypasses RLS previously had no other guard on this
+// read at all.
+func fetchRecentMessages(ctx context.Context, tx pgx.Tx, userID, conversationID string, limit int) ([]historyTurn, error) {
 	// Newest-first with a limit, then reversed below, so the cap keeps the
 	// most recent messages rather than the oldest ones. Ordered by seq, not
 	// created_at: saveMessages inserts a turn's user and assistant row in one
 	// statement, so both get the exact same now() value, and two rows with a
 	// tied timestamp have no guaranteed order — the identity column does.
 	rows, err := tx.Query(ctx, `
-		select role, content, title_refs from messages
-		where conversation_id = $1
-		order by seq desc
-		limit $2`,
-		conversationID, limit)
+		select m.role, m.content, m.title_refs
+		from messages m
+		join conversations c on c.id = m.conversation_id
+		where m.conversation_id = $1 and c.user_id = $2
+		order by m.seq desc
+		limit $3`,
+		conversationID, userID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -166,8 +174,9 @@ func trimToGraphemeBoundary(runes []rune) []rune {
 // loadConversation returns enough of conversationID's history to seed a
 // fresh WS connection's in-memory context (TASKS.md T20), or nil for a
 // conversation with nothing saved yet — a brand-new "new chat" id and a
-// foreign id both resolve the same way, via RLS filtering fetchRecentMessages
-// down to zero rows. Capped at maxSeededMessages rather than
+// foreign id both resolve the same way, via fetchRecentMessages' explicit
+// join and RLS both independently filtering down to zero rows. Capped at
+// maxSeededMessages rather than
 // maxStoredHistoryMessages: this load has two consumers with different
 // appetites — windowHistory trims the text it forwards to the agent, and
 // shownFromHistory wants every stored title_ref it can get — so the cap is
@@ -177,7 +186,7 @@ func loadConversation(db *pgxpool.Pool) func(ctx context.Context, userID, conver
 		var history []historyTurn
 		err := withUser(ctx, db, userID, func(tx pgx.Tx) error {
 			var err error
-			history, err = fetchRecentMessages(ctx, tx, conversationID, maxSeededMessages)
+			history, err = fetchRecentMessages(ctx, tx, userID, conversationID, maxSeededMessages)
 			return err
 		})
 		return history, err
@@ -188,25 +197,27 @@ func loadConversation(db *pgxpool.Pool) func(ctx context.Context, userID, conver
 // completed exchanges for GET /api/chat/history/{conversationID}, and also
 // reports whether the conversation exists at all from this caller's point of
 // view. A foreign id and a genuinely nonexistent one are indistinguishable
-// here on purpose — conversation_isolation's RLS policy
-// (20260904191046_conversations.sql) makes another user's row invisible, not
-// merely filtered, the same ambiguity deleteConversationHandler already
-// accepts for the same reason — so exists is false for both, and chatHistory
-// answers both the same way (404) rather than pretending to tell them apart.
+// here on purpose — the explicit user_id filter below and
+// conversation_isolation's RLS policy (20260904191046_conversations.sql)
+// both independently make another user's row invisible, not merely
+// filtered, the same ambiguity deleteConversationHandler already accepts for
+// the same reason — so exists is false for both, and chatHistory answers
+// both the same way (404) rather than pretending to tell them apart.
 func loadConversationTurns(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error) {
 	return func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error) {
 		turns := []conversationTurn{}
 		var exists bool
 		err := withUser(ctx, db, userID, func(tx pgx.Tx) error {
 			if err := tx.QueryRow(ctx,
-				`select exists(select 1 from conversations where id = $1)`, conversationID,
+				`select exists(select 1 from conversations where id = $1 and user_id = $2)`,
+				conversationID, userID,
 			).Scan(&exists); err != nil {
 				return err
 			}
 			if !exists {
 				return nil
 			}
-			flat, err := fetchRecentMessages(ctx, tx, conversationID, maxStoredHistoryMessages)
+			flat, err := fetchRecentMessages(ctx, tx, userID, conversationID, maxStoredHistoryMessages)
 			if err != nil {
 				return err
 			}
@@ -240,14 +251,15 @@ func loadConversationTurns(db *pgxpool.Pool) func(ctx context.Context, userID, c
 // proceeds straight to the messages insert below.
 //
 // A conversationID belonging to another user fails closed, not silently: the
-// conversations insert's DO NOTHING never touches that pre-existing row, but
-// the messages insert immediately after is scoped by message_isolation's
-// `with check` (conversation_id must resolve through a conversations row
-// this session can see) and is rejected — the whole transaction rolls back
-// and this returns an error, same handling as any other database failure. A
-// random client-generated UUID isn't a guessable oracle, and this is a
-// materially different trust profile than turn ids (never persisted, never a
-// primary key elsewhere).
+// conversations insert's DO NOTHING never touches that pre-existing row, and
+// the messages insert immediately after joins through conversations on
+// user_id explicitly (T34) — a foreign id matches no row, inserts nothing,
+// and the RowsAffected check below turns that into errConversationNotWritable
+// rather than a silent no-op. message_isolation's RLS policy stays wired to
+// the same tables as a second, independent layer, not the only one: a random
+// client-generated UUID isn't a guessable oracle, and this is a materially
+// different trust profile than turn ids (never persisted, never a primary
+// key elsewhere).
 func saveMessages(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error) {
 	return func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error) {
 		// jsonb null (via a nil parameter), not the JSON literal "null" — a
@@ -272,15 +284,35 @@ func saveMessages(db *pgxpool.Pool) func(ctx context.Context, userID, conversati
 				return err
 			}
 			created = tag.RowsAffected() > 0
-			_, err = tx.Exec(ctx, `
+
+			msgTag, err := tx.Exec(ctx, `
 				insert into messages (conversation_id, role, content, title_refs)
-				values ($1, 'user', $2, null), ($1, 'assistant', $3, $4)`,
-				conversationID, userText, assistantText, refsJSON)
-			return err
+				select $1, v.role, v.content, v.title_refs
+				from (values ('user', $2::text, null::jsonb), ('assistant', $3::text, $4::jsonb))
+					as v(role, content, title_refs)
+				where exists (select 1 from conversations where id = $1 and user_id = $5)`,
+				conversationID, userText, assistantText, refsJSON, userID)
+			if err != nil {
+				return err
+			}
+			// The exists() guard doesn't vary per row, so this can only ever
+			// insert both rows or neither.
+			if msgTag.RowsAffected() == 0 {
+				return errConversationNotWritable
+			}
+			return nil
 		})
 		return created, err
 	}
 }
+
+// errConversationNotWritable is saveMessages' own signal that conversationID
+// doesn't belong to this caller — the explicit join finding no matching row,
+// independent of RLS. chat.go's finishTurn treats this the same as
+// isRLSRejection (main.go): the one persist failure that must reach the
+// browser rather than stay a silent log (T32/DECISIONS.md: "always a
+// terminal frame").
+var errConversationNotWritable = errors.New("conversation does not belong to the caller")
 
 // conversationSummary is one entry of GET /api/conversations — enough for the
 // sidebar to list and link to a conversation without its message history.
