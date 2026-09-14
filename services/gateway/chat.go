@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -295,6 +296,17 @@ type inboundMessage struct {
 	Providers []int `json:"providers,omitempty"`
 }
 
+// maxMessageLength bounds one chat message's text, in runes (counted via
+// utf8.RuneCountInString, which walks the UTF-8 bytes without allocating a
+// []rune copy just to measure it) — so a multi-byte character is never
+// split. Comfortably under the 32 KiB default per-frame read limit
+// coder/websocket enforces, even once the rest of the envelope and a
+// guest's providers list are added — the point is for this check to fire
+// first, with a clear message, rather than the raw frame ever getting big
+// enough to trip the wire limit and silently kill the whole connection
+// (web/src/lib/chat-socket.ts's MAX_MESSAGE_LENGTH mirrors this).
+const maxMessageLength = 4000
+
 // outboundEvent is the gateway's curated, public vocabulary — never the
 // agent's internal event shape. See chat.go's translation in runTurn and
 // agent/chat.py's module docstring on why the two protocols differ.
@@ -406,7 +418,10 @@ const maxSeededMessages = 20
 // widening (catalog_tool.py's LADDER_BUDGET_SECONDS), but not the first
 // TMDB call of a search, so this still has to catch a stuck one. Generous
 // relative to the documented 4-8s normal case.
-const turnDeadline = 30 * time.Second
+//
+// A var, not a const, so a test can shorten it without a real 30s wait —
+// same reasoning as chatTicketTTL above.
+var turnDeadline = 30 * time.Second
 
 // Comfortably inside the 60s idle timeout common to proxies and load
 // balancers, so a socket between turns is never quiet long enough to be
@@ -668,9 +683,9 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 			// fired, so a save derived from it would fail immediately. ctx
 			// itself (not Background()) for the event context: finishTurn's
 			// WS send must see this connection's own context as already
-			// done, or sendEvent's cancellation guard would fire a stale
-			// conversation_created down a socket that's already being torn
-			// down by this same shutdown.
+			// done, or sendTerminalEvent's cancellation guard would fire a
+			// stale conversation_created down a socket that's already being
+			// torn down by this same shutdown.
 			for {
 				select {
 				case rec := <-done:
@@ -708,6 +723,24 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 			}
 			switch msg.Type {
 			case "message":
+				// msg.Turn is the sole correlation key between this dispatch
+				// and its `done` record (see the "done" case's currentTurn
+				// match) — but "" doubles as runChatConnection's own "no
+				// turn active" sentinel, so letting it through as a real
+				// turn id is what let a duplicate empty Turn panic the
+				// "done" case on a nil cancelCurrent (T32). Rejecting only
+				// emptiness, not requiring any particular shape: unlike
+				// conversationID below, turn is never used as a database
+				// key or parsed as a uuid anywhere, only echoed back on the
+				// wire and compared by Go string equality.
+				if msg.Turn == "" {
+					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
+					continue
+				}
+				if utf8.RuneCountInString(msg.Text) > maxMessageLength {
+					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: "That message is too long — try something shorter."})
+					continue
+				}
 				parsedConv, err := uuid.Parse(msg.Conversation)
 				if err != nil {
 					// Malformed frame — every real client always supplies a
@@ -718,7 +751,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 					// route param — now also checked server-side before
 					// ChatPanel ever mounts, but this is defence in depth,
 					// not the only guard.
-					h.sendEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
+					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
 					continue
 				}
 				// Canonicalized once, here, and used for every reference to
@@ -741,7 +774,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				var providers []int
 				if guest {
 					if !validGuestProviders(msg.Providers) {
-						h.sendEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
+						h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
 						continue
 					}
 					// Only a turn that can reach the model counts: with no
@@ -752,7 +785,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 					// or at the model still spent a slot; a reload resets it.
 					if len(msg.Providers) > 0 {
 						if guestTurns >= h.guestTurnCap {
-							h.sendEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: guestTurnCapText})
+							h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: guestTurnCapText})
 							continue
 						}
 						guestTurns++
@@ -762,7 +795,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 						history = guestHistory
 					}
 				} else if len(msg.Providers) > 0 {
-					h.sendEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
+					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
 					continue
 				}
 
@@ -836,7 +869,16 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 
 		case rec := <-done:
 			outstanding--
-			if rec.turn == currentTurn {
+			// cancelCurrent != nil is defence in depth, not load-bearing:
+			// the "message" case's emptiness check above already keeps
+			// msg.Turn from ever colliding with currentTurn's own "no turn
+			// active" sentinel, which is what let two done-records both
+			// match a stale currentTurn == "" and the second one panic here
+			// on an already-nilled cancelCurrent (T32). Turn-id uniqueness
+			// beyond non-emptiness is still just client convention (every
+			// real client mints a fresh crypto.randomUUID() per message —
+			// web/src/lib/chat-socket.ts), not enforced here.
+			if rec.turn == currentTurn && cancelCurrent != nil {
 				// Release turnDeadline's timer now rather than letting it
 				// idle until it fires on its own — same reason the
 				// "message" and "cancel" cases above call this eagerly.
@@ -864,13 +906,14 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 // smaller captured generation than the current one.
 //
 // Takes two contexts, same split as runTurn's turnCtx/connCtx: dbCtx governs
-// the save to the database, and eventCtx gates the "conversation_created"
-// send via sendEvent's own cancellation guard. They're the same context at
-// every call site except runChatConnection's shutdown drain, where dbCtx is
-// context.Background() (ctx has already fired, so a save derived from it
+// the save to the database, and eventCtx gates every sendTerminalEvent call
+// below (the "conversation_created" confirmation and the RLS-rejection
+// error) via writeEvent's own cancellation guard. They're the same context
+// at every call site except runChatConnection's shutdown drain, where dbCtx
+// is context.Background() (ctx has already fired, so a save derived from it
 // would fail immediately) but eventCtx stays ctx — deliberately already
-// Done, so sendEvent's guard skips writing a stale event down a connection
-// that's already being torn down by that same shutdown.
+// Done, so that guard skips writing a stale event down a connection that's
+// already being torn down by that same shutdown.
 func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec turnRecord, conn *websocket.Conn) {
 	if !rec.ok {
 		return
@@ -886,11 +929,26 @@ func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec
 	created, err := h.saveMessages(saveCtx, userID, rec.conversation, rec.userText, rec.assistantText, rec.titleRefs)
 	cancel()
 	if err != nil {
-		// Logged, not shown to the browser: what the user already saw
-		// stays on screen. The next message on this conversation
-		// self-heals through saveMessages' own conflict handling either
-		// way.
+		// Logged either way — an RLS rejection is still worth an operator's
+		// attention (a recurring one could mean a client bug or a race, not
+		// just one unlucky request) — but only a conversation id RLS won't
+		// let this session write into (foreign, or deleted between dispatch
+		// and this persist attempt — see saveMessages' own doc comment on
+		// this exact rejection) also reaches the browser. Every other
+		// persist failure stays a silent log: what the user already saw
+		// stays on screen, and the next message on this conversation
+		// self-heals through saveMessages' own conflict handling. This one
+		// is different — the turn's answer was shown but will never be
+		// saved, and nothing else will ever tell the user that (T32/
+		// DECISIONS.md: "always a terminal frame"). The agent has already
+		// spent its call by the time this is caught; checking ownership
+		// earlier would mean either bypassing RLS or duplicating
+		// saveMessages' own conflict logic ahead of the turn, both bigger
+		// changes than this task takes on.
 		slog.ErrorContext(dbCtx, "message persist failed", "turn", rec.turn, "conversation", rec.conversation, "error", dbError(err))
+		if isRLSRejection(err) {
+			h.sendTerminalEvent(eventCtx, conn, rec.turn, outboundEvent{Type: "error", Text: "This conversation isn't available."})
+		}
 		return
 	}
 	if created {
@@ -905,32 +963,63 @@ func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec
 		// failed messages insert rolls back the whole transaction,
 		// including the conversations insert that set created, so
 		// nothing was actually committed.
-		h.sendEvent(eventCtx, conn, rec.turn, outboundEvent{Type: "conversation_created"})
+		h.sendTerminalEvent(eventCtx, conn, rec.turn, outboundEvent{Type: "conversation_created"})
 	}
 }
 
-// sendEvent writes one curated event down the socket, tagged with turn. It
-// checks turnCtx first so a turn that has been cancelled, superseded, or has
-// timed out never writes a stale event after the fact — see
-// runChatConnection for the full set of reasons turnCtx becomes Done. This
-// check is both necessary and sufficient; no shared "is this still current"
-// state is needed beyond it. conn == nil is a second, defensive guard: the
-// three real call sites always pass a live connection, but finishTurn is
-// also called directly (with no connection) from unit tests, where safety
+// sendProgressEvent writes a progress event (interpreting/results/token),
+// gated on turnCtx: a stale one for a turn that's since been cancelled,
+// superseded, or timed out is correctly dropped. The counterpart to
+// sendTerminalEvent below — see that function's doc comment for why the two
+// must never be interchanged, and never collapsed back into one function
+// taking a plain context.Context.
+func (h *Handler) sendProgressEvent(turnCtx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) bool {
+	return h.writeEvent(turnCtx, conn, turn, ev)
+}
+
+// sendTerminalEvent writes a turn's terminal event — done, error, the
+// runChatConnection-level rejections that end a "message" frame before any
+// turn is even dispatched, and finishTurn's conversation_created/persist-
+// failure events — gated on connCtx, never turnCtx. turnCtx being Done is
+// exactly the situation a terminal frame exists to report, so gating one on
+// turnCtx would silently swallow the very deadline/cancel/supersede signal
+// it's supposed to deliver (T32).
+//
+// Split from sendProgressEvent into two named functions, rather than one
+// sendEvent left to every call site's judgment about which context to pass:
+// both contexts are always in scope wherever a turn is running, so nothing
+// stopped a future call site from copy-pasting the wrong one — which is
+// exactly how this bug happened the first time. Reading "sendTerminalEvent
+// (turnCtx, ...)" at a call site is a visible contradiction in a way
+// "sendEvent(turnCtx, ...)" never was.
+func (h *Handler) sendTerminalEvent(connCtx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) bool {
+	return h.writeEvent(connCtx, conn, turn, ev)
+}
+
+// writeEvent is sendProgressEvent's and sendTerminalEvent's shared
+// implementation. Not called directly by anything else: it takes whichever
+// context its caller decided was correct and enforces nothing about that
+// choice itself, which is exactly why those two functions exist as the
+// named, one-per-meaning callers instead of exposing this directly.
+//
+// Checks ctx first so a write that's no longer wanted never reaches the
+// browser after the fact. conn == nil is a second, defensive guard: the
+// real call sites always pass a live connection, but finishTurn is also
+// called directly (with no connection) from unit tests, where safety
 // shouldn't depend on every test fake correctly returning created == false.
 // Reports whether the event actually reached the browser. Most callers ignore
 // that — a dropped event is already the intended outcome here — but the
 // "results" case needs it: picks the user never saw must not join the
 // already-shown set.
-func (h *Handler) sendEvent(turnCtx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) bool {
-	if turnCtx.Err() != nil || conn == nil {
+func (h *Handler) writeEvent(ctx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) bool {
+	if ctx.Err() != nil || conn == nil {
 		return false
 	}
 	ev.Turn = turn
 	writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := wsjson.Write(writeCtx, conn, ev); err != nil {
-		slog.WarnContext(turnCtx, "chat event write failed", "turn", turn, "error", err.Error())
+		slog.WarnContext(ctx, "chat event write failed", "turn", turn, "error", err.Error())
 		return false
 	}
 	return true
@@ -1001,10 +1090,15 @@ func summarizePicks(picks []agentPick, isLookup bool) string {
 //
 // Takes two contexts: turnCtx governs this turn's own work (cancelled by
 // supersede, explicit cancel, or turnDeadline expiring — see
-// runChatConnection) and gates every write via sendEvent; connCtx governs
-// only the deferred send's escape hatch below, and must never be used for
-// anything else in this function — see that comment for why the
-// distinction matters.
+// runChatConnection) and gates every *progress* write via sendProgressEvent
+// (interpreting/results/token — a stale one for an abnormally-ended turn
+// must still be dropped). connCtx gates the deferred send's escape hatch
+// below and every *terminal* write via sendTerminalEvent (done, error, and
+// the post-loop fallback) — turnCtx being Done is exactly the condition a
+// terminal frame exists to report, so gating those on turnCtx instead is
+// what let a cancelled/superseded/timed-out turn end with no terminal frame
+// at all and the composer stuck disabled (T32). See sendTerminalEvent's own
+// doc comment for the same split from the other side.
 func (h *Handler) runTurn(
 	turnCtx context.Context,
 	connCtx context.Context,
@@ -1048,11 +1142,10 @@ func (h *Handler) runTurn(
 		chatCtx, err = h.loadChatCtx(turnCtx, userID)
 	}
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return
+		if !errors.Is(err, context.Canceled) {
+			slog.ErrorContext(turnCtx, "chat context load failed", "turn", turnID, "error", dbError(err))
 		}
-		slog.ErrorContext(turnCtx, "chat context load failed", "turn", turnID, "error", dbError(err))
-		h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
+		h.sendTerminalEvent(connCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
 		return
 	}
 
@@ -1077,11 +1170,10 @@ func (h *Handler) runTurn(
 	if userID != "" && len(chatCtx.Providers) > 0 {
 		verdicts, err = h.loadVerdicts(turnCtx, userID)
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
+			if !errors.Is(err, context.Canceled) {
+				slog.ErrorContext(turnCtx, "chat verdict load failed", "turn", turnID, "error", dbError(err))
 			}
-			slog.ErrorContext(turnCtx, "chat verdict load failed", "turn", turnID, "error", dbError(err))
-			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
+			h.sendTerminalEvent(connCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
 			return
 		}
 	}
@@ -1096,29 +1188,62 @@ func (h *Handler) runTurn(
 		Shown:              shown,
 	})
 	if err != nil {
+		// Unlike the two blocks above, this one still has to pick between
+		// two different texts: agentUnavailableText specifically blames the
+		// model for a genuine call failure, which would be a wrong (and
+		// user-visible) accusation for an ordinary cancel/supersede/timeout,
+		// so that case falls back to the same genericErrorText the other
+		// blocks use unconditionally.
+		// errText, not text: this function's text parameter is the user's
+		// own chat message, still referenced elsewhere below — reusing that
+		// name here for an unrelated error string would shadow it for the
+		// rest of this block.
+		errText := agentUnavailableText
 		if errors.Is(err, context.Canceled) {
-			return
+			errText = genericErrorText
+		} else {
+			slog.ErrorContext(turnCtx, "agent call failed", "turn", turnID, "error", err.Error())
 		}
-		slog.ErrorContext(turnCtx, "agent call failed", "turn", turnID, "error", err.Error())
-		h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "error", Text: agentUnavailableText})
+		h.sendTerminalEvent(connCtx, conn, turnID, outboundEvent{Type: "error", Text: errText})
 		return
 	}
 
+	// turnCtx.Err() is checked inside each *progress* case below, never once
+	// before the switch: the events channel is unbuffered, so the agent's
+	// own producer goroutine (newAgentCaller) races an identical
+	// `select { case events <- ev: case <-turnCtx.Done(): }` against this
+	// receive — a legitimate "results"/"message" can already be off the
+	// channel and in `ev` by the time turnCtx fires, in which case this
+	// still drops it via `continue`, same as before. What this restructuring
+	// actually fixes is "done"/"error": moving the check off the shared
+	// pre-switch position means those two cases no longer check turnCtx at
+	// all, so the one event that's *supposed* to end the turn can never be
+	// discarded by this race — only a still-narrower loss of a "results"/
+	// "message" event immediately preceding a "done" remains possible, and
+	// even then the turn still ends with a correct terminal frame, just with
+	// rec.ok left false. "error" and "done" gate on connCtx and return, so
+	// they report correctly regardless of turnCtx's state. If turnCtx fires
+	// before the agent's HTTP call notices, that call's own context
+	// cancellation closes `events` on its own (newAgentCaller), which the
+	// post-loop fallback below already handles.
 	for ev := range events {
-		if turnCtx.Err() != nil {
-			return
-		}
 		switch ev.Type {
 		case "intent":
+			if turnCtx.Err() != nil {
+				continue
+			}
 			var intent agentIntent
 			if err := json.Unmarshal(ev.Intent, &intent); err == nil {
 				line := interpretingLine(intent, chatCtx.ProviderNames)
-				h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "interpreting", Text: line})
+				h.sendProgressEvent(turnCtx, conn, turnID, outboundEvent{Type: "interpreting", Text: line})
 			} else {
 				slog.WarnContext(turnCtx, "chat intent decode failed", "turn", turnID, "error", err.Error())
 			}
 		case "results":
-			rendered := h.sendEvent(turnCtx, conn, turnID, outboundEvent{
+			if turnCtx.Err() != nil {
+				continue
+			}
+			rendered := h.sendProgressEvent(turnCtx, conn, turnID, outboundEvent{
 				Type: "results", Picks: ev.Picks, Relaxed: ev.Relaxed, Note: ev.Note,
 			})
 			// Guarded on a non-empty summary, not unconditional like
@@ -1145,7 +1270,10 @@ func (h *Handler) runTurn(
 				rec.countsAsShown = rendered && ev.Kind != "lookup"
 			}
 		case "message":
-			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "token", Text: ev.Text})
+			if turnCtx.Err() != nil {
+				continue
+			}
+			h.sendProgressEvent(turnCtx, conn, turnID, outboundEvent{Type: "token", Text: ev.Text})
 			rec.ok = true
 			rec.userText = text
 			rec.assistantText = ev.Text
@@ -1157,11 +1285,11 @@ func (h *Handler) runTurn(
 			rec.titleRefs = nil
 			rec.countsAsShown = false
 		case "error":
-			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "error", Text: friendlyError(ev.Reason)})
+			h.sendTerminalEvent(connCtx, conn, turnID, outboundEvent{Type: "error", Text: friendlyError(ev.Reason)})
 			rec.ok = false
 			return
 		case "done":
-			h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "done"})
+			h.sendTerminalEvent(connCtx, conn, turnID, outboundEvent{Type: "done"})
 			return
 		default:
 			slog.WarnContext(turnCtx, "unknown agent event type", "turn", turnID, "type", ev.Type)
@@ -1177,8 +1305,12 @@ func (h *Handler) runTurn(
 	// "message" event in this same stream — that's left as-is, not reset:
 	// what the user already saw stays what the user saw (DECISIONS.md:
 	// "stored history must match what the user saw"), this fallback only
-	// adds the missing "and it didn't finish cleanly" signal on top.
-	h.sendEvent(turnCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
+	// adds the missing "and it didn't finish cleanly" signal on top. connCtx,
+	// not turnCtx: this is exactly the 30s turnDeadline-expiry path T32
+	// exists to fix — turnCtx is reliably Done by the time this line runs,
+	// so gating on it would silently drop the one event this fallback exists
+	// to send.
+	h.sendTerminalEvent(connCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
 }
 
 // interpretingLine is templated from the agent's DiscoverIntent, never a
