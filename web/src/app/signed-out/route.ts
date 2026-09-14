@@ -1,6 +1,5 @@
-import { NextResponse, type NextRequest } from "next/server"
-
 import { GUEST_PROVIDERS_COOKIE } from "@/lib/guest"
+import { redirectTo } from "@/lib/redirect"
 
 // The counterpart to /signed-in (user-menu.tsx's signOut lands here). Clearing
 // the guest cookie is the whole job, and it needs a Route Handler for the same
@@ -13,8 +12,8 @@ import { GUEST_PROVIDERS_COOKIE } from "@/lib/guest"
 // wall, and chat/layout.tsx now lets a guest with nothing picked straight
 // through. Signing out drops you into the product, signed out — not onto the
 // onboarding picker, which read as though the account had been wiped.
-export async function GET(request: NextRequest) {
-  const res = NextResponse.redirect(new URL("/chat", request.nextUrl))
+export async function GET() {
+  const res = redirectTo("/chat")
   res.cookies.delete(GUEST_PROVIDERS_COOKIE)
   return res
 }

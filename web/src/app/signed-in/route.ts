@@ -1,11 +1,12 @@
 import { auth } from "@clerk/nextjs/server"
-import { NextResponse, type NextRequest } from "next/server"
+import type { NextRequest } from "next/server"
 
 import {
   GUEST_PROVIDERS_COOKIE,
   readGuestProviders,
   safeNext,
 } from "@/lib/guest"
+import { redirectTo } from "@/lib/redirect"
 import { setSubscription } from "@/lib/subscriptions"
 
 // Where every sign-in and sign-up lands (the fallbackRedirectUrl on both
@@ -28,7 +29,7 @@ export async function GET(request: NextRequest) {
     // a cookie still set means picks that were never carried over, and the
     // next person to sign in on this device would inherit them. Losing a
     // guest's own picks beats writing them into someone else's account.
-    const res = NextResponse.redirect(new URL(next, request.nextUrl))
+    const res = redirectTo(next)
     res.cookies.delete(GUEST_PROVIDERS_COOKIE)
     return res
   }
@@ -51,9 +52,7 @@ export async function GET(request: NextRequest) {
   // A partial failure is made visible instead: /onboarding is the picker,
   // account-backed by now, showing exactly which picks landed so the rest
   // can be re-ticked in one screen rather than silently lost or inherited.
-  const res = NextResponse.redirect(
-    new URL(failed.length > 0 ? "/onboarding" : next, request.nextUrl),
-  )
+  const res = redirectTo(failed.length > 0 ? "/onboarding" : next)
   res.cookies.delete(GUEST_PROVIDERS_COOKIE)
   return res
 }
