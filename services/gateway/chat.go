@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/time/rate"
 )
 
 // --- Ticket-based WS auth ---------------------------------------------------
@@ -135,9 +137,13 @@ func (h *Handler) chatTicket(w http.ResponseWriter, r *http.Request) {
 // becomes a different mode; within a connection userID == "" is the guest, and
 // mint above refuses to ever issue that value.
 //
-// No rate limit here, per-IP or global: a model 429 already reaches the user as
-// "try again in a moment" (friendlyError), so throttling would only move the
-// refusal without bounding the shared quota.
+// A per-IP token bucket gates guest "message" frames (TASKS.md T33, via
+// guestRateLimiters below) — it stops one client from being the exhaustion
+// vector, but it does not divide the shared quota fairly among several
+// concurrently active guests, and a model 429 still reaches the user as "try
+// again in a moment" (friendlyError) regardless. It gates a frame on an
+// already-open socket, never the upgrade itself: a browser can't read a
+// rejected upgrade's status, so nothing here refuses a connection.
 
 // Every account is provisioned into users.country's default
 // (20260831230634_streaming.sql), so a guest hard-wired to the same value sees
@@ -160,6 +166,116 @@ const defaultGuestTurnCap = 20
 
 // No number in the copy, so it can't drift from the cap.
 const guestTurnCapText = "You've reached the guest limit for this session — sign in to keep chatting."
+
+// guestRateLimiters is a per-IP token bucket shared by every guest socket
+// from that IP (TASKS.md T33) — deliberately not per-socket, since opening a
+// fresh socket must not hand a client a fresh budget. In-memory and
+// single-instance, same limitation as chatTicketStore.
+//
+// IP extraction (see guestIP below) reads r.RemoteAddr, not
+// X-Forwarded-For: nothing in this repo documents a reverse proxy in front
+// of the gateway (docker-compose.yml exposes it directly), and trusting a
+// client-supplied header with no verified hop in front of it would let any
+// client spoof its way past the limiter entirely. If a trusted proxy is
+// ever placed in front of the gateway, this must switch to reading that
+// proxy's header, or every guest collapses into one shared bucket.
+type guestRateLimiters struct {
+	mu      sync.Mutex
+	limit   rate.Limit
+	burst   int
+	idleTTL time.Duration
+	byIP    map[string]*guestRateLimiterEntry
+}
+
+type guestRateLimiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+// Sized against the shared LLM quota, not one guest's own budget: TASKS.md's
+// "Shared LLM quota" note puts the whole app's Gemini free tier at ~7
+// turns/min (15 req/min, two calls a turn), shared by every guest and
+// account. One IP steady-refilling at 2/min leaves headroom for several
+// concurrently active guests before the app-wide ceiling is reached, while a
+// burst of 3 still covers an opening message plus a couple of quick
+// follow-ups ("show me more") before it throttles.
+var defaultGuestRateLimit = rate.Every(30 * time.Second)
+
+const defaultGuestRateBurst = 3
+
+// Idle IPs are swept so the map can't grow without bound over the process's
+// lifetime — unlike conversationDeletions, which stays unbounded because
+// deletes are low-volume, distinct guest IPs visiting over time are not.
+const defaultGuestLimiterIdleTTL = 30 * time.Minute
+const defaultGuestLimiterSweepInterval = 10 * time.Minute
+
+// No number in the copy, matching guestTurnCapText.
+const guestRateLimitText = "You're sending messages faster than I can keep up — wait a moment and try again."
+
+func newGuestRateLimiters(rootCtx context.Context, limit rate.Limit, burst int, idleTTL, sweepInterval time.Duration) *guestRateLimiters {
+	g := &guestRateLimiters{limit: limit, burst: burst, idleTTL: idleTTL, byIP: make(map[string]*guestRateLimiterEntry)}
+	go g.janitor(rootCtx, sweepInterval)
+	return g
+}
+
+// allow reports whether ip may send now, lazily creating its bucket on first
+// sight. Only the map lookup/creation needs the mutex — *rate.Limiter is
+// already safe for concurrent use, so AllowN() runs outside the lock rather
+// than serializing every guest IP's check behind one. AllowN(now, 1) rather
+// than Allow(), so lastSeen and the token check read the same instant
+// instead of two separate calls to time.Now().
+func (g *guestRateLimiters) allow(ip string) bool {
+	now := time.Now()
+	g.mu.Lock()
+	entry, ok := g.byIP[ip]
+	if !ok {
+		entry = &guestRateLimiterEntry{limiter: rate.NewLimiter(g.limit, g.burst)}
+		g.byIP[ip] = entry
+	}
+	entry.lastSeen = now
+	limiter := entry.limiter
+	g.mu.Unlock()
+	return limiter.AllowN(now, 1)
+}
+
+// sweep evicts entries idle past idleTTL, as of now — a parameter rather
+// than time.Now() so a test can drive it without a real wait.
+func (g *guestRateLimiters) sweep(now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for ip, entry := range g.byIP {
+		if now.Sub(entry.lastSeen) > g.idleTTL {
+			delete(g.byIP, ip)
+		}
+	}
+}
+
+func (g *guestRateLimiters) janitor(rootCtx context.Context, sweepInterval time.Duration) {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-rootCtx.Done():
+			return
+		case now := <-ticker.C:
+			g.sweep(now)
+		}
+	}
+}
+
+// guestIP extracts the caller's address for guestRateLimiters. See that
+// type's doc comment for why this trusts RemoteAddr and not a header.
+func guestIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// Not expected on a direct connection (see the doc comment above) —
+		// logged because the fallback silently collapses every guest hitting
+		// it into one shared bucket, which would otherwise be invisible.
+		slog.WarnContext(r.Context(), "guest IP parse failed", "remoteAddr", r.RemoteAddr, "error", err.Error())
+		return r.RemoteAddr
+	}
+	return host
+}
 
 // validGuestProviders rejects a frame whose providers list can't have come
 // from the picker — a set of switches, so no duplicates, and the same
@@ -513,6 +629,10 @@ func (h *Handler) chatWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before Accept: guestIP logs against r.Context() on its error path, and
+	// that context is unreliable once Accept returns (see the comment below).
+	ip := guestIP(r)
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns: h.originPatterns,
 	})
@@ -530,7 +650,7 @@ func (h *Handler) chatWS(w http.ResponseWriter, r *http.Request) {
 	connCtx, cancel := context.WithCancel(h.rootCtx)
 	defer cancel()
 
-	h.runChatConnection(connCtx, conn, userID)
+	h.runChatConnection(connCtx, conn, userID, ip)
 }
 
 // runChatConnection is the single coordinator for one connection: it alone
@@ -540,7 +660,7 @@ func (h *Handler) chatWS(w http.ResponseWriter, r *http.Request) {
 // `done` — writes to conn are safe from multiple goroutines (coder/websocket
 // handles that internally), but only one goroutine may ever call Read, which
 // is why the read loop is separate and singular.
-func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, userID string) {
+func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, userID, guestIPAddr string) {
 	guest := userID == ""
 
 	// Keepalive. A chat socket is idle between turns for as long as the user
@@ -784,8 +904,14 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 					// Counts attempts, not answers: a turn that fails before
 					// or at the model still spent a slot; a reload resets it.
 					if len(msg.Providers) > 0 {
+						// Cap first — a free per-socket check — so an
+						// already-capped socket never spends a shared token.
 						if guestTurns >= h.guestTurnCap {
 							h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: guestTurnCapText})
+							continue
+						}
+						if !h.guestLimiters.allow(guestIPAddr) {
+							h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: guestRateLimitText})
 							continue
 						}
 						guestTurns++
