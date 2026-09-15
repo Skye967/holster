@@ -12,45 +12,37 @@ Two model calls around one deterministic TMDB step, never an agent loop:
 
 This is structurally two calls, not a style choice: rank() must condition on
 the real candidates discover() returns, which do not exist until interpret()'s
-output has been used to call TMDB. A single call cannot see results it has not
-yet triggered. (On an empty result, this TMDB step retries with progressively
-fewer soft constraints — see search().)
+output has been used to call TMDB. (Below the result floor — see
+``RESULT_FLOOR`` — the TMDB step retries with progressively fewer soft
+constraints; see search().)
 
 A message naming a film or show takes a shorter path — interpret() sets
 DiscoverIntent.title, and search() answers with the titles carrying that name
 rather than a discover() query, one model call instead of two (see
 lookup_title()).
 
-Both steps read untrusted text — the user's message and, in TMDB's overviews,
-third-party-editable text anyone can put a hostile instruction in (see
-ARCHITECTURE.md) — but the two calls differ in blast radius, not exposure.
-interpret()'s output mostly populates tmdb.discover()'s already-typed,
-already-validated parameter surface (Literals, and bounds on ``limit``,
-runtime, and year), so a manipulated message can at most produce a
-weird-but-valid catalog query. rank()'s output schema carries no title
-metadata at all — only a selected id and a one-line blurb — so a manipulated
-overview can at most win a bad blurb, never assert a fake title, year, or
-availability.
-
+Both steps read text anyone can edit — the user's message, and the overviews
+TMDB lets third parties write — but they differ in blast radius. interpret()'s
+output populates tmdb.discover()'s already-typed parameter surface (Literals,
+and bounds on ``limit``, runtime, and year), so a manipulated message can at
+most produce a weird-but-valid query. rank()'s output schema carries no title
+metadata — only a selected id and a blurb — so a manipulated overview can win
+a bad blurb, never assert a fake title, year, or availability.
 ``title`` is the one field that is free text rather than a bounded parameter:
 it reaches TMDB as a ``query`` term, the same way the model's cast, crew and
-keyword names already do (tmdb.py's _resolve_name). What bounds it is not its
-type but its destination and its result — the endpoint is a literal, and every
-card that comes back is a real TMDB row fetched by id. Note that rank()'s
-id-validation, the enforcement point described below, does not apply on that
-path, because rank() never runs there; the equivalent guarantee is that
-lookup_title only ever enriches rows TMDB itself returned.
+keyword names already do. What bounds it is not its type but its destination —
+the endpoint is a literal and every card is a real TMDB row fetched by id. rank()'s
+id-validation doesn't apply on that path since rank() never runs there;
+lookup_title() only ever enriches rows TMDB returned.
 
-watch_region and watch_providers are not fields the model can set anywhere in
-this module. They are ordinary keyword arguments to search(), supplied by the
-caller from the user's real subscriptions and country. That is what makes
-"results only include services the user ticked" a code guarantee rather than
-a prompt hope.
+watch_region and watch_providers are keyword arguments to search(), never
+fields the model can set — that is what makes "results only include services
+the user ticked" a code guarantee rather than a prompt hope.
 
-LangChain is confined to google_interpreter()/google_ranker() at the
-bottom of this file. Everything else depends on the plain Interpreter/Ranker
-callables — the same dependency-injection shape as TMDBClient's ``transport``
-seam — so tests fake an async function, not a framework.
+LangChain is confined to google_interpreter()/google_ranker() at the bottom of
+this file; everything else takes the plain Interpreter/Ranker callables — the
+same dependency-injection shape as TMDBClient's ``transport`` seam — so tests
+fake an async function, not a framework.
 """
 
 from __future__ import annotations
@@ -93,11 +85,11 @@ class DiscoverIntent(BaseModel):
     """interpret()'s output — tmdb.discover()'s creative parameters, none of
     its identity parameters, plus three fields that aren't discover()
     parameters at all: is_capability_question and clarifying_question,
-    search()'s signal to skip discover()/rank() entirely (TASKS.md T16.5),
-    and title, its signal to look one named title up instead (TASKS.md T27).
+    search()'s signal to skip discover()/rank() entirely,
+    and title, its signal to look one named title up instead.
     watch_region and watch_providers are deliberately absent: the model must
     never be able to choose which streaming services results come from
-    (TASKS.md T13, CLAUDE.md)."""
+    (CLAUDE.md)."""
 
     media_type: MediaType = Field(description="'movie' for films, 'tv' for series.")
     is_capability_question: bool = Field(
@@ -273,12 +265,11 @@ class CatalogToolError(Exception):
 
 
 # The soft constraints search() can drop, in the order it drops them, when a
-# query returns fewer than RESULT_FLOOR. watch_region, watch_providers,
-# media_type and every exclusion are never in this list — the services a user
-# ticked never bend (TASKS.md T13.5) — and neither are cast and crew: a named
-# person is the request itself, not a filter on it, so padding two genuine
-# matches with three unrelated films buys a count and loses the answer
-# (TASKS.md T30).
+# query comes back under the result floor (see RESULT_FLOOR). watch_region,
+# watch_providers, media_type and every exclusion are never in this list — the
+# services a user ticked never bend — and neither are cast and
+# crew: a named person is the request itself, not a filter on it, so padding two
+# genuine matches with three unrelated films buys a count and loses the answer.
 #
 # "rating" is last on purpose: it drops the rating sort, and with it the 1000-vote
 # floor that sort carries, so its rows are less confidently rated than rung 0's.
@@ -290,8 +281,11 @@ RelaxedConstraint = Literal["keywords", "runtime", "year", "genres", "rating"]
 # is the weaker target that fires the ladder and tops the picks up. An explicit
 # count in the message still wins downward, via min(RESULT_FLOOR, limit) — a
 # "just one" request must not fire a rung hunting for five. It cannot win
-# upward: ten is the most a turn shows (TASKS.md T30), which is why
+# upward: ten is the most a turn shows, which is why
 # DiscoverIntent.limit's own description says so.
+#
+# services/gateway sizes maxSeededMessages off the floor and maxShownRefs off the
+# ceiling (chat.go), so changing either here is a change there too.
 RESULT_FLOOR = 5
 RESULT_CEILING = 10
 
@@ -302,7 +296,7 @@ RESULT_CEILING = 10
 # dropped a year the user had actually typed. The loop stops the moment the
 # ceiling is met or TMDB runs out, so a fresh query still costs one page.
 # maxShownRefs must stay below what this reaches or an exhausted-looking query
-# isn't one; both sides guard it (TestShownWindowStaysShorterThanTheAgentsPagingReach).
+# isn't one.
 MAX_DISCOVER_PAGES = 4
 
 # Which path search() took. Set where the branch is actually taken, not
@@ -469,7 +463,7 @@ async def _safe_availability(
     distinct from that — see _enrich_pick for why the distinction matters.
 
     Takes media_type/tmdb_id directly, not a Title, so a caller that hasn't
-    resolved a Title yet (enrich_known_title, T18.5) can still run this
+    resolved a Title yet (enrich_known_title) can still run this
     concurrently with the lookup that would produce one."""
     return await _safe(
         client.watch_providers(
@@ -488,14 +482,14 @@ def _merge_enrichment(
     blurb: str,
 ) -> dict[str, Any]:
     """The dict-merge step shared by _enrich_pick (discover()'s picks) and
-    enrich_known_title (a watchlist's already-known ids, T18.5) — same
+    enrich_known_title (a watchlist's already-known ids) — same
     fields, same availability-filtered-to-`wanted` and None-vs-[] rules
     either way. available_on is filtered to `wanted` (the caller's own
     subscriptions) here, not upstream: discover()'s own provider filter only
     guarantees a title is on *at least one* of the caller's services,
     watch_providers() returns every flatrate provider for the title — this
     filter is the actual enforcement point for "never a service the user
-    doesn't have" (TASKS.md T16). available_on is None, not [], when the
+    doesn't have". available_on is None, not [], when the
     availability check itself failed (see _safe_availability) — a TMDB
     hiccup must never make an available title read as confirmed-unavailable.
     """
@@ -543,8 +537,8 @@ async def _safe_title_with_details(
     (title_with_details() returning None because TMDB has no page for this
     id) and a transient TMDBError/TMDBUnavailable both collapse to this same
     None: the caller (enrich_known_title) can't tell "gone" from "TMDB is
-    down" from this alone, and per TASKS.md's "degrade rather than fail
-    wherever there is stored data," doesn't need to — either way the saved
+    down" from this alone and doesn't need to: stored data degrades rather
+    than fails (ARCHITECTURE.md's Failure rules) — either way the saved
     title still has to show up with a way to remove it, not vanish.
     _one_taste_line is a second caller, for the same reason."""
     return await _safe(
@@ -584,13 +578,13 @@ async def enrich_known_title(
     tmdb_id: int,
 ) -> dict[str, Any]:
     """The by-id counterpart to _enrich_pick, for a title_verdicts row
-    (TASKS.md T18.5) rather than a discover()/rank() candidate — no
+    rather than a discover()/rank() candidate — no
     interpret_model/rank_model, no LLM call, just TMDB lookups run fresh
     every time.
 
     Never raises and never returns None: title_verdicts is stored data, so
-    a saved title always appears in the result (TASKS.md's cross-cutting
-    "degrade rather than fail wherever there is stored data" rule) — when
+    a saved title always appears in the result — stored data degrades rather
+    than fails (ARCHITECTURE.md's Failure rules) — when
     the base lookup fails or the id no longer resolves on TMDB, the result
     still carries every key a resolved pick does (_UNAVAILABLE_PLACEHOLDER),
     enough for the caller to render a minimal row with a working remove
@@ -732,7 +726,7 @@ async def lookup_title(
     watch_providers: list[int],
 ) -> list[dict[str, Any]]:
     """Answer about a named film or show — search()'s other path, taken when
-    interpret() sets ``intent.title`` (TASKS.md T27).
+    interpret() sets ``intent.title``.
 
     Selection is _matching_titles() for *which* rows carry the name, then one
     judgement here: of those, keep the ones prominent enough to believe.
@@ -760,9 +754,8 @@ async def lookup_title(
       as "nothing matched", which is a different claim. Availability is
       applied downstream instead, by _enrich_pick's own filter, so an
       unavailable title comes back as a real card whose available_on is empty
-      — which the UI renders as "Not on your services". TASKS.md T13's
-      invariant is untouched: that filter is still the only thing deciding
-      what available_on may name.
+      — which the UI renders as "Not on your services". That filter is still
+      the only thing deciding what available_on may name.
     - **No verdict exclusion.** search() drops candidates the user has already
       judged, because a recommendation should not repeat them. A question
       about a named title is not a recommendation — "is Heat on my services"
@@ -801,7 +794,7 @@ async def lookup_title(
 
 class TitleRef(BaseModel):
     """One title_verdicts row's identity — the /titles request's per-item
-    shape (TASKS.md T18.5). TitleVerdict is the /chat counterpart; it is flat
+    shape. TitleVerdict is the /chat counterpart; it is flat
     rather than a subclass so a TitleVerdict cannot satisfy
     TitlesRequest.items."""
 
@@ -810,7 +803,7 @@ class TitleRef(BaseModel):
 
 
 class TitleVerdict(BaseModel):
-    """One title_verdicts row as /chat receives it (TASKS.md T19) — the
+    """One title_verdicts row as /chat receives it — the
     gateway's Verdict struct (services/gateway/verdicts.go), field for field.
 
     verdict is a plain str, not a Literal, while media_type is a Literal:
@@ -844,8 +837,8 @@ async def enrich_watchlist(
     items: list[TitleRef],
 ) -> list[dict[str, Any]]:
     """Batched enrich_known_title, one item per gather_all task — same
-    concurrent fan-out idiom search() uses per pick (TASKS.md T18.5's read
-    path). Unlike search(), never short-circuits on empty watch_providers: a
+    concurrent fan-out idiom search() uses per pick. Unlike search(), this
+    never short-circuits on empty watch_providers: a
     saved title with no ticked services still needs "Not on your services"
     to render as live truth, which is different information than "nothing
     to search for." enrich_known_title never raises, so a single item's
@@ -918,7 +911,7 @@ async def _one_taste_line(client: TMDBClient, v: TitleVerdict) -> str | None:
 async def _resolve_taste(client: TMDBClient, liked: list[TitleVerdict]) -> list[str]:
     """Describe the caller's liked titles for rank(). title_verdicts stores
     only ids, so the names have to come from TMDB — the agent still reads
-    nothing it was not handed (TASKS.md T19); it was handed the ids.
+    nothing it was not handed; it was handed the ids.
 
     gather_all, not plain asyncio.gather: a homogeneous fan-out, the same
     case enrich_watchlist and search()'s own pick enrichment use.
@@ -940,9 +933,8 @@ TASTE_HEADER = "Previously liked:"
 
 def _with_taste(message: str, taste: list[str]) -> str:
     """Fold the taste hint into the text handed to rank(), mirroring how
-    chat.py's _with_history folds recent turns in — this is now the second
-    such site. Done here rather than by widening the Ranker callable so
-    google_ranker and every test fake stay as they are.
+    chat.py's _with_history folds recent turns in. Done here rather than by
+    widening the Ranker callable, which would reach every implementation.
 
     Prepended, not appended: chat.py may already have shaped `message` to end
     with "Current message: ...", and appending would bury the live request
@@ -963,20 +955,17 @@ def _with_target_count(message: str, *, limit: int, floor: int) -> str:
     back with whatever the model feels like — five picks for "action movies"
     when twenty candidates were available.
 
-    A third folding site, alongside _with_taste here and _with_history in
-    chat.py, for the same reason: the count is per-call, the prompt is static.
-    Appended rather than prepended, so it lands after the user's text and
-    last before google_ranker() adds the candidate list — which does displace
-    _with_history from the spot its own docstring claims. A target, not a
-    guarantee, either way: search() cuts to `limit` and tops up to `floor`
-    whatever comes back.
+    Folded in here rather than put in the prompt because the count is
+    per-call and the prompt is static. Appended, so it lands after the user's
+    text and last before google_ranker() adds the candidate list. A target,
+    not a guarantee: search() cuts to `limit` and tops up to `floor` whatever
+    comes back.
     """
     if limit <= 1:
         return f"{message}\n\nReturn exactly one pick."
     # Unconditional: at floor == limit this reads "Return 3 picks, or fewer
-    # only if fewer than 3 genuinely fit", which is the point — gating it on
-    # floor < limit left those counts with no way to come back short, so a
-    # widened pool answered "3 westerns from 1955" by padding two that weren't.
+    # only if fewer than 3 genuinely fit", which is the point — those counts
+    # still need a way to come back short rather than padding a widened pool.
     ask = f"Return {limit} picks, or fewer only if fewer than {floor} genuinely fit"
     return f"{message}\n\n{ask}."
 
@@ -993,103 +982,76 @@ async def search(
     verdicts: list[TitleVerdict] | None = None,
     shown: list[TitleRef] | None = None,
 ) -> CatalogResult:
-    """The full two-step pipeline. ``watch_region``/``watch_providers`` come
-    only from the caller — the real user's subscriptions and country — and
-    are passed to discover() regardless of anything in ``intent``.
+    """The full two-step pipeline.
+
+    ``watch_region``/``watch_providers`` come only from the caller — the real
+    user's subscriptions and country — and are passed to discover() regardless
+    of anything in ``intent``.
 
     ``on_intent``, if given, is awaited once interpret() resolves and before
     discover()/rank() run — the hook a caller needs to stream an "interpreting"
-    line to the user within ~2s, well before the full pipeline (which can take
-    several TMDB round trips plus rank()) finishes. Optional and additive so
-    every existing caller and test is unaffected.
+    line within ~1-2s, well before the full pipeline (up to nine sequential
+    TMDB calls, plus rank()) finishes. Optional and additive, so every
+    existing caller and test is unaffected.
 
-    ``verdicts`` is the caller's whole title_verdicts set (TASKS.md T19), and
-    this function is where each value's meaning for a recommendation lives —
-    the gateway only reads the rows. It does two things: every verdict but
-    ``want_to_watch`` removes that title from the candidates rank() sees, and
-    ``liked`` titles of this search's media type become a hint prepended to
-    rank()'s message. Exclusion is a set filter, not a prompt instruction, for
-    the same reason rank() validates ids against the candidate list: it has to
-    hold whatever the model does.
+    ``verdicts`` is the caller's whole title_verdicts set, and this function
+    is where each value's meaning for a recommendation lives —
+    the gateway only reads the rows. Every verdict but ``want_to_watch``
+    removes that title from the candidates rank() sees, and ``liked`` titles of
+    this search's media type become a hint prepended to rank()'s message.
+    Exclusion is a set filter, not a prompt instruction, so it holds whatever
+    the model does.
 
     ``shown`` is what the caller has already put on screen in this
-    conversation (TASKS.md T30), and it is excluded from the candidates the
-    same way — unconditionally, including titles marked ``want_to_watch``,
-    which verdicts alone deliberately keep. It is what makes "show me 10 more"
-    mean ten *different* titles. It never reaches ``all_judged``: a query run
-    dry by re-asking is not a query whose every result the user has rated,
-    and saying so would be false. That case is ``all_shown`` instead.
+    conversation, excluded unconditionally — including ``want_to_watch``
+    titles, which verdicts alone keep. It is what makes "show me 10 more" mean
+    ten *different* titles. It never reaches ``all_judged``: a query run dry
+    by re-asking is not a query whose every result the user has rated, and
+    saying so would be false. That case is ``all_shown`` instead.
 
-    When fewer than ``RESULT_FLOOR`` candidates survive exclusion, soft
-    constraints are dropped one rung at a time, in ``RelaxedConstraint``'s own
-    order, and the query retried until the floor is met or the ladder is
-    exhausted. ``CatalogResult.relaxed`` records what was dropped. Services,
-    region, exclusions, cast and crew are never in the ladder; every other
-    rung is guarded on the constraint having actually reached TMDB, and the
-    genres rung additionally on a *resolved* cast/crew — see the rungs
-    themselves for why each.
+    When fewer candidates survive exclusion than the result floor
+    (``min(RESULT_FLOOR, limit)``), soft constraints are dropped one rung at a
+    time — in ``RelaxedConstraint``'s order — and the query retried until the
+    floor is met or the ladder is exhausted, bounded by
+    ``LADDER_BUDGET_SECONDS``. ``CatalogResult.relaxed`` records what was
+    dropped. The user's services, region and exclusions are never in the
+    ladder, and neither are cast and crew: a named person is the request
+    itself, so padding two genuine matches with three unrelated films buys a
+    count and loses the answer.
 
-    Rungs **accumulate**: a wider query's rows are appended to the narrower
-    query's, never substituted for them. Replacing would delete the exact
-    matches a narrow query did find — the three Tom Hanks horror films are not
-    among the twenty most-watched Hanks films — so the user would lose
-    precisely what they asked for in the act of being given more.
-
-    Appending is necessary but not sufficient, because rank() cannot see rungs
-    and may name only widened picks. So every exact candidate is guaranteed a
-    place in the pick list, this function stable-sorts by rung, and only then
-    cuts to ``limit`` — what was asked for leads, the widening follows, and
-    the cut falls on the least exact. Each of the three does something the
-    other two can't: without the guarantee there is nothing exact to order,
-    and cutting in rank()'s own fit order instead (what passing a limit into
-    rank() did) discards exact matches that were present, which is why rank()
-    no longer takes a limit at all.
-
-    Each retry is a full discover() call with its own retry/backoff, and the
-    widening is bounded by ``LADDER_BUDGET_SECONDS`` rather than running to
-    exhaustion: it is reachable from POST /chat under the gateway's 30s
-    turnDeadline, and the worst case is nine discover() calls
-    (``MAX_DISCOVER_PAGES`` pages of the query as asked, then one per rung),
-    each with their own retries. The budget is a deadline around the whole
-    widening, so a call already in flight is cancelled rather than left to
-    finish its own retries; page 1 sits outside it, because that one is the
-    answer rather than the widening. What has accumulated is then the reply,
-    which makes it a real answer rather than a truncated one — the same
-    treatment ``TASTE_TIMEOUT_SECONDS`` gives the taste step. Accumulation
-    also makes the long tail rare — the floor is usually met by the first rung
-    that fires, because one widened page is twenty rows.
+    Rungs accumulate — a wider query's rows are appended to the narrower
+    query's, never substituted for them — so the titles that matched exactly
+    survive being widened past. Surviving is not being picked, though: rank()'s
+    candidate list carries no rung marker, so it can name only widened titles.
+    This function therefore reserves every exact match a place itself,
+    stable-sorts by rung, and only then cuts to ``limit`` — in that order,
+    because cutting in rank()'s own fit order could discard every exact match a
+    widened query found. Accumulation also makes the long tail rare — the
+    floor is usually met by the first rung that fires, because one widened
+    page is twenty rows. (agent/README.md walks the whole ladder.)
 
     Returns a picks-less CatalogResult with ``intent=None``, calling neither
     the model nor TMDB, when ``watch_providers`` is empty: a user with no
-    ticked streaming services can't get results from any, so there is
-    nothing to interpret or search for.
+    ticked streaming services can't get results from any.
 
     Takes a different path entirely when interpret() sets ``intent.title``,
     i.e. the message asks about one film or show by name: neither discover()
-    nor rank() runs, and the answer is that title itself, looked up by name
-    and enriched — see lookup_title() for what that path deliberately does
-    not filter on, and why. ``relaxed`` is empty there because no constraint
-    ladder exists to relax.
+    nor rank() runs, and the answer is that title itself, looked up by name and
+    enriched — see lookup_title(). ``relaxed`` is empty there, no ladder having
+    run.
 
     Also returns picks-less (this time with ``intent`` set) when interpret()
-    flags the message as a capability question rather than a title request
-    (TASKS.md T16.5), or sets ``intent.clarifying_question`` because neither
-    the message nor the conversation so far gives anything to search on —
+    flags the message as a capability question rather than a title request, or
+    sets ``intent.clarifying_question`` because neither the message nor the
+    conversation gives anything to search on.
     discover()/rank() never run either way, and ``on_intent`` never fires,
-    since there is no search to narrate an "interpreting" line for. The
-    caller (chat.py's stream_chat) is the one that turns either case into a
-    reply: what the caller can actually do for a capability question,
-    ``intent.clarifying_question`` itself for the other.
+    there being no search to narrate.
 
-    Raises CatalogToolError if interpret() or rank() fails (a network/API
-    error, or a response that didn't satisfy its schema — see
-    CatalogToolError's docstring for detail). tmdb.TMDBError/TMDBUnavailable
-    propagate unwrapped from the discover step, exactly as calling
-    tmdb.discover() directly would. Not from the taste step: that one goes
-    through _safe_title_with_details and degrades to a missing hint, so TMDB
-    trouble there costs the nudge and never the turn. A bare ValueError means
-    the *caller* passed something invalid (e.g. a malformed watch_region) — a
-    bug to fix, not a case this function handles.
+    Raises CatalogToolError if interpret() or rank() fails.
+    tmdb.TMDBError/TMDBUnavailable propagate unwrapped from the discover step,
+    exactly as calling tmdb.discover() directly would — but not from the taste
+    step, which degrades to a missing hint. A bare ValueError means the
+    *caller* passed something invalid, such as a malformed watch_region.
     """
     if not watch_providers:
         return CatalogResult(intent=None, picks=[], relaxed=[])
@@ -1201,16 +1163,11 @@ async def search(
     # so absorb() can dedupe against them and the filter runs exactly once, on
     # the union, below.
     #
-    # Exclusion-aware on purpose, and this is a reversal. T19.5 kept the count
-    # blind to exclusion so an all-judged page could not be mistaken for
-    # "TMDB returned nothing" and relax constraints unrelated to why it was
-    # empty. Two things changed. A blind count cannot see the case T30 is
-    # about at all — a "show me more" whose whole first page is already shown
-    # sits at zero survivors and would never widen. And a rung that buys
-    # nothing now costs nothing, because rungs accumulate rather than replace,
-    # so the old failure mode is a wasted call rather than a wrong answer.
-    # chat.py still gives all_judged precedence over `relaxed`, so the user is
-    # never told the wrong cause either way.
+    # Exclusion-aware on purpose: a "show me more" whose whole first page is
+    # already shown sits at zero survivors, and a blind count would never widen
+    # for it. A rung that buys nothing costs only a wasted call, since rungs
+    # accumulate rather than replace, and chat.py gives all_judged precedence
+    # over `relaxed`, so the user is never told the wrong cause.
     def surviving() -> int:
         return sum(1 for c in candidates if key(c) not in excluded)
 
@@ -1225,12 +1182,10 @@ async def search(
         return surviving() < floor
 
     def absorb(more: list[Title], rung: int) -> None:
-        """Append a wider query's rows to the narrower query's, deduped.
-
-        Appending rather than replacing is the whole point of the ladder
-        (see this function's docstring): a narrow query's real matches must
-        survive being widened past, or the user loses what they asked for in
-        the act of being given more.
+        """Append a wider query's rows to the narrower query's, deduped —
+        never substitute, or the matches the user actually asked for are lost
+        in the act of being given more. ``rung`` is recorded per title so the
+        sort at the end can put the exact matches back in front.
         """
         for c in more:
             if c["tmdb_id"] in rung_of:
@@ -1240,8 +1195,7 @@ async def search(
 
     # Paging before relaxing, and toward `limit` rather than `floor` — a thin
     # page usually means exclusion ate it, and the answer to that is the next
-    # page of what was asked for, not a wider question (TASKS.md T31). This
-    # also subsumes T19.5's post-ladder top-up, leaving one exclusion pass.
+    # page of what was asked for, not a wider question.
     #
     # Page 1 is read whatever the budget has left: it is the answer, not the
     # widening, so only what follows it is bounded.
@@ -1271,8 +1225,9 @@ async def search(
             # that never happened. Put that cheap guard before thin(), which
             # walks the candidate list. Number the rung `len(relaxed) + 1`, not
             # a literal, so reordering can't duplicate one; rung 0 is the query
-            # as asked. absorb() the rows, never assign them. Rung order and
-            # why each is guarded: TASKS.md T30.
+            # as asked. absorb() the rows, never assign them. Each rung is
+            # guarded on its own constraint having actually reached TMDB, so a
+            # drop that would re-send an identical query never fires.
             keywords_applied = any(client.is_keyword_resolved(k) for k in keywords)
             if keywords_applied and thin():
                 keywords = []
@@ -1295,8 +1250,9 @@ async def search(
             # question; "a horror movie with Hanks" widened to "Hanks films" is the
             # same question asked less narrowly. Keywords above need no such guard
             # because the interpret prompt *infers* them from tone, so dropping one
-            # discards a guess; genres are only ever set when the message names the
-            # genre outright (TASKS.md T30, DECISIONS.md).
+            # discards a guess; the prompt only asks the model to set genres when
+            # the message names one explicitly (DiscoverIntent.genres), so relaxing
+            # one discards a stated fact, not a guess.
             #
             # Resolved, not merely named: _resolve_name drops a person TMDB can't find,
             # so a typo'd name would widen "a horror movie with <typo>" to "any movie"
@@ -1354,9 +1310,7 @@ async def search(
         )
 
     # One exclusion pass, at the end, over everything every page and rung
-    # brought back. The paging loop above is why this can be a single pass:
-    # the old top-up ran after the ladder and had to re-derive both flags from
-    # its extra page.
+    # brought back.
     before_exclusion = len(candidates)
     not_judged = [c for c in candidates if key(c) not in judged]
     candidates = [c for c in candidates if key(c) not in excluded]
@@ -1398,7 +1352,7 @@ async def search(
     # An exact candidate is admitted whether or not the floor is already met,
     # which is what holds the "what was asked for leads" promise: rank() cannot
     # see rungs, so on a widened query it can name ten widened picks and never
-    # mention the three that matched (TASKS.md T30).
+    # mention the three that matched.
     #
     # It cannot crowd the list out: a rung only fires below `floor`, so a
     # non-empty `relaxed` means fewer than `floor` exact survivors. The
@@ -1419,9 +1373,9 @@ async def search(
     # ordering inside each rung and puts the titles that actually matched the
     # request at the head of the carousel, with the widening behind them.
     ranked.sort(key=rung)
-    # Cut last, so it falls on the least exact picks. Cutting before the sort —
-    # what passing a limit into rank() did — cuts in the model's fit order and
-    # can discard every exact match a widened query found.
+    # Cut last, so it falls on the least exact picks: cutting before the sort
+    # would cut in the model's fit order and can discard every exact match a
+    # widened query found.
     del ranked[limit:]
     exact_matches = sum(1 for p in ranked if rung(p) == 0)
     # Built from the filtered list, which is what rank() validated against —

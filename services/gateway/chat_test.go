@@ -28,8 +28,8 @@ import (
 )
 
 // testConversationID is the conversation id most tests below send on every
-// "message" frame — its value is arbitrary (TASKS.md T20.5: conversation ids
-// are client-generated, opaque UUIDs), only used where a test isn't itself
+// "message" frame — its value is arbitrary, conversation ids being
+// client-generated opaque UUIDs, and it is only used where a test isn't itself
 // about multi-conversation behavior.
 const testConversationID = "11111111-1111-1111-1111-111111111111"
 const otherConversationID = "22222222-2222-2222-2222-222222222222"
@@ -300,7 +300,7 @@ func TestParseProviderNamesResolvesOnlyWantedIDsInOrder(t *testing.T) {
 
 // --- agent HTTP streaming client ------------------------------------------
 
-// assertPickEnrichment checks the TASKS.md T16 fields (GenreNames,
+// assertPickEnrichment checks the enrichment fields (GenreNames,
 // RuntimeMinutes, AvailableOn) shared by TestNewAgentCallerStreamsEventsInOrder
 // (real JSON decode) and TestChatTurnStreamsInterpretingResultsAndDone
 // (gateway passthrough) — one helper so a future field change can't
@@ -361,10 +361,11 @@ func TestNewAgentCallerStreamsEventsInOrder(t *testing.T) {
 		}
 	}
 
-	// Real json.Unmarshal, not a struct literal (see TestChatTurnStreamsInterpretingResultsAndDone,
-	// which injects Go values directly and so cannot catch a tag/key mismatch
-	// against agent/chat.py's actual dict keys) — proves the enrichment
-	// fields (TASKS.md T16) really decode from the agent's wire shape.
+	// Real json.Unmarshal, not a struct literal (see
+	// TestChatTurnStreamsInterpretingResultsAndDone, which injects Go values
+	// directly and so cannot catch a tag/key mismatch against agent/chat.py's
+	// actual dict keys) — proves the enrichment fields really decode from the
+	// agent's wire shape.
 	pick := all[1].Picks[0]
 	assertPickEnrichment(t, pick)
 	if len(pick.Cast) != 1 || pick.Cast[0] != "Star" {
@@ -420,8 +421,8 @@ func TestNewAgentCallerStopsOnContextCancel(t *testing.T) {
 // documented behavior in the abstract, since a later refactor of this
 // struct (a custom UnmarshalJSON, an intermediate map, an added omitempty)
 // could silently collapse the one distinction this whole feature exists to
-// preserve (TASKS.md T16: "couldn't check" must never read as "confirmed
-// nowhere the caller subscribes").
+// preserve: "couldn't check" must never read as "confirmed nowhere the
+// caller subscribes".
 func TestAgentPickAvailableOnDistinguishesNullFromEmpty(t *testing.T) {
 	var failed, confirmedEmpty agentPick
 	if err := json.Unmarshal([]byte(`{"available_on":null}`), &failed); err != nil {
@@ -463,8 +464,8 @@ func newChatTestServer(t *testing.T, loadCtx func(context.Context, string) (chat
 	return newChatTestServerWithConversations(t, loadCtx, callAgent, loadVerdicts, noopLoadConversation, noopSaveMessages, opts...)
 }
 
-// newChatTestServerWithConversations is newChatTestServer plus the two T20/
-// T20.5 dependencies, for the tests below that need to fake conversation
+// newChatTestServerWithConversations is newChatTestServer plus the two
+// conversation dependencies, for the tests below that need to fake conversation
 // hydration or observe what gets persisted — every other test goes through
 // the plain wrapper above and gets the default behaviour (no history, saves
 // discarded).
@@ -602,14 +603,14 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 	// Proves only the gateway -> browser leg: fakeAgentEvents injects these
 	// agentPick values directly, with no JSON decode of the agent's own wire
 	// shape involved. TestNewAgentCallerStreamsEventsInOrder is what proves
-	// the enrichment fields (TASKS.md T16) actually decode from real agent
+	// the enrichment fields actually decode from real agent
 	// JSON with the right keys — this just confirms they still reach the
 	// browser once decoded.
 	assertPickEnrichment(t, got[1].Picks[0])
 }
 
 // TestChatTurnSendsProviderNamesToTheAgent proves runTurn forwards
-// chatContext.ProviderNames on to the agent (TASKS.md T16.5) — the same
+// chatContext.ProviderNames on to the agent — the same
 // values TestChatTurnStreamsInterpretingResultsAndDone above already proves
 // reach interpretingLine, reused rather than re-resolved so a
 // capability-question answer can name the caller's services.
@@ -692,7 +693,7 @@ func TestChatCancelStopsTheAgentCall(t *testing.T) {
 	}
 }
 
-// TestChatNewMessageSupersedesTheInFlightTurn also proves T32's fix: a
+// TestChatNewMessageSupersedesTheInFlightTurn also proves a
 // superseded turn is not just cancelled, it sends its own terminal event
 // (never left silently unresolved on the client) — so both t1's error and
 // t2's done must reach the browser, in whichever order the two goroutines
@@ -829,8 +830,8 @@ func TestChatCancelsTurnContextPromptlyOnNormalCompletion(t *testing.T) {
 // An agent stream that ends without ever sending "done" or "error" (a
 // crashed agent process, a dropped connection) must still leave the browser
 // with a terminal event — never hang the turn indefinitely. See runTurn's
-// post-loop fallback and TASKS.md's "a dropped stream ... never just stops
-// mid-sentence looking finished."
+// post-loop fallback: a dropped stream never just stops mid-sentence looking
+// finished (ARCHITECTURE.md's Failure rules).
 func TestChatDroppedAgentStreamStillSendsATerminalEvent(t *testing.T) {
 	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
 		ch := make(chan agentEvent, 1)
@@ -943,7 +944,7 @@ func TestInterpretingLineSurfacesKeywordsExclusionsAndCastCrew(t *testing.T) {
 }
 
 // TestChatTurnSendsVerdictsToTheAgent proves runTurn forwards what
-// loadVerdicts returns on to the agent (TASKS.md T19) — a load of its own,
+// loadVerdicts returns on to the agent — a load of its own,
 // not a field on chatContext, which is why this is the one call site that
 // passes a real loadVerdicts rather than the noop.
 func TestChatTurnSendsVerdictsToTheAgent(t *testing.T) {
@@ -981,9 +982,10 @@ func TestChatTurnSendsVerdictsToTheAgent(t *testing.T) {
 
 // TestChatTurnFailsWhenVerdictsCannotLoad pins the deliberate choice at
 // runTurn's verdict load: fail the turn, never degrade to no verdicts.
-// Degrading would silently put titles the user marked seen back on screen —
-// the one guarantee T19 exists to make — and TASKS.md says outright that the
-// chat cannot degrade. Without this test the fix is a comment: every other
+// Degrading would silently put titles the user marked seen back on screen,
+// breaking the promise that a title marked seen is never suggested again — and
+// the chat is the one surface that cannot degrade. Without this test the
+// fail-the-turn choice is only a comment: every other
 // call site here passes a loadVerdicts that cannot fail, so a later change
 // to the degrade-shape used elsewhere in this codebase would go unnoticed.
 func TestChatTurnFailsWhenVerdictsCannotLoad(t *testing.T) {
@@ -1045,11 +1047,11 @@ func TestChatTurnWithNoSubscriptionsSkipsVerdicts(t *testing.T) {
 	}
 }
 
-// --- T20/T20.5: conversation hydration, switching, and persistence ---------
+// --- conversation hydration, switching, and persistence -------------------
 
 // TestChatConnectionHydratesHistoryFromStoredConversation proves the "message"
 // case in runChatConnection seeds its in-memory history from loadConversation
-// the first time it sees a given conversation id (TASKS.md T20/T20.5) — a
+// the first time it sees a given conversation id — a
 // reload/reconnect that resends its conversation id on the first message
 // carries prior turns into the very first agent call, not just into what the
 // browser re-renders.
@@ -1092,8 +1094,8 @@ func TestChatConnectionHydratesHistoryFromStoredConversation(t *testing.T) {
 
 // TestChatCompletedTurnPersistsViaSaveMessages proves a successfully
 // completed turn calls saveMessages with the conversation id the client sent,
-// the exact text shown, and the title ids from its picks — DECISIONS.md's
-// "clean text and the title IDs shown."
+// the exact text shown, and the title ids from its picks — clean text and the
+// title ids, nothing else.
 func TestChatCompletedTurnPersistsViaSaveMessages(t *testing.T) {
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US", Providers: []int{8}}, nil
@@ -1333,7 +1335,7 @@ func TestChatDisconnectPersistsBothSupersededAndCurrentTurns(t *testing.T) {
 }
 
 // TestChatSwitchingConversationsDoesNotBleedHistoryOrPersistence is the
-// regression guard for T20.5's core hazard: a turn still in flight on one
+// regression guard for the core switching hazard: a turn still in flight on one
 // conversation when the user switches to another must (a) still persist
 // against the conversation it actually ran on, never the one that's current
 // by the time it finishes, and (b) never have its answer merged into the
@@ -1466,7 +1468,7 @@ func TestChatMessageRejectsAMalformedConversationID(t *testing.T) {
 
 // TestChatMessageRejectsAnEmptyTurnID mirrors
 // TestChatMessageRejectsAMalformedConversationID for msg.Turn — the
-// regression guard for T32's nil-cancelCurrent panic, whose root cause was
+// regression guard for the nil-cancelCurrent panic, whose root cause was
 // letting "" (the coordinator's own "no turn active" sentinel) double as a
 // real turn id. Only emptiness is rejected — unlike conversationID, turn is
 // never parsed as a uuid, and the test suite's own convention of plain
@@ -1491,7 +1493,7 @@ func TestChatMessageRejectsAnEmptyTurnID(t *testing.T) {
 	}
 }
 
-// TestChatDuplicateTurnIDsDoNotPanic is the direct regression guard for T32's
+// TestChatDuplicateTurnIDsDoNotPanic is the direct regression guard for the
 // nil-cancelCurrent panic: two "message" frames sharing the same (now
 // UUID-valid) turn id must not crash the connection, even though only the
 // first should ever be "current" by the time the second's done-record
@@ -1552,7 +1554,7 @@ func TestChatOverLongMessageIsRejected(t *testing.T) {
 }
 
 // TestChatTurnDeadlineSendsATerminalErrorEvent is the direct regression test
-// for T32's original bug: a turn that never comes back before turnDeadline
+// for the original bug: a turn that never comes back before turnDeadline
 // must still end with a terminal event, not silence. Shortens the package
 // var so the test doesn't wait a real 30s.
 func TestChatTurnDeadlineSendsATerminalErrorEvent(t *testing.T) {
@@ -1580,7 +1582,7 @@ func TestChatTurnDeadlineSendsATerminalErrorEvent(t *testing.T) {
 }
 
 // TestFinishTurnSurfacesAnRLSViolationAsAVisibleError proves the other half
-// of T32's "foreign conversation id" fix: when saveMessages fails because
+// of the "foreign conversation id" fix: when saveMessages fails because
 // this session's RLS policy rejected the write (SQLSTATE 42501 — a
 // conversation foreign to this caller, or deleted between dispatch and
 // persist), the browser gets a clear, visible error rather than a silent
@@ -1623,7 +1625,7 @@ func TestFinishTurnSurfacesAnRLSViolationAsAVisibleError(t *testing.T) {
 }
 
 // TestFinishTurnSurfacesANotWritableConversationAsAVisibleError proves the
-// T34 path alongside TestFinishTurnSurfacesAnRLSViolationAsAVisibleError:
+// app-level path alongside TestFinishTurnSurfacesAnRLSViolationAsAVisibleError:
 // saveMessages' own explicit ownership check (errConversationNotWritable) is
 // what actually fires for a foreign or deleted conversation id today, and it
 // must reach the browser exactly like the RLS backstop does — logged under a
@@ -1898,7 +1900,7 @@ func TestDeleteConversationTombstoneAppliesRegardlessOfIDCase(t *testing.T) {
 // conversation-history load failure degrades to an empty history window
 // rather than failing the turn outright — history is a nice-to-have for the
 // agent (loadConversation's own contract already treats "nothing saved yet"
-// as a normal nil result), not a hard requirement like T19's verdicts, so a
+// as a normal nil result), not a hard requirement like verdicts, so a
 // transient read error here must not stop the user from getting an answer.
 func TestChatTurnDegradesToEmptyHistoryWhenConversationLoadFails(t *testing.T) {
 	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
@@ -2232,7 +2234,7 @@ func TestFinishTurnSkipsTheWebSocketSendOnceItsEventContextIsDone(t *testing.T) 
 	}
 }
 
-// --- guests (TASKS.md T27) ---------------------------------------------------
+// --- guests ------------------------------------------------------------------
 
 // newGuestTestServer wires a full Handler where every user-scoped dependency
 // fails the test if it is ever called — that, not any single assertion, is
@@ -2593,7 +2595,7 @@ func TestGuestRateLimitBlocksAfterTheBucketIsSpent(t *testing.T) {
 	}
 }
 
-// The bucket is per-IP, not per-socket (TASKS.md T33): a client opening a
+// The bucket is per-IP, not per-socket: a client opening a
 // fresh guest socket must not get a fresh budget.
 func TestGuestRateLimitIsSharedAcrossSocketsFromTheSameIP(t *testing.T) {
 	callAgent, requests := captureAgentRequests()
@@ -2729,7 +2731,7 @@ func TestGuestRejectsAMalformedProvidersList(t *testing.T) {
 	}
 }
 
-// --- what the socket has already shown (T30) --------------------------------
+// --- what the socket has already shown --------------------------------------
 
 func picksEvent(ids ...int) agentEvent {
 	picks := make([]agentPick, len(ids))
@@ -2748,7 +2750,7 @@ func newShownTestServer(t *testing.T, reply ...agentEvent) (*httptest.Server, fu
 	return newGuestTestServer(t, caller, loadGuest), requests
 }
 
-// The T30 done-when: a second "show me more" must not re-offer what the first
+// A second "show me more" must not re-offer what the first
 // turn already put on screen.
 func TestShownTitlesAreSentBackToTheAgentOnTheNextTurn(t *testing.T) {
 	srv, requests := newShownTestServer(t, picksEvent(101, 102))
@@ -2913,10 +2915,10 @@ func TestShownWindowStaysShorterThanTheAgentsPagingReach(t *testing.T) {
 
 // The agent applies its own backstop to whatever history we send
 // (agent/chat.py's MAX_HISTORY_TURNS), and silently: a gateway window wider
-// than that backstop is re-truncated with no error anywhere, which is exactly
-// how this window was once cut from five exchanges back to three. Only this
-// direction needs guarding — the agent's cap sits deliberately at twice the
-// operating point, so lowering it is not a realistic edit.
+// than that backstop is re-truncated with no error anywhere, quietly cutting
+// the window this test guards. Only this direction needs guarding — the
+// agent's cap sits deliberately at twice the operating point, so lowering it
+// is not a realistic edit.
 func TestTheAgentDoesNotSilentlyRetruncateOurHistoryWindow(t *testing.T) {
 	// agent/chat.py's MAX_HISTORY_TURNS, counted in messages like this one.
 	const agentMaxHistoryTurns = 20
@@ -2971,7 +2973,7 @@ func TestShownFromHistoryFlattensStoredRefsOldestFirst(t *testing.T) {
 	}
 }
 
-// The T30 gap this closes: an account's shown set used to live only in the
+// The gap this closes: an account's shown set used to live only in the
 // connection, so a dropped socket — which chat-socket.ts reconnects on next
 // use, with the cards still on screen — re-offered exactly what the user was
 // looking at. Reading it back from messages.title_refs makes a reconnect cost

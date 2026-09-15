@@ -16,7 +16,7 @@ export interface ConversationSummary {
 // confirms (a "conversation_created" event on the chat socket — see
 // chat.go's finishTurn) that a turn's persist just created a brand-new
 // conversation row. app-sidebar.tsx listens for this to refetch and pick up
-// the new conversation's just-derived title (TASKS.md T20.5) without the
+// the new conversation's just-derived title without the
 // user navigating away and back. A plain event, not a shared React context:
 // the sidebar and the chat session provider don't otherwise need to talk to
 // each other, and this is the one signal between them. Dispatched by
@@ -28,8 +28,8 @@ export const CONVERSATIONS_CHANGED_EVENT = "holster:conversations-changed"
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-// A basic shape check on a client-generated conversation id (TASKS.md
-// T20.5), used by /chat/[id]/page.tsx to redirect a malformed route param to
+// A basic shape check on a client-generated conversation id, used by
+// /chat/[id]/page.tsx to redirect a malformed route param to
 // a fresh conversation before it ever reaches the socket. The gateway
 // (chat.go's "message" case, via uuid.Parse) is the actual authority on
 // well-formedness — this is defence in depth.
@@ -37,7 +37,7 @@ export function isValidConversationId(id: string): boolean {
   return UUID_RE.test(id)
 }
 
-// The sidebar's list (TASKS.md T20.5) — the gateway already orders these
+// The sidebar's list — the gateway already orders these
 // newest first.
 export async function fetchConversations(
   getToken: GetToken,

@@ -1,9 +1,10 @@
 """Holster agent — FastAPI service.
 
 Turns a message plus the caller's streaming subscriptions into TMDB catalog
-queries and an answer. This module is the service skeleton: health, structured
-logging, and correlation-ID propagation. Catalog tools and the chat endpoint
-land in later tasks.
+queries and an answer. This module is the HTTP surface — POST /chat, GET
+/providers, POST /titles and /health — plus structured logging and
+correlation-ID propagation; the pipeline itself lives in catalog_tool.py
+and chat.py.
 """
 
 from __future__ import annotations
@@ -147,16 +148,14 @@ def _require_env(key: str) -> str:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # GOOGLE_API_KEY is read by ChatGoogleGenerativeAI itself, not passed
     # explicitly — checked here anyway so a missing key stops startup rather
-    # than the first /chat request. See TASKS.md T13's note on "app-level keys."
+    # than the first /chat request.
     _require_env("GOOGLE_API_KEY")
     app.state.tmdb_client = TMDBClient(_require_env("TMDB_API_KEY"))
-    # max_retries counts differently than it did for the old ChatAnthropic
-    # config this value was carried over from: here it's total attempts
-    # (2 = one retry), not retries-beyond-initial. The one retry also can't
-    # actually help against a free-tier rate limit — the SDK's fixed
-    # exponential backoff doesn't read Gemini's Retry-After header (a known
-    # upstream issue), so it just retries too soon. Still worth keeping for
-    # genuine transient 5xx/network errors, which it does help.
+    # max_retries is total attempts here (2 = one retry), not
+    # retries-beyond-initial. It helps with transient 5xx/network errors. It
+    # does not help against a free-tier rate limit: the SDK's backoff is fixed
+    # exponential and ignores the Retry-After the response carries, so the one
+    # retry fires too soon to land.
     # `or`, not getenv's own default: docker-compose's ${GOOGLE_MODEL}
     # substitutes an empty string when unset in .env, not an absent key, so
     # getenv's default would never fire under compose.
@@ -206,8 +205,8 @@ async def chat(
 ) -> StreamingResponse:
     """Streams chat.stream_chat()'s events as newline-delimited JSON. A plain
     chunked HTTP response, not a second WebSocket — the browser's socket is the
-    gateway's alone (../DECISIONS.md); this is the "plain HTTP call" that
-    decision describes, just with a body streamed as it becomes available
+    gateway's alone; this is a plain HTTP call, just with a body streamed as
+    it becomes available
     rather than buffered, which is what lets the gateway forward an
     "interpreting" line before the full pipeline finishes.
     """
@@ -229,7 +228,7 @@ async def providers(
     region: str, tmdb_client: TMDBClient = Depends(get_tmdb_client)
 ) -> list[RegionProvider]:
     """Every provider available in one country, across movies and TV. Feeds
-    the gateway's streaming_providers cache (TASKS.md T15) — internal only,
+    the gateway's streaming_providers cache — internal only,
     like /chat; the gateway decides staleness and owns the write. A bad
     region or an unreachable TMDB surfaces as a plain 500, which is exactly
     what the gateway's refresh treats as "agent call failed, serve stale."
@@ -242,7 +241,7 @@ async def titles(
     req: TitlesRequest, tmdb_client: TMDBClient = Depends(get_tmdb_client)
 ) -> list[dict[str, Any]]:
     """Batched enrichment for already-known tmdb_ids — the watchlist's read
-    path (TASKS.md T18.5). No LLM call: the ids are already known, so
+    path. No LLM call: the ids are already known, so
     there's nothing to interpret or rank, only TMDB lookups re-run fresh on
     every call. Internal only, like /chat and /providers.
     """

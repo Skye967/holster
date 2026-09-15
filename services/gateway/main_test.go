@@ -727,15 +727,14 @@ func TestTokenNeverLogged(t *testing.T) {
 	}
 }
 
-// T7's done-when: a valid token returns the user ID, without one 401.
+// A valid token returns the user ID; without one, 401.
 func TestRoutesRequireAuthOnEveryMethod(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	h := newTestHandler(t, key, "kid_A")
 
 	// Register a future-shaped write route to prove it inherits auth. (The
-	// real PUT/DELETE /api/subscriptions/{providerID} now exists — see
-	// providers.go and providers_test.go — so it is no longer a placeholder
-	// here; this one stands in for any route not yet built.)
+	// real subscriptions routes have their own coverage in providers_test.go;
+	// this one stands in for any route not yet built.)
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/example", h.example)
 	api.HandleFunc("POST /api/chat", h.example)
@@ -788,7 +787,7 @@ func TestRoutesRequireAuthOnEveryMethod(t *testing.T) {
 	}
 }
 
-// T15: the picker is the first caller to hit /api/ with a plain browser
+// The picker is the first caller to hit /api/ with a plain browser
 // fetch() rather than a WebSocket upgrade or a server-side request, so this
 // is the first test that actually exercises corsMiddleware.
 func TestCORSPreflightFromAllowedOrigin(t *testing.T) {

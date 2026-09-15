@@ -29,11 +29,15 @@ Do not run `supabase db push` against the local compose Postgres — the entrypo
 already applied the files without recording them in `supabase_migrations`, so the
 push re-runs them and fails on the first `create table`.
 
+An applied migration is never edited, comments included: the committed file is the
+record of what ran. A stale comment in one is corrected where it is read from, not by
+rewriting history.
+
 ## Roles
 
-The T10 migration creates two service roles, `gateway_app` (the sole writer) and
-`agent_ro` (no write grant anywhere, and no read grants yet — later tasks add
-them), both `NOLOGIN`. A committed migration runs everywhere, so it carries no
+`20260831233121_rls_roles.sql` creates two service roles, `gateway_app` (the sole
+writer) and `agent_ro` (no write grant anywhere; `select` on `conversations` and
+`messages`, granted later by `20260904191046_conversations.sql`), both `NOLOGIN`. A committed migration runs everywhere, so it carries no
 password.
 
 - **Local:** compose's `db-init` service applies `db/local-roles.sql` once
@@ -66,8 +70,8 @@ streaming_subscriptions  one row per service the user subscribes to
 streaming_providers      cache of TMDB's watch-provider list, one row per country
   country                text primary key
   providers              jsonb              -- [{provider_id, provider_name,
-                                            --   logo_path, display_priority}]
-  fetched_at             timestamptz        -- lazy-refreshed past 24h (T15)
+                                            --   logo_url, display_priority}]
+  fetched_at             timestamptz        -- lazy-refreshed past 24h
 
 title_verdicts           one row per user per title
   user_id                text references users(id) on delete cascade
@@ -96,6 +100,6 @@ messages
 
 - **No table holds a credential.** Holster stores no secret belonging to any other
   service, for any user. There is no encryption layer because there is nothing to
-  encrypt — see *No OAuth, and no credential architecture* in `../DECISIONS.md`.
+  encrypt. Do not reintroduce one without reintroducing the thing it protects.
 - **Row-level security on every user-scoped table**, keyed on the Clerk user ID.
 - `on delete cascade` throughout, so deleting a user genuinely removes their rows.

@@ -1,4 +1,4 @@
-// One WebSocket per chat session (DECISIONS.md "One socket per session"),
+// One WebSocket per chat session (ARCHITECTURE.md's "One socket per session"),
 // opened with a single-use ticket minted from POST /api/chat/ticket —
 // browsers can't set an Authorization header on a WS upgrade, so this is
 // the only way the connection gets authenticated (services/gateway/chat.go).
@@ -40,7 +40,7 @@ export interface AgentPick {
   // Must render differently: null means "unknown," not "not here."
   available_on: AgentProvider[] | null
   blurb: string
-  // True only for a watchlist row (TASKS.md T18.5) whose TMDB lookup failed
+  // True only for a watchlist row whose TMDB lookup failed
   // or the id no longer resolves — every other field is then a zero value,
   // not real data. Absent (falsy) on every /chat pick.
   unavailable?: boolean
@@ -107,13 +107,10 @@ const UNREACHABLE_TEXT = "Can't reach the server right now — try again"
 export const MAX_MESSAGE_LENGTH = 4000
 
 // Reports whether text has more than max code points, without counting past
-// max — the composer has no maxLength of its own, so a pasted string can be
-// arbitrarily large, and `[...text].length` would walk and allocate over all
-// of it just to reject it. Drives the string iterator directly rather than
-// `for...of` only because the loop has no use for the yielded character
-// itself, and an unused `for...of` binding trips this project's lint config
-// (no `varsIgnorePattern` override) — same code-point-at-a-time semantics
-// either way, so this still exits as soon as the answer is known.
+// max — the composer has no maxLength, so a pasted string can be arbitrarily
+// large and `[...text].length` would walk all of it just to reject it. Drives
+// the iterator directly rather than `for...of` because an unused loop binding
+// trips this project's lint config.
 function exceedsCodePointLength(text: string, max: number): boolean {
   let count = 0
   const iter = text[Symbol.iterator]()
@@ -128,7 +125,8 @@ function exceedsCodePointLength(text: string, max: number): boolean {
 // so it gets its own constant rather than borrowing that one's semantics.
 const SOCKET_OPEN_TIMEOUT_MS = 10000
 
-// guest is decided by the server (chat/layout.tsx's auth()) and passed down —
+// guest is decided by the server (chat/layout.tsx's getSession()) and passed
+// down —
 // never inferred here from a failed ticket mint, which must stay a visible
 // error for an account rather than a silent downgrade to a guest socket.
 async function connect(
@@ -148,16 +146,11 @@ async function connect(
   try {
     socket = new WebSocket(wsURL(query))
   } catch {
-    // wsURL() throws when NEXT_PUBLIC_GATEWAY_URL is unset, and the
-    // WebSocket constructor itself can throw synchronously for a malformed
-    // URL. Without this catch, connect()'s returned promise rejects instead
-    // of resolving — and ensureSocket()'s connectingRef.current = connect(
-    // ...).then(...) has no .catch(), so a rejection leaves connectingRef
-    // pointing at a dead promise forever, silently wedging every future
-    // send() and reconnect attempt for the rest of the session (T32).
-    // Converting the throw into the same { error } shape every other
-    // reachable-failure path already returns keeps connect()'s contract —
-    // always resolves, never rejects — intact.
+    // wsURL() throws when NEXT_PUBLIC_GATEWAY_URL is unset, and the WebSocket
+    // constructor can throw synchronously for a malformed URL. connect()'s
+    // contract is that it always resolves and never rejects: ensureSocket()
+    // has no .catch(), so a rejection would leave connectingRef pointing at a
+    // dead promise and wedge every later send() for the session.
     return { error: UNREACHABLE_TEXT }
   }
   const opened = await new Promise<boolean>((resolve) => {
@@ -282,10 +275,10 @@ export function useChatSocket(
 
   // A guest needs nothing from Clerk — waiting on its script here would make
   // "no account needed" depend on that script loading. Derived rather than
-  // testing isLoaded in the body: isLoaded still flips false->true underneath
-  // a guest, and as a dependency that re-ran this effect, closing the open
-  // socket and dialling a second one. The close is our own, so the listener
-  // below stays silent and an in-flight turn would never be failed.
+  // tested in the effect body: isLoaded still flips false->true underneath a
+  // guest, and as a dependency it re-runs the effect, closing the open socket
+  // and dialling a second one. That close is our own, so the listener below
+  // stays silent and an in-flight turn is never failed.
   const ready = guest || isLoaded
 
   useEffect(() => {
@@ -303,16 +296,11 @@ export function useChatSocket(
     (text: string, conversationId: string): string => {
       const turn = crypto.randomUUID()
       if (exceedsCodePointLength(text, MAX_MESSAGE_LENGTH)) {
-        // Deferred to a microtask, not fired synchronously: chat-session-
-        // provider.tsx's wrapped send() reads this function's return value
-        // (turn) and marks it active *after* this call returns, so an
-        // error event dispatched before that point would clear nothing —
-        // the provider would then latch onto a turn that already finished,
-        // leaving the composer disabled forever (T32). queueMicrotask keeps
-        // this on the same "fires after send() returns" timing every other
-        // failure here already has (ensureSocket().then()), without
-        // actually opening a connection for a message that's rejected
-        // either way.
+        // Deferred, not fired synchronously: chat-session-provider.tsx marks
+        // the turn active *after* this call returns, so an error dispatched
+        // before that would clear nothing and leave the composer disabled
+        // forever. This matches the "fires after send() returns" timing
+        // every other failure path here has, without opening a connection.
         queueMicrotask(() => {
           onEventRef.current({
             type: "error",

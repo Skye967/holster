@@ -12,7 +12,7 @@ import { setSubscription } from "@/lib/subscriptions"
 
 // Where every sign-in and sign-up lands (the fallbackRedirectUrl on both
 // Clerk components, and what signInHref points at). Carries a guest's ticked
-// services into the account (TASKS.md T29) before any page renders, so the
+// services into the account before any page renders, so the
 // picker and the chat gate see the rows on their first load — a migration
 // beside the page would race it. A Route Handler because it's the one place
 // that can both write and clear the cookie. Cookie picks are always added,
@@ -20,12 +20,10 @@ import { setSubscription } from "@/lib/subscriptions"
 // session's to drop.
 //
 // redirect() here, never NextResponse.redirect(new URL(path,
-// request.nextUrl)) — the second mistake of that exact shape caught in
-// review on this route. An absolute URL trusts the server's own Host, which
-// this app's self-hosted runtime can get wrong; every target below is
-// same-origin, so nothing needs one. `next` is the one value here with
-// outside input, and it's safeNext() that makes it safe to redirect to, not
-// this call — safeNext already collapsed it to a same-origin path above.
+// request.nextUrl)): an absolute URL trusts the server's own Host, which this
+// app's self-hosted runtime can get wrong, and every target below is
+// same-origin. `next` is the one value carrying outside input, and safeNext()
+// above — not this call — is what collapsed it to a same-origin path.
 export async function GET(request: NextRequest) {
   const next = safeNext(
     request.nextUrl.searchParams.get("next"),
@@ -54,8 +52,8 @@ export async function GET(request: NextRequest) {
     console.error("guest subscription migration failed", r.reason)
   }
 
-  // Cleared whatever happened, which is what TASKS.md T29 specifies: this
-  // route only runs at sign-in, so a kept cookie is never read again — it
+  // Cleared whatever happened: this route only runs at sign-in, so a kept
+  // cookie is never read again — it
   // just waits to carry this device's picks into whoever signs in next.
   // A partial failure is made visible instead: /onboarding is the picker,
   // account-backed by now, showing exactly which picks landed so the rest

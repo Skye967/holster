@@ -1,7 +1,7 @@
 """TMDB client tests — offline, against httpx2.MockTransport.
 
-The live path (real token, real HTTP) is in test_tmdb_live.py, which skips
-without TMDB_API_KEY — same shape as the gateway's TEST_DATABASE_URL tests.
+There is no live path here: every request goes through MockTransport, so the
+suite needs no TMDB_API_KEY and makes no network call.
 """
 
 from __future__ import annotations
@@ -605,7 +605,7 @@ def test_search_titles_makes_one_request_not_one_per_media_type() -> None:
     assert fake.count("/search/tv") == 0
 
 
-# --- candidate quality: sort, floor, and how multi-value filters join (T31) --
+# --- candidate quality: sort, floor, and how multi-value filters join --------
 
 
 def test_the_default_sort_is_most_watched_not_most_trending() -> None:

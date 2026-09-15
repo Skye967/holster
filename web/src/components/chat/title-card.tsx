@@ -31,7 +31,8 @@ import {
 import type { AgentPick, AgentProvider } from "@/lib/chat-socket"
 import type { Verdict } from "@/lib/verdicts"
 
-// The four judgments (title-card.tsx's "smaller control") — want_to_watch is
+// The four judgments, set from the smaller judgment control below —
+// want_to_watch is
 // deliberately not one of these, since it has its own always-visible bookmark
 // control. Order matches title_verdicts' check constraint
 // (supabase/migrations/20260903002450_verdicts.sql).
@@ -76,10 +77,9 @@ function Availability({
   )
 }
 
-// The MVP's main visual component (TASKS.md T16.5) — reused as-is by T18.5's
-// watchlist once it lands. Meant to sit in a horizontal snap-scroll row (see
-// chat-panel.tsx), which is why it has a fixed width rather than flexing to
-// its container.
+// The MVP's main visual component, shared with the watchlist
+// view. Meant to sit in a horizontal snap-scroll row (see chat-panel.tsx),
+// which is why it has a fixed width rather than flexing to its container.
 //
 // Verdict state and its mutations live in the caller (chat-panel.tsx), not
 // here — this stays a presentational component, and the same verdict map
@@ -120,8 +120,8 @@ export function TitleCard({
   // Shared by the bookmark button and the radio group below, but *not* the
   // dropdown trigger (see its own disabled prop) — a locked judgment still
   // blocks switching straight to a different one, or to want_to_watch, but
-  // since T19.5 (DECISIONS.md "Locked judgments can be cleared") the menu
-  // itself must stay reachable so its "Clear rating" item can fire.
+  // the menu itself must stay reachable so its "Clear rating" item can fire —
+  // a locked judgment can be cleared (ARCHITECTURE.md).
   const locked = pending || judgment != null
 
   return (
@@ -140,7 +140,7 @@ export function TitleCard({
       <CardHeader>
         <CardTitle className="truncate">{pick.title}</CardTitle>
         <CardAction className="flex items-center gap-1">
-          {/* The primary save control (TASKS.md T18) — one tap, toggles,
+          {/* The primary save control — one tap, toggles,
               saves immediately, no confirmation. Disabled once a judgment is
               locked — want_to_watch must not be silently set over a locked
               judgment, and the gateway rejects that write anyway. Unlike the
@@ -166,8 +166,8 @@ export function TitleCard({
           </Button>
           {/* The smaller judgment control. Disabled only by `pending`, not
               `locked` — once one of the four judgments is set the menu must
-              still open, so its "Clear rating" item (below) stays reachable
-              (T19.5, DECISIONS.md "Locked judgments can be cleared"). Swaps
+              still open, so its "Clear rating" item (below) stays reachable:
+              a locked judgment can be cleared (ARCHITECTURE.md). Swaps
               to that judgment's own icon so the locked state is still
               visible, not just inert. */}
           <DropdownMenu>

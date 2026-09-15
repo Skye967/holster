@@ -17,9 +17,55 @@ Planning and process live **outside** the repo, in the parent directory:
 
 ## Code style
 
-- Comments: short, and only where the code isn't self-evident.
 - Match surrounding code. Don't introduce a second way to do something that already
   has one.
+
+### Comments
+
+**A comment is what the code cannot say. Short because history is gone, not because
+detail is.** Length is an output of the filter below, not a budget: cutting mechanism to
+hit a length is how a comment turns into a pointer.
+
+**Keep** — the four things a comment is for, each answered *in the code*:
+
+1. **Why this shape?** — the constraint that rules out the obvious simpler version.
+2. **How does it work?** — the mechanism, when it spans more than the reader can see at
+   once. Mechanism, never a restatement of the line beneath it.
+3. **What is still true but not visible?** — a live limitation, an invariant, an
+   accepted cost, stated as a fact rather than pointed at.
+4. **What else must change with it?** — a coupling nothing enforces. This one *is* a
+   reference, and must name a real symbol.
+
+**Cut** — history (what the code used to be, what was tried, which bug prompted it),
+provenance (task ids, PR numbers), restatement, and reassurance ("note that",
+"obviously", "this is safe").
+
+**Three things earn a reference:** a symbol; a fact already stated and then sourced
+(`SQLSTATE 42501, "insufficient_privilege"`); or an invariant — but only from a doc that
+ships with the code, such as `ARCHITECTURE.md`, a service's own README, or a migration.
+`../TASKS.md` and `../DECISIONS.md` live outside the repo and a contributor cannot open
+them, so an invariant sitting there is moved in, not cited. State the invariant, then
+name the doc — never the name alone.
+
+**Two tests.**
+
+*Cover and reread* — does it explain itself? Cover every reference except the couplings
+and ask whether you can still understand the code. If not, the comment is broken.
+
+*Check, don't recall* — is it true? Verify every claim about anything outside this file
+against that thing as you write it. Two shapes account for nearly every false comment:
+
+- An **absolute** — only, never, every, nothing, the one, guarantees — which a single
+  counterexample falsifies. If you have not checked exhaustively, weaken it: the weaker
+  sentence is usually shorter and always truer.
+- A **named reference** — open the file and find the sentence. Existence is not support;
+  a heading can be present and still not carry your point. Schema objects are
+  cumulative, so read the latest migration that touches one, not the one that created it.
+
+**Name the coupling; don't describe the guard.** *"Mirrors `chat.go`'s `maxShownRefs`"*
+is a fact a reader can check. *"TestX catches an edit here"* is a claim about program
+behaviour that drifts the moment either side moves, and the test's own name already
+carries it. If you do name a guard, you have run it and watched it fail.
 
 ## Invariants
 
@@ -72,9 +118,9 @@ features: connection management, and one chat. Resist additions.
   pick a service is scope creep, not a feature.
 - **Streaming services are a preference, not a connection.** Netflix and Hulu publish
   no OAuth. Users tick what they subscribe to; those rows hold no secret.
-- **No OAuth to third-party services.** Spotify and YouTube were planned and cut. Do
-  not add a provider without revisiting `DECISIONS.md` — the whole credential
-  architecture was removed with them, and adding one back means adding all of it back.
+- **No OAuth to third-party services.** Adding a provider means reintroducing the whole
+  credential architecture — user tokens, refresh, encryption at rest, revocation — which
+  was removed with Spotify and YouTube. It is not an increment.
 - **Taste comes from inside the app** — what the user subscribes to, what they type,
   and the verdicts they give on titles. Not from an external history feed.
 

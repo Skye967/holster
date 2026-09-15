@@ -74,8 +74,8 @@ user ID and carrying the `email` claim. Clerk creates the account on its side
 only; nothing writes ours.
 
 Per request rather than on a `user.created` webhook, and guarded by a `where … is
-distinct from` clause so an unchanged row is not rewritten — see `../../DECISIONS.md`
-and `upsertUser`.
+distinct from` clause so an unchanged row is not rewritten: a webhook can be missed or
+arrive late, and a per-request upsert repairs itself. See `upsertUser`.
 
 A provisioning failure returns 503 rather than letting the request through, bounded
 by a 2s deadline so an unresponsive database cannot hold the request open.

@@ -1,5 +1,5 @@
-// A fetch call to the gateway, hardened the way TASKS.md's T7 notes require:
-// Clerk session tokens live 60 seconds, so any idle tab's next request can
+// A fetch call to the gateway, hardened against a stale token: Clerk session
+// tokens live 60 seconds, so any idle tab's next request can
 // hit a 401 that isn't a real error. This catches it, fetches a fresh token,
 // and retries once — only a failed retry becomes a visible error.
 
@@ -17,12 +17,10 @@ export const GATEWAY_CALL_TIMEOUT_MS = 10000
 // can't drift between call sites (streaming-picker.tsx, chat-socket.ts).
 export const SESSION_EXPIRED_TEXT = "Your session ended — reload the page"
 
-// Shared fallback for a gatewayFetch call's catch block: every call site
-// needs the same session-expired text for GatewaySessionExpiredError and its
-// own fallback for everything else. Not a general error-to-text mapper — a
-// call site with its own typed errors (VerdictLockedError, VerdictStaleError
-// in chat-panel.tsx/watchlist-view.tsx) still checks those separately and
-// passes the result in as fallback.
+// Shared fallback for a gatewayFetch call's catch block. Not a general
+// error-to-text mapper: a call site with its own typed errors
+// (VerdictLockedError, VerdictStaleError) checks those first and passes the
+// result in as fallback.
 export function gatewayErrorText(err: unknown, fallback: string): string {
   return err instanceof GatewaySessionExpiredError
     ? SESSION_EXPIRED_TEXT
@@ -49,13 +47,14 @@ export type GetToken = (opts: {
   skipCache?: boolean
 }) => Promise<string | null>
 
-// Bounds an arbitrary promise, not just a fetch() — needed because getToken()
-// (Clerk's SDK) has no cancellation option of its own, so an AbortSignal passed
-// to gatewayFetch only cancels the fetch() half. A caller that also wants its
-// fetch actually torn down on timeout should pass its own AbortSignal.timeout as
-// gatewayFetch's init.signal — this wrapper is what bounds the getToken() half
-// that a signal can't reach. clearTimeout on the losing side so a fast response
-// doesn't leave a no-op timer running for the rest of the window.
+// Bounds an arbitrary promise, not just a fetch(): getToken() (Clerk's SDK)
+// has no cancellation of its own, so an AbortSignal passed to gatewayFetch
+// only reaches the fetch() half. A caller wanting the fetch torn down too
+// passes its own AbortSignal.timeout as gatewayFetch's init.signal.
+//
+// The .finally is load-bearing, not tidy-up: without it a fast response leaves
+// the loser's timer pending for the rest of the window — one per call, and in
+// Node that keeps the event loop alive past the request.
 export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout>
   const timeout = new Promise<never>((_, reject) => {

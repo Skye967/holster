@@ -58,7 +58,7 @@ def test_correlation_id_survives_server_error() -> None:
 # --- /chat -------------------------------------------------------------
 #
 # Real TMDBClient/model construction happens in lifespan(), which needs live
-# keys (see the live-suite pattern in test_catalog_tool_live.py). These tests
+# keys, and there is no live suite in this repo. These tests
 # never trigger it: they override the Depends() seams directly, the same way
 # TMDBClient's transport= and catalog_tool's Interpreter/Ranker do for
 # everything else in this codebase.
@@ -112,7 +112,7 @@ def test_chat_requires_a_message() -> None:
 
 # --- /providers ----------------------------------------------------------
 #
-# Feeds the gateway's streaming_providers cache refresh (TASKS.md T15). No
+# Feeds the gateway's streaming_providers cache refresh. No
 # LangChain/model dependency here, just the TMDB client seam.
 
 
@@ -161,7 +161,7 @@ async def _must_not_be_called(*_args: Any, **_kwargs: Any) -> Any:
 
 # --- /titles ---------------------------------------------------------------
 #
-# The watchlist's read path (TASKS.md T18.5). No LLM dependency — same seam
+# The watchlist's read path. No LLM dependency — same seam
 # shape as /providers, just POST with a body of already-known ids.
 
 

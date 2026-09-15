@@ -19,7 +19,9 @@ export type GuestProviderResult = { ok: true } | { ok: false; reason: string }
 // browser never sends a whole list — a list is snapshotted when the call is
 // made, and a second toggle's snapshot can carry a pick the first one has since
 // failed and rolled back. Next dispatches Server Functions one at a time per
-// client, so this read-modify-write cannot lose an update.
+// client, so this read-modify-write cannot lose an update. Next's "Mutating
+// data" guide calls that an implementation detail that may change: if it ever
+// dispatches in parallel, two toggles racing here silently drop one pick.
 //
 // A Server Function, not document.cookie: only a server-side cookies().set can
 // write an httpOnly cookie, and the revalidatePath below is what drops the

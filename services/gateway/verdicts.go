@@ -41,29 +41,23 @@ type Verdict struct {
 // loadVerdicts mirrors loadProviders' shape (providers.go): a plain function
 // closed over the pool, injected into Handler so it's fakeable in tests. One
 // loader for both consumers — the browser's hydration and the agent's chat
-// context (T19) — so the two can never disagree about what a user has judged.
+// context — so the two can never disagree about what a user has judged.
 //
-// Newest-first because the agent keeps only the first few liked titles for
-// its taste hint (catalog_tool.py's MAX_TASTE_TITLES) and carries no
-// timestamp to re-sort by; /api/verdicts is indifferent. Ordered by
-// verdict_set_at (20260904154626_verdict_set_at.sql), not created_at:
-// saveVerdict's conflict clause refreshes verdict_set_at on every write, so a
-// title bookmarked in January and liked today correctly sorts as today.
-// created_at is kept as an untouched "first saved" audit column — its only
-// remaining reader is watchlist.go's loadWatchlistItems, which still orders
-// want_to_watch rows by it (correct there: a bookmark's created_at is only
-// ever set once, on insert, and a cleared-then-rebookmarked row is a fresh
-// insert with a fresh timestamp). saveVerdict writes one row per transaction, so
-// production timestamps are distinct and the tie-break is only insurance -
-// it keeps the order total if a batched write or a backfill ever makes them
-// tie, which is what db_test.go exercises.
+// Newest-first because the agent keeps only the first few liked titles for its
+// taste hint (catalog_tool.py's MAX_TASTE_TITLES) and carries no timestamp to
+// re-sort by. Ordered by verdict_set_at, not created_at: saveVerdict's
+// conflict clause refreshes it whenever the verdict changes, so a title
+// bookmarked in January and liked today sorts as today. created_at stays an
+// untouched "first saved" column (see watchlist.go, which orders by it). The
+// tie-break is insurance for a batched write or backfill — saveVerdict writes
+// one row per transaction, so real timestamps are distinct.
 //
 // Uncapped, because the agent needs every row to answer "has this user judged
-// this title" - a LIMIT would quietly expire T19's guarantee once someone had
-// judged enough titles. Note the sort is not index-covered: title_verdicts
-// has only its primary key (user_id, tmdb_id, media_type), so this fetches
-// the user's rows and sorts them. Fine at these sizes; a
-// (user_id, verdict_set_at desc) index is the fix if it stops being.
+// this title" — a LIMIT would quietly expire that guarantee. The sort is not
+// index-covered: title_verdicts carries only its primary key
+// (user_id, tmdb_id, media_type), so this reads the user's rows and sorts them
+// in memory. Fine at these sizes; a (user_id, verdict_set_at desc) index is the
+// fix when it stops being — not a LIMIT, which the paragraph above rules out.
 func loadVerdicts(db *pgxpool.Pool) func(ctx context.Context, userID string) ([]Verdict, error) {
 	return func(ctx context.Context, userID string) ([]Verdict, error) {
 		var verdicts []Verdict
@@ -94,13 +88,11 @@ func loadVerdicts(db *pgxpool.Pool) func(ctx context.Context, userID string) ([]
 // the four judgments directly to a *different* value after it's already set
 // — title_verdicts' migration comment (20260903002450_verdicts.sql) states
 // those "never change" once set and assigns enforcing that to "whichever task
-// builds the write path." Only want_to_watch is exempt: TASKS.md's T17 entry
-// describes it as "an intention with a lifecycle, expected to become seen
-// later," never the reverse. Since T19.5 (DECISIONS.md, "Locked judgments can
-// be cleared") a locked judgment can still be *cleared* via DELETE and then
-// re-set — this error is only ever about overwriting one verdict with
-// another in a single step, never about whether a judgment can change at
-// all.
+// builds the write path." Only want_to_watch is exempt: it is an intention
+// with a lifecycle, expected to become seen later, never the reverse. A locked
+// judgment can still be *cleared* via
+// DELETE and re-set (ARCHITECTURE.md's "A locked judgment can be cleared"): this
+// error is only about overwriting one verdict with another in a single step.
 var errVerdictLocked = errors.New("verdict already set and cannot change")
 
 // errVerdictStale is returned by saveVerdict when a DELETE's ?expect doesn't
@@ -123,14 +115,8 @@ func saveVerdict(db *pgxpool.Pool) func(ctx context.Context, userID string, tmdb
 				// Compare-and-delete, not an unconditional clear: only
 				// removes the row when it still holds the exact verdict the
 				// caller believes is there — the same idiom the upsert below
-				// already uses (its WHERE only updates when the existing
-				// value matches an expected one). Before T19.5 this clause
-				// was hardcoded to `verdict = 'want_to_watch'`, so a stale
-				// client (e.g. a second tab that hasn't seen a write made
-				// elsewhere) clicking an outdated control was always a safe
-				// no-op — the WHERE simply matched nothing. Comparing against
-				// the caller's own expected value generalizes that same
-				// safety to every verdict, including locked judgments.
+				// uses. A stale client (a second tab that hasn't seen a write
+				// made elsewhere) matches nothing and is a safe no-op.
 				//
 				// FOR UPDATE, not a bare SELECT then DELETE: it locks the row
 				// (if one exists) for the rest of this transaction, so no
@@ -170,10 +156,9 @@ func saveVerdict(db *pgxpool.Pool) func(ctx context.Context, userID string, tmdb
 			// row is still want_to_watch (the one mutable value) or already
 			// holds the requested verdict (an idempotent no-op) — once a row
 			// holds a different judgment, this WHERE excludes it and
-			// RowsAffected is 0, which the caller maps to a 409. Unchanged by
-			// T19.5: only DELETE (above) was broadened, so setting a
-			// *different* verdict over a locked one is still rejected — the
-			// caller must clear it first.
+			// RowsAffected is 0, which the caller maps to a 409. Setting a
+			// *different* verdict over a locked one is rejected: the caller
+			// must clear it first via DELETE.
 			//
 			// verdict_set_at (20260904154626_verdict_set_at.sql) only
 			// refreshes when the verdict actually changes, not on the
@@ -273,8 +258,8 @@ func (h *Handler) setVerdict(w http.ResponseWriter, r *http.Request) {
 	if err := h.saveVerdict(r.Context(), userID, tmdbID, mediaType, verdict, expectedVerdict); err != nil {
 		if errors.Is(err, errVerdictLocked) {
 			// Not routine like an expired token, but not a server failure
-			// either. Since T19.5, clearing a locked judgment *is* a normal
-			// UI path (title-card.tsx's "Clear rating") — this only fires on
+			// either. Clearing a locked judgment *is* a normal UI path
+			// (title-card.tsx's "Clear rating") — this only fires on
 			// a PUT attempting to overwrite a locked judgment with a
 			// different one directly, which the UI still disables, so
 			// reaching here means a stale client or a direct API call.

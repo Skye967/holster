@@ -6,7 +6,7 @@ import {
 } from "@/lib/gateway"
 import type { Session } from "@/lib/session"
 
-// Derived, not stored (TASKS.md T15.5: "no new flag"). A guest's answer is its
+// Derived, not stored — no flag of its own. A guest's answer is its
 // cookie (lib/guest.ts); an account's is its rows. Getting the account branch
 // wrong fails safe — gatewayFetch throws GatewaySessionExpiredError, caught
 // below and treated the same as any other failure, so a mistake here would

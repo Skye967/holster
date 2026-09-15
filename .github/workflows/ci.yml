@@ -7,6 +7,47 @@ permissions:
   contents: read
 
 jobs:
+  comments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # A task id says where a decision was recorded, not why the code is the way
+      # it is, and means nothing without the planning docs open (CLAUDE.md's
+      # Comments section).
+      #
+      # Whole files rather than comment lines: `T` followed by digits matches no
+      # identifier here, so the wider net costs nothing and reaches docstrings
+      # and block comments.
+      #
+      # supabase/migrations is skipped: an applied migration is not edited
+      # (db/README.md), so its comments stay as the record of that one change.
+      # --exclude-dir matches a basename, and that is the only `migrations`
+      # directory in the tree.
+      - name: No task ids in comments
+        run: |
+          set +e
+          grep -rnE '\bT[0-9]+(\.[0-9]+)?\b' . \
+            --include='*.go' --include='*.py' --include='*.ts' --include='*.tsx' \
+            --include='*.md' --include='*.sql' --include='*.yml' --include='*.mjs' \
+            --exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=.git \
+            --exclude-dir=migrations --exclude=hits.txt > hits.txt
+          status=$?
+          set -e
+          # grep exits 1 for "no matches" (the good case); anything above
+          # that is a real failure, such as a path that no longer exists or a
+          # signal kill. Only 0 and 1 may pass: `|| true` would turn a renamed
+          # directory into a permanent green.
+          if [ "$status" -ge 2 ]; then
+            echo "::error::grep failed - check the paths in this step" >&2
+            exit 1
+          fi
+          if [ -s hits.txt ]; then
+            echo "Task ids found - state the fact instead."
+            echo "See CLAUDE.md > Code style > Comments."
+            cat hits.txt
+            exit 1
+          fi
+
   gateway:
     runs-on: ubuntu-latest
     services:

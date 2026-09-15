@@ -28,8 +28,8 @@ class GuestWriteError extends Error {
 // — that ranking surfaces channel add-ons and split paid tiers (Paramount+ and
 // Peacock each list as separate "Essential"/"Premium" entries with no plain
 // "Paramount Plus" or "Peacock" of their own). Everything else is reachable
-// only through search. TASKS.md T15: "surface the common providers and put
-// the long tail behind search."
+// only through search — the common providers surfaced, the long tail behind
+// search.
 const DEFAULT_PROVIDER_IDS = [
   8, // Netflix
   15, // Hulu
@@ -98,11 +98,12 @@ export function StreamingPicker({
     setFailure,
   } = useRowStatus<number>()
 
-  // A guest needs nothing from Clerk — waiting on its script here would make
-  // "no account needed" depend on that script loading. Derived rather than
-  // tested in the body: isLoaded still flips false->true underneath a guest,
-  // and as a dependency that re-ran the load, refetching the catalog and
-  // rebuilding the list out from under an in-flight toggle.
+  // A guest needs nothing from Clerk, so a guest's `ready` doesn't wait on
+  // isLoaded; a signed-in user's does, since the load needs a token. Derived
+  // rather than tested inside the load: isLoaded still flips false->true
+  // underneath a guest, and as a dependency that re-runs the load, refetching
+  // the catalog and rebuilding the list out from under an in-flight toggle.
+  // chat-socket.ts derives its own `ready` the same way, for the same reason.
   const ready = guest || isLoaded
 
   // Only used for the cap message below, so the rendered rows are close enough
@@ -147,10 +148,6 @@ export function StreamingPicker({
 
   const toggle = useCallback(
     async (providerId: number, subscribed: boolean) => {
-      // Starting fresh with {pending: true} also clears any stale error from
-      // a previous failed attempt on this row — set before the optimistic
-      // update / first await so a second click is already disabled by the
-      // time React re-renders.
       // Refused up front so the switch never flips on only to bounce back.
       // Counted from the rendered rows, which can lag a write still in flight;
       // that only costs a redundant round trip, since setGuestProvider enforces
@@ -159,9 +156,13 @@ export function StreamingPicker({
         setFailure(providerId, GUEST_CAP_TEXT)
         return
       }
+      // Starting fresh with {pending: true} also clears any stale error from a
+      // previous failed attempt on this row — set before the optimistic update
+      // and the first await, so a second click is already disabled by the time
+      // React re-renders.
       setPending(providerId)
       // Optimistic: flip immediately, revert with an inline message if the
-      // write fails (TASKS.md's cross-cutting rule — never show a status code).
+      // write fails, and never showing a status code while doing it.
       setProviders(
         (prev) =>
           prev?.map((p) =>
@@ -247,8 +248,8 @@ export function StreamingPicker({
           // region has no cached catalog and the agent couldn't fetch one.
           // Gated on providers.length, not visible.length, so it can't fire
           // just because none of the 8 defaults matched a loaded catalog
-          // (TASKS.md's cross-cutting rule: "nothing matched" vs "something
-          // broke").
+          // ("nothing matched" and "something broke" must never look alike —
+          // ARCHITECTURE.md's Failure rules).
           <p className="text-sm text-muted-foreground">
             Can&apos;t reach your streaming services right now — try reloading.
           </p>

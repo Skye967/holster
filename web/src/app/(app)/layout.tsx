@@ -10,7 +10,7 @@ import { getSession } from "@/lib/session"
 
 // Guest-visible by default, on purpose: the shell touches no user data, and
 // each page that reads user-scoped data decides for itself. The gateway is the
-// boundary. Why: DECISIONS.md "Optional sign-in".
+// boundary. Why: ARCHITECTURE.md's "Sign-in is optional".
 export default async function AppLayout({ children }: LayoutProps<"/">) {
   const { userId } = await getSession()
 

@@ -27,8 +27,7 @@ export function verdictKey(tmdbId: number, mediaType: "movie" | "tv"): string {
 // The single builder for PUT/DELETE /api/verdicts/{mediaType}/{tmdbId} — a
 // DELETE's ?expect is the gateway's required compare-and-delete guard
 // (verdicts.go's saveVerdict); omit it for a PUT. One place so chat-panel.tsx
-// and watchlist-view.tsx can't drift on the query-string shape, the same
-// reasoning that put verdictKey and the two error/text pairs here.
+// and watchlist-view.tsx can't drift on the query-string shape.
 export function verdictUrl(
   mediaType: "movie" | "tv",
   tmdbId: number,
@@ -45,8 +44,7 @@ export function verdictUrl(
 export class VerdictLockedError extends Error {}
 
 // Shown by both chat-panel.tsx and watchlist-view.tsx on a VerdictLockedError
-// — one source of truth so the two never drift, the same reasoning that put
-// VerdictLockedError itself here rather than in either caller.
+// — one source of truth so the two never drift.
 export const VERDICT_LOCKED_TEXT =
   "That title's already been rated — clear it first to change your answer"
 
@@ -77,3 +75,4 @@ export async function fetchVerdicts(
   if (!res.ok) throw new Error(`status ${res.status}`)
   return res.json()
 }
+

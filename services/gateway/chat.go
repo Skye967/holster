@@ -51,11 +51,6 @@ type chatTicket struct {
 	userID string
 }
 
-// chatTicketEntry is one minted ticket paired with its expiry deadline —
-// chatTicketStore's own inlined version of the mutex-protected, self-expiring
-// map it used to share with conversationDeletions (see that type's doc
-// comment for why the two have since diverged). Not generic anymore, now
-// that chatTicketStore is the sole user.
 type chatTicketEntry struct {
 	ticket   chatTicket
 	expireAt time.Time
@@ -103,11 +98,9 @@ func (s *chatTicketStore) consume(id string) (chatTicket, bool) {
 	return entry.ticket, ok
 }
 
-// scheduleExpiry removes id after chatTicketTTL. Every ticket id is a fresh
-// 32-byte crypto/rand value (mint, above) and is never reused, so — unlike
-// the old shared expiringMap this once wrapped — there is no second write to
-// the same key to defend against here; a plain unconditional delete is
-// correct.
+// scheduleExpiry removes id after chatTicketTTL. Ticket ids are fresh 32-byte
+// crypto/rand values and never reused, so there is no second write to the same
+// key to defend against: an unconditional delete is correct.
 func (s *chatTicketStore) scheduleExpiry(id string) {
 	time.AfterFunc(chatTicketTTL, func() {
 		s.mu.Lock()
@@ -129,7 +122,7 @@ func (h *Handler) chatTicket(w http.ResponseWriter, r *http.Request) {
 
 // --- Guests ------------------------------------------------------------------
 //
-// Why guests exist and what they cost: DECISIONS.md "Optional sign-in".
+// Why guests exist and what they cost: ARCHITECTURE.md's "Sign-in is optional".
 //
 // What this file enforces: a guest has no users row, so nothing user-scoped is
 // read or written for it; ?guest=1 declares a guest and a ticket declares an
@@ -137,13 +130,15 @@ func (h *Handler) chatTicket(w http.ResponseWriter, r *http.Request) {
 // becomes a different mode; within a connection userID == "" is the guest, and
 // mint above refuses to ever issue that value.
 //
-// A per-IP token bucket gates guest "message" frames (TASKS.md T33, via
-// guestRateLimiters below) — it stops one client from being the exhaustion
-// vector, but it does not divide the shared quota fairly among several
-// concurrently active guests, and a model 429 still reaches the user as "try
-// again in a moment" (friendlyError) regardless. It gates a frame on an
-// already-open socket, never the upgrade itself: a browser can't read a
-// rejected upgrade's status, so nothing here refuses a connection.
+// A per-IP token bucket gates guest "message" frames (guestRateLimiters
+// below), so one client can't be the exhaustion vector. It does not divide the
+// quota: several concurrent guests still contend for the same Gemini free
+// tier, and a model 429 reaches the user as "try again in a moment"
+// (friendlyError) either way.
+//
+// The bucket gates a frame on an already-open socket, never the upgrade
+// itself: a browser can't read a rejected upgrade's status, so nothing here
+// refuses a connection.
 
 // Every account is provisioned into users.country's default
 // (20260831230634_streaming.sql), so a guest hard-wired to the same value sees
@@ -153,6 +148,8 @@ const guestRegion = "US"
 
 // Bounds one message's providers list — the picker offers a few dozen per
 // region, so anything past this is a malformed frame, not a real selection.
+// Mirrors web/src/lib/guest.ts's MAX_GUEST_PROVIDERS, which stops a longer
+// list reaching the wire in the first place.
 const maxGuestProviders = 50
 
 // Mirrors web/src/lib/guest.ts's MAX_PROVIDER_ID. TMDB's ids are four digits;
@@ -168,7 +165,7 @@ const defaultGuestTurnCap = 20
 const guestTurnCapText = "You've reached the guest limit for this session — sign in to keep chatting."
 
 // guestRateLimiters is a per-IP token bucket shared by every guest socket
-// from that IP (TASKS.md T33) — deliberately not per-socket, since opening a
+// from that IP — deliberately not per-socket, since opening a
 // fresh socket must not hand a client a fresh budget. In-memory and
 // single-instance, same limitation as chatTicketStore.
 //
@@ -192,9 +189,9 @@ type guestRateLimiterEntry struct {
 	lastSeen time.Time
 }
 
-// Sized against the shared LLM quota, not one guest's own budget: TASKS.md's
-// "Shared LLM quota" note puts the whole app's Gemini free tier at ~7
-// turns/min (15 req/min, two calls a turn), shared by every guest and
+// Sized against the shared LLM quota, not one guest's own budget: Gemini's
+// free tier allows 15 requests a minute and a turn costs two calls, so the
+// whole app has roughly 7 turns a minute, shared by every guest and
 // account. One IP steady-refilling at 2/min leaves headroom for several
 // concurrently active guests before the app-wide ceiling is reached, while a
 // burst of 3 still covers an opening message plus a couple of quick
@@ -204,8 +201,9 @@ var defaultGuestRateLimit = rate.Every(30 * time.Second)
 const defaultGuestRateBurst = 3
 
 // Idle IPs are swept so the map can't grow without bound over the process's
-// lifetime — unlike conversationDeletions, which stays unbounded because
-// deletes are low-volume, distinct guest IPs visiting over time are not.
+// lifetime: distinct guest IPs arrive far faster than the deletes that grow
+// conversationDeletions, and a forgotten limiter costs a guest one free burst
+// rather than correctness.
 const defaultGuestLimiterIdleTTL = 30 * time.Minute
 const defaultGuestLimiterSweepInterval = 10 * time.Minute
 
@@ -317,48 +315,29 @@ func loadGuestChatContext(db *pgxpool.Pool) func(ctx context.Context, providers 
 
 // --- Tracking conversations deleted mid-turn --------------------------------
 //
-// Deleting a conversation (conversations.go's deleteConversationHandler) is a
-// plain HTTP request, racing whatever WS turn might still be in flight on
-// that same conversation id. Without this, a straggling turn's own persist
-// (finishTurn, via saveMessages) can land after the delete and silently
-// recreate the conversation row through saveMessages' own
-// on-conflict-do-nothing insert — that insert can't tell "already exists
-// because it's ongoing" from "already exists because it was just deleted."
+// Deleting a conversation is a plain HTTP request, racing whatever WS turn is
+// still in flight on that id. Without this, a straggling finishTurn's persist
+// lands after the delete and recreates the row through saveMessages'
+// on-conflict-do-nothing insert, which can't tell "exists because it's
+// ongoing" from "exists because it was just deleted."
 //
-// A boolean "was this deleted recently" tombstone can't make that
-// distinction from "a brand-new, legitimate turn was dispatched after the
-// delete, against the same conversation id" (e.g. the browser's back button
-// reopening a since-deleted conversation's URL and sending a fresh message
-// to it) — both look identical to a plain within-TTL check, and the second
-// case would be wrongly dropped. A monotonic per-conversation generation
-// counter fixes that: dispatch captures the conversation's current
-// generation (runChatConnection), and finishTurn only suppresses persistence
-// if the generation has moved on since — i.e. a delete actually happened
-// strictly after this turn was dispatched, not merely at some point within
-// the TTL window.
+// A monotonic per-conversation generation makes that distinction: dispatch
+// captures the current generation (runChatConnection) and finishTurn
+// suppresses its persist only if the generation moved on since. A boolean
+// tombstone can't — it reads a legitimate new turn dispatched after the
+// delete (the back button reopening a deleted conversation's URL) the same as
+// a straggler.
 //
-// Deliberately never expired. An earlier version wrapped an expiringMap and
-// aged each id's generation out after a 40s TTL, sized to outlast a
-// straggling turn's own finishTurn call — safe for that alone (a turn can
-// only still be in flight for roughly turnDeadline+provisionTimeout after
-// dispatch, comfortably under 40s), but a since-removed per-connection
-// history cache also read this same generation to decide whether its own
-// long-lived in-memory entry was still trustworthy, and could live far past
-// 40 seconds. Once the TTL passed with nothing to notice the gap,
-// generation() reverted to 0 ("never deleted"), letting that cache silently
-// serve pre-deletion history as agent context indefinitely — the bug this
-// permanent map exists to prevent. It stays permanent even with that cache
-// gone: a real delete must stay remembered for as long as anything might
-// still hold pre-delete data, and nothing bounds how long a turn dispatched
-// against a long-open connection might straggle. Growth is bounded by how
-// many conversations are ever actually deleted across the app's whole
-// lifetime — a low-volume, user-driven event — so an unbounded map is the
-// simpler, correct choice at this app's scale.
+// Never expired. An aged-out generation reverts to 0, "never deleted", and
+// nothing anywhere notices — finishTurn stops suppressing and a deleted
+// conversation reappears. A straggling turn is bounded (turnDeadline plus the
+// persist, ~32s), so finishTurn alone would tolerate a generous TTL; the risk
+// is anything longer-lived that reads generation(), for which no TTL is
+// demonstrably long enough. Permanence is cheap: one int per conversation ever
+// deleted, a low-volume, user-driven event.
 //
-// In-memory, single-instance — same limitation as chatTicketStore: if this
-// ever runs more than one gateway replica, a delete landing on one instance
-// while a straggler or a cache entry lives on another would miss this check
-// entirely.
+// In-memory, single-instance — same limitation as chatTicketStore: a delete
+// landing on one replica while a straggler lives on another misses this check.
 type conversationDeletions struct {
 	mu   sync.Mutex
 	gens map[string]int
@@ -391,13 +370,13 @@ func (c *conversationDeletions) generation(id string) int {
 
 // --- WebSocket upgrade and per-connection turn loop -------------------------
 //
-// One socket per session (../../DECISIONS.md): messages up, curated events
+// One socket per session (ARCHITECTURE.md): messages up, curated events
 // down, an explicit cancel rather than hanging up and hoping the server
 // notices. The gateway owns conversation state for the life of the
-// connection, seeded and persisted via conversations.go (TASKS.md T20).
+// connection, seeded and persisted via conversations.go.
 
 // inboundMessage is what the browser sends up the socket. Conversation is
-// required on every "message" frame (TASKS.md T20.5) — the client generates
+// required on every "message" frame — the client generates
 // each conversation's id itself (see web/src/lib/chat-socket.ts), so a
 // connection may carry turns for more than one conversation over its
 // lifetime as the user switches between them.
@@ -415,10 +394,10 @@ type inboundMessage struct {
 // maxMessageLength bounds one chat message's text, in runes (counted via
 // utf8.RuneCountInString, which walks the UTF-8 bytes without allocating a
 // []rune copy just to measure it) — so a multi-byte character is never
-// split. Comfortably under the 32 KiB default per-frame read limit
+// split. Comfortably under the 32 KiB default per-message read limit
 // coder/websocket enforces, even once the rest of the envelope and a
 // guest's providers list are added — the point is for this check to fire
-// first, with a clear message, rather than the raw frame ever getting big
+// first, with a clear message, rather than the message ever getting big
 // enough to trip the wire limit and silently kill the whole connection
 // (web/src/lib/chat-socket.ts's MAX_MESSAGE_LENGTH mirrors this).
 const maxMessageLength = 4000
@@ -440,7 +419,7 @@ type outboundEvent struct {
 	Text    string      `json:"text,omitempty"`
 	Picks   []agentPick `json:"picks,omitempty"`
 	Relaxed []string    `json:"relaxed,omitempty"`
-	// The agent's one-line explanation of a widened search (T30), empty
+	// The agent's one-line explanation of a widened search, empty
 	// whenever nothing was relaxed. Composed there, beside the rest of the
 	// relaxation copy, rather than templated here like interpretingLine:
 	// splitting it from agent/chat.py's _nothing_found_message would
@@ -470,7 +449,7 @@ type turnRecord struct {
 	// The conversation this turn was actually dispatched for — fixed at
 	// dispatch (see runTurn), independent of whichever conversation the
 	// coordinator considers current by the time this reports back. A user
-	// may switch conversations (TASKS.md T20.5) while a turn on the old one
+	// may switch conversations while a turn on the old one
 	// is still finishing; finishTurn uses this, not the coordinator's
 	// current pointer, to decide what to persist and whether to merge into
 	// the in-memory history window.
@@ -501,18 +480,13 @@ type turnRecord struct {
 }
 
 // Only the last few exchanges reach the agent — see agent/chat.py's
-// MAX_HISTORY_TURNS and TASKS.md T14's "decide how much history goes to the
-// agent." "show me more"/pagination replaying a stored DiscoverIntent (T13's
-// own suggested mechanism) would serve that follow-up case better than raw
-// history text, but building it is out of scope here — see agent/README.md.
+// MAX_HISTORY_TURNS.
 //
-// Five, not two, because the interpret prompt now carries a follow-up's
-// parameters forward out of this history ("show me more" repeats the previous
-// request — agent/catalog_tool.py's _INTERPRET_SYSTEM_PROMPT), and maxShownRefs
-// below budgets for four such rounds. At two exchanges the original request
-// fell out of the window on the third one, and "show me more" quietly became
-// "show me anything". The extra cost is a handful of short lines per turn —
-// an assistant turn's stored text is one "Suggested: A, B, C" sentence.
+// Five, not two, because the interpret prompt carries a follow-up's parameters
+// forward out of this history ("show me more" repeats the previous request —
+// agent/catalog_tool.py's _INTERPRET_SYSTEM_PROMPT), and maxShownRefs below
+// budgets for four such rounds. At two, the original request fell out of the
+// window on the third exchange and "show me more" became "show me anything".
 const maxHistoryExchanges = 5
 
 // How much of a conversation loadConversation reads back. Deep enough for both
@@ -521,13 +495,13 @@ const maxHistoryExchanges = 5
 // shownFromHistory needs about maxShownRefs/RESULT_FLOOR assistant rows to
 // refill the shown set, doubled for the user rows interleaved with them.
 //
-// Sized off the agent's *floor* rather than its ceiling, because the floor is
-// what a turn actually guarantees — sizing off ten refs a turn assumed every
-// turn fills, and a run of five-pick turns then forgot titles a guest would
-// still remember. A budget rather than a guarantee even so: a lookup turn
-// carries one ref and a message turn none. Written flat rather than derived
-// because the derivation is what encoded the wrong assumption;
-// TestSeededMessagesCoversBothItsConsumers holds both ends instead.
+// Sized off the agent's *floor* rather than its ceiling: the floor is the
+// weaker target, so budgeting against it survives a run of thin turns that
+// budgeting against the ceiling would not. A budget rather than a guarantee
+// even so — a lookup turn carries one ref and a message turn none. A flat
+// literal rather than a formula on purpose: deriving it risks re-anchoring
+// on the ceiling instead of the floor, the distinction the line above exists
+// to avoid.
 const maxSeededMessages = 20
 
 // The backstop for a turn that never comes back. The agent bounds its own
@@ -557,6 +531,10 @@ const (
 // reaches — verdicts exclude on top of it, which is why the agent's copy for
 // that case says "everything I found" rather than "everything there is". See
 // TestShownWindowStaysShorterThanTheAgentsPagingReach.
+//
+// Also held under agent/chat.py's MAX_SHOWN, that side's backstop on the same
+// list: past it the agent truncates and silently excludes fewer titles than this
+// window claims to suppress.
 const maxShownRefs = 40
 
 func windowShown(refs []agentTitleRef) []agentTitleRef {
@@ -713,7 +691,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 	var guestConv string
 	var guestHistory []historyTurn
 	var guestTurns int
-	// The titles already shown on this connection (T30) — guests only. An
+	// The titles already shown on this connection — guests only. An
 	// account's are read back from messages.title_refs on every message
 	// instead, beside the history: see the load below for why connection
 	// memory is the wrong home for state the database already holds.
@@ -845,14 +823,12 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 			case "message":
 				// msg.Turn is the sole correlation key between this dispatch
 				// and its `done` record (see the "done" case's currentTurn
-				// match) — but "" doubles as runChatConnection's own "no
-				// turn active" sentinel, so letting it through as a real
-				// turn id is what let a duplicate empty Turn panic the
-				// "done" case on a nil cancelCurrent (T32). Rejecting only
-				// emptiness, not requiring any particular shape: unlike
-				// conversationID below, turn is never used as a database
-				// key or parsed as a uuid anywhere, only echoed back on the
-				// wire and compared by Go string equality.
+				// match), and "" doubles as runChatConnection's "no turn
+				// active" sentinel — so an empty turn id must never reach it.
+				// Rejecting only emptiness, not requiring any particular
+				// shape: unlike conversationID below, turn is never a database
+				// key or parsed as a uuid, only echoed back and compared by
+				// string equality.
 				if msg.Turn == "" {
 					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
 					continue
@@ -864,7 +840,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				parsedConv, err := uuid.Parse(msg.Conversation)
 				if err != nil {
 					// Malformed frame — every real client always supplies a
-					// well-formed uuid (TASKS.md T20.5); conversations.id is
+					// well-formed uuid; conversations.id is
 					// a uuid column, so letting anything else reach a query
 					// would surface as a database type-cast error rather
 					// than a clean signal. Reachable today via /chat/[id]'s
@@ -937,7 +913,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 
 				// A new message supersedes whatever is in flight — belt and
 				// suspenders alongside the client disabling send while
-				// streaming (TASKS.md T14): the gateway never trusts the
+				// streaming: the gateway never trusts the
 				// client alone to keep two turns from overlapping.
 				if cancelCurrent != nil {
 					cancelCurrent()
@@ -945,12 +921,9 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 
 				if !guest {
 					// Loaded fresh on every message rather than cached: a
-					// per-connection history cache used to live here, but
-					// its invalidation rules were the source of most of
-					// this feature's bugs, for a database read cheap enough
-					// to just repeat. (guestHistory above is that cache's
-					// shape again, but with no database to fall out of sync
-					// with, none of those rules apply to it.)
+					// read is cheap, and a cache here would need
+					// invalidation rules the database keeps outrunning.
+					// (guestHistory above has no database to diverge from.)
 					loadCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
 					history, err = h.loadConversation(loadCtx, userID, conversationID)
 					cancel()
@@ -996,13 +969,10 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 		case rec := <-done:
 			outstanding--
 			// cancelCurrent != nil is defence in depth, not load-bearing:
-			// the "message" case's emptiness check above already keeps
-			// msg.Turn from ever colliding with currentTurn's own "no turn
-			// active" sentinel, which is what let two done-records both
-			// match a stale currentTurn == "" and the second one panic here
-			// on an already-nilled cancelCurrent (T32). Turn-id uniqueness
-			// beyond non-emptiness is still just client convention (every
-			// real client mints a fresh crypto.randomUUID() per message —
+			// the "message" case's emptiness check already keeps msg.Turn
+			// from colliding with currentTurn's "no turn active" sentinel.
+			// Turn-id uniqueness beyond non-emptiness is client convention
+			// (each client mints a crypto.randomUUID() per message —
 			// web/src/lib/chat-socket.ts), not enforced here.
 			if rec.turn == currentTurn && cancelCurrent != nil {
 				// Release turnDeadline's timer now rather than letting it
@@ -1020,26 +990,19 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 // finishTurn persists rec (if it succeeded) against the conversation it was
 // actually run against, rec.conversation — never whatever the coordinator
 // considers current now, since the user may have switched to a different
-// conversation (TASKS.md T20.5) while this turn was still finishing.
+// conversation while this turn was still finishing.
 //
 // Skips persisting when rec.conversation's generation has moved on since
-// this turn was dispatched (rec.deletionGen) — meaning a real delete landed
-// strictly after dispatch, so this turn's own persist would otherwise
-// resurrect the conversation the delete just removed via saveMessages'
-// on-conflict-do-nothing insert. A turn dispatched *after* a delete captures
-// the post-delete generation itself, so this comparison never suppresses it
-// — only a genuine straggler that predates the delete has a strictly
-// smaller captured generation than the current one.
+// dispatch (rec.deletionGen): a straggler would otherwise resurrect the row
+// the delete just removed. Only a straggler predating the delete has a
+// smaller captured generation — a turn dispatched after one captures the
+// post-delete value and is never suppressed.
 //
-// Takes two contexts, same split as runTurn's turnCtx/connCtx: dbCtx governs
-// the save to the database, and eventCtx gates every sendTerminalEvent call
-// below (the "conversation_created" confirmation and the RLS-rejection
-// error) via writeEvent's own cancellation guard. They're the same context
-// at every call site except runChatConnection's shutdown drain, where dbCtx
-// is context.Background() (ctx has already fired, so a save derived from it
-// would fail immediately) but eventCtx stays ctx — deliberately already
-// Done, so that guard skips writing a stale event down a connection that's
-// already being torn down by that same shutdown.
+// Two contexts, same split as runTurn's: dbCtx governs the save, eventCtx
+// gates the sendTerminalEvent calls below. Identical at every call site but
+// runChatConnection's shutdown drain, where dbCtx is context.Background() (ctx
+// has fired, so a save derived from it fails immediately) and eventCtx stays
+// ctx — already Done, so no stale event is written down a closing connection.
 func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec turnRecord, conn *websocket.Conn) {
 	if !rec.ok {
 		return
@@ -1049,8 +1012,8 @@ func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec
 		return
 	}
 	// Blocking, not backgrounded: a two-row insert, not a TMDB round trip
-	// — DECISIONS.md's bar for this file ("shipping the simpler design
-	// cleanly beats the complex one badly").
+	// — and the simpler design shipped cleanly beats the complex one shipped
+	// badly.
 	saveCtx, cancel := context.WithTimeout(dbCtx, provisionTimeout)
 	created, err := h.saveMessages(saveCtx, userID, rec.conversation, rec.userText, rec.assistantText, rec.titleRefs)
 	cancel()
@@ -1058,15 +1021,15 @@ func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec
 		// A conversation id this session can't write into (foreign, or
 		// deleted between dispatch and this persist attempt) is not a server
 		// failure — it's saveMessages' own explicit ownership check
-		// (errConversationNotWritable, T34) or, failing that, RLS's
+		// (errConversationNotWritable) or, failing that, RLS's
 		// message_isolation policy as a second, independent backstop
 		// (isRLSRejection). Either way the browser must be told: the turn's
 		// answer was shown but will never be saved, and nothing else will
-		// ever tell the user that (T32/DECISIONS.md: "always a terminal
-		// frame"). The agent has already spent its call by the time this is
-		// caught; checking ownership earlier would mean either bypassing RLS
+		// ever tell the user that — a turn always ends in a terminal frame
+		// (ARCHITECTURE.md). The agent has already spent its call by the time
+		// this is caught; checking ownership earlier would mean either bypassing RLS
 		// or duplicating saveMessages' own conflict logic ahead of the turn,
-		// both bigger changes than this task takes on.
+		// both bigger changes than this path warrants.
 		//
 		// Every other persist failure stays a silent log: what the user
 		// already saw stays on screen, and the next message on this
@@ -1113,34 +1076,28 @@ func (h *Handler) sendProgressEvent(turnCtx context.Context, conn *websocket.Con
 // failure events — gated on connCtx, never turnCtx. turnCtx being Done is
 // exactly the situation a terminal frame exists to report, so gating one on
 // turnCtx would silently swallow the very deadline/cancel/supersede signal
-// it's supposed to deliver (T32).
+// it's supposed to deliver.
 //
-// Split from sendProgressEvent into two named functions, rather than one
-// sendEvent left to every call site's judgment about which context to pass:
-// both contexts are always in scope wherever a turn is running, so nothing
-// stopped a future call site from copy-pasting the wrong one — which is
-// exactly how this bug happened the first time. Reading "sendTerminalEvent
-// (turnCtx, ...)" at a call site is a visible contradiction in a way
-// "sendEvent(turnCtx, ...)" never was.
+// Two named functions rather than one sendEvent taking a context: both
+// contexts are in scope wherever a turn runs, so a single entry point leaves
+// each call site free to pass the wrong one. "sendTerminalEvent(turnCtx, ...)"
+// is a visible contradiction; "sendEvent(turnCtx, ...)" is not.
 func (h *Handler) sendTerminalEvent(connCtx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) bool {
 	return h.writeEvent(connCtx, conn, turn, ev)
 }
 
 // writeEvent is sendProgressEvent's and sendTerminalEvent's shared
-// implementation. Not called directly by anything else: it takes whichever
-// context its caller decided was correct and enforces nothing about that
-// choice itself, which is exactly why those two functions exist as the
-// named, one-per-meaning callers instead of exposing this directly.
+// implementation, and is not called directly by anything else: it enforces
+// nothing about which context it is handed.
 //
 // Checks ctx first so a write that's no longer wanted never reaches the
-// browser after the fact. conn == nil is a second, defensive guard: the
-// real call sites always pass a live connection, but finishTurn is also
-// called directly (with no connection) from unit tests, where safety
-// shouldn't depend on every test fake correctly returning created == false.
-// Reports whether the event actually reached the browser. Most callers ignore
-// that — a dropped event is already the intended outcome here — but the
-// "results" case needs it: picks the user never saw must not join the
-// already-shown set.
+// browser after the fact. Real call sites always pass a live connection, so
+// conn == nil is reachable only from unit tests calling finishTurn directly —
+// it is here so correctness doesn't rest on every fake returning
+// created == false, which would otherwise nil-deref the created branch.
+// Reports whether the event reached the browser: most callers ignore that,
+// but the "results" case needs it, since picks the user never saw must not
+// join the already-shown set.
 func (h *Handler) writeEvent(ctx context.Context, conn *websocket.Conn, turn string, ev outboundEvent) bool {
 	if ctx.Err() != nil || conn == nil {
 		return false
@@ -1227,7 +1184,7 @@ func summarizePicks(picks []agentPick, isLookup bool) string {
 // the post-loop fallback) — turnCtx being Done is exactly the condition a
 // terminal frame exists to report, so gating those on turnCtx instead is
 // what let a cancelled/superseded/timed-out turn end with no terminal frame
-// at all and the composer stuck disabled (T32). See sendTerminalEvent's own
+// at all and the composer stuck disabled. See sendTerminalEvent's own
 // doc comment for the same split from the other side.
 func (h *Handler) runTurn(
 	turnCtx context.Context,
@@ -1242,18 +1199,12 @@ func (h *Handler) runTurn(
 ) {
 	rec := turnRecord{turn: turnID, conversation: conversationID, deletionGen: deletionGen}
 	defer func() {
-		// done is unbuffered, and runChatConnection stops reading it once the
-		// connection dies — without an escape hatch, this send blocks forever
-		// on the ordinary "client closed the tab mid-answer" path, leaking
-		// this goroutine permanently. That escape hatch must be connCtx, not
-		// turnCtx: turnCtx also becomes Done on an ordinary supersede or
-		// turnDeadline expiry, which happens while the coordinator is very
-		// much still alive and reading `done` — racing that against turnCtx
-		// would let Go's uniform-random select silently drop a legitimately
-		// completed turn's record about as often as it delivers it. connCtx
-		// only closes when the connection itself is torn down, which is
-		// exactly the "nobody will ever read done again" condition this
-		// needs.
+		// done is unbuffered and runChatConnection stops reading it once the
+		// connection dies, so this send needs an escape hatch or it leaks the
+		// goroutine when the client closes the tab mid-answer. It must be
+		// connCtx: turnCtx is also Done on a supersede or deadline expiry,
+		// while the coordinator is still reading `done`, and select would then
+		// drop a completed turn's record about half the time.
 		select {
 		case done <- rec:
 		case <-connCtx.Done():
@@ -1287,9 +1238,10 @@ func (h *Handler) runTurn(
 	// and running loadChatCtx first means a cancelled turn bails before this.
 	//
 	// A failure here fails the turn rather than degrading to no verdicts.
-	// TASKS.md is explicit that "the chat cannot degrade," and degrading
-	// would silently re-show titles the user marked seen — breaking exactly
-	// the guarantee T19 exists to make, in the direction users notice.
+	// The chat is the one surface that cannot degrade (ARCHITECTURE.md's
+	// Failure rules), and degrading would silently re-show titles the user
+	// marked seen — breaking the promise that a title marked seen is never
+	// suggested again, in the direction users notice.
 	// Skipped for a caller with no subscriptions: the agent answers that with
 	// its "pick your services" message before it ever looks at verdicts
 	// (agent/chat.py's stream_chat), so loading them is work whose result is
@@ -1338,24 +1290,22 @@ func (h *Handler) runTurn(
 		return
 	}
 
-	// turnCtx.Err() is checked inside each *progress* case below, never once
-	// before the switch: the events channel is unbuffered, so the agent's
-	// own producer goroutine (newAgentCaller) races an identical
-	// `select { case events <- ev: case <-turnCtx.Done(): }` against this
-	// receive — a legitimate "results"/"message" can already be off the
-	// channel and in `ev` by the time turnCtx fires, in which case this
-	// still drops it via `continue`, same as before. What this restructuring
-	// actually fixes is "done"/"error": moving the check off the shared
-	// pre-switch position means those two cases no longer check turnCtx at
-	// all, so the one event that's *supposed* to end the turn can never be
-	// discarded by this race — only a still-narrower loss of a "results"/
-	// "message" event immediately preceding a "done" remains possible, and
-	// even then the turn still ends with a correct terminal frame, just with
-	// rec.ok left false. "error" and "done" gate on connCtx and return, so
-	// they report correctly regardless of turnCtx's state. If turnCtx fires
-	// before the agent's HTTP call notices, that call's own context
-	// cancellation closes `events` on its own (newAgentCaller), which the
-	// post-loop fallback below already handles.
+	// turnCtx.Err() is checked inside each *progress* case, never once before
+	// the switch: "done" and "error" must not check it at all, so the event
+	// that ends the turn can't be discarded by a cancel racing this receive.
+	//
+	// The race is real either way: `events` is unbuffered and newAgentCaller
+	// runs a mirrored select against this receive, so a "results"/"message"
+	// can already be in `ev` when turnCtx fires and is then dropped by the
+	// `continue` below. That residual is accepted — the turn still ends with a
+	// correct terminal frame, but rec.ok stays false and nothing is persisted.
+	// A clean "done" with no row in messages is this case, not a bug in
+	// finishTurn.
+	//
+	// "done" and "error" gate on connCtx and return instead, reporting
+	// correctly whatever turnCtx is doing. If turnCtx fires before the agent's
+	// HTTP call notices, that call's cancellation closes `events`
+	// (newAgentCaller) and the post-loop fallback below handles it.
 	for ev := range events {
 		switch ev.Type {
 		case "intent":
@@ -1429,22 +1379,21 @@ func (h *Handler) runTurn(
 	// Reached only if the channel closed without "done" or "error" ever
 	// firing (both return above) — a transport failure (see newAgentCaller's
 	// scanner.Err() log) or an agent-side bug that dropped the stream mid-way.
-	// TASKS.md: "A dropped stream keeps what arrived, marks it incomplete,
-	// and offers a retry — it never just stops mid-sentence looking
-	// finished." rec.ok may already be true from an earlier "results"/
-	// "message" event in this same stream — that's left as-is, not reset:
-	// what the user already saw stays what the user saw (DECISIONS.md:
-	// "stored history must match what the user saw"), this fallback only
-	// adds the missing "and it didn't finish cleanly" signal on top. connCtx,
-	// not turnCtx: this is exactly the 30s turnDeadline-expiry path T32
-	// exists to fix — turnCtx is reliably Done by the time this line runs,
-	// so gating on it would silently drop the one event this fallback exists
-	// to send.
+	// A dropped stream keeps what arrived, marks it incomplete and offers a
+	// retry, rather than stopping mid-sentence looking finished
+	// (ARCHITECTURE.md's Failure rules). rec.ok may already be true from an
+	// earlier "results"/ "message" event in this same stream — that's left
+	// as-is, not reset: what the user already saw stays what the user saw
+	// (ARCHITECTURE.md's Failure rules), this fallback only adds the missing
+	// "and it didn't finish cleanly" signal on top. connCtx, not turnCtx: on the
+	// 30s turnDeadline-expiry path turnCtx is reliably Done by the time this
+	// line runs, so gating on it would silently drop the one event this fallback
+	// exists to send.
 	h.sendTerminalEvent(connCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
 }
 
 // interpretingLine is templated from the agent's DiscoverIntent, never a
-// second model call (TASKS.md T14) — it doubles as a comprehension check, so
+// second model call — it doubles as a comprehension check, so
 // it must be on screen well before the full pipeline finishes.
 func interpretingLine(intent agentIntent, providerNames []string) string {
 	// A named-title lookup answers with that title, not a filtered search, so
@@ -1501,7 +1450,7 @@ func interpretingLine(intent agentIntent, providerNames []string) string {
 		line += " " + strings.Join(clauses, ", ")
 	}
 	// Requires streaming_providers to have a cached row for the caller's
-	// country (T9's table; T15 owns keeping it fresh). Until then, or if the
+	// country, kept fresh by providers.go's lazy cache. Until then, or if the
 	// user's picks aren't in it yet, providerNames is empty and this clause is
 	// dropped — degrade the phrasing, never block on it.
 	if len(providerNames) > 0 {
@@ -1530,7 +1479,7 @@ func humanJoin(items []string) string {
 // have no verdict dependency, so loading them here would spend a query those
 // three discard and, worse, would 503 them on a title_verdicts problem they
 // have nothing to do with. runTurn assembles the third piece itself, from
-// verdicts.go's loadVerdicts — see there and T19.
+// verdicts.go's loadVerdicts.
 type chatContext struct {
 	Region        string
 	Providers     []int
@@ -1577,7 +1526,7 @@ func parseProviderNames(raw []byte, wanted []int) []string {
 // streaming_providers row — the one read both loadChatContext (inside its
 // transaction) and loadGuestChatContext (straight off the pool) share, so it
 // takes queryRower (main.go), what pgx.Tx and *pgxpool.Pool have in common.
-// No cached row yet (T15 populates it lazily on read) degrades to no names,
+// No cached row yet (providers.go fills it lazily on read) degrades to no names,
 // never an error: the interpreting line drops its "on …" clause, the turn
 // goes on.
 func cachedProviderNames(ctx context.Context, q queryRower, country string, wanted []int) ([]string, error) {
@@ -1648,14 +1597,14 @@ type agentChatRequest struct {
 	WatchProviders []int  `json:"watch_providers,omitempty"`
 	// Same values as chatContext.ProviderNames, already resolved for
 	// interpretingLine below — reused here so a capability-question answer
-	// (TASKS.md T16.5) can name the caller's services without the agent
+	// can name the caller's services without the agent
 	// needing its own TMDB lookup.
 	WatchProviderNames []string      `json:"watch_provider_names,omitempty"`
 	History            []historyTurn `json:"history,omitempty"`
-	// The caller's whole verdict set (T19); agent/catalog_tool.py's search()
+	// The caller's whole verdict set; agent/catalog_tool.py's search()
 	// decides what each value means.
 	Verdicts []Verdict `json:"verdicts,omitempty"`
-	// What has already been put on screen for this conversation (T30), so
+	// What has already been put on screen for this conversation, so
 	// "show me 10 more" means ten different titles. An account's comes from
 	// messages.title_refs, read back on every message beside the history
 	// (shownFromHistory); a guest's, having no rows, accumulates on the
@@ -1694,7 +1643,7 @@ type agentIntent struct {
 // merged with per-title runtime/cast (tmdb.TitleDetails), resolved genre
 // names, availability filtered to the caller's own subscriptions, and
 // rank()'s blurb. Forwarded to the browser close to verbatim — the
-// title-card rendering is TASKS.md T16.5's job, not this one's.
+// title-card rendering is the browser's job, not this one's.
 type agentPick struct {
 	TMDBID         int      `json:"tmdb_id"`
 	MediaType      string   `json:"media_type"`
@@ -1716,7 +1665,7 @@ type agentPick struct {
 	// plain slice, so no extra type (e.g. a pointer) is needed here.
 	AvailableOn []agentProvider `json:"available_on"`
 	Blurb       string          `json:"blurb"`
-	// True only for a watchlist row (TASKS.md T18.5) whose TMDB lookup
+	// True only for a watchlist row whose TMDB lookup
 	// failed or the id no longer resolves — every other field on such a
 	// row is then a Go zero value, not real data. Absent (false) on every
 	// /chat pick.
@@ -1766,10 +1715,11 @@ type agentEvent struct {
 type agentCaller func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error)
 
 // newAgentCaller streams agent/main.py's POST /chat response (chunked NDJSON,
-// not a second WebSocket — see ../../DECISIONS.md) and parses it one line at
+// not a second WebSocket — ARCHITECTURE.md's "One socket per session") and
+// parses it one line at
 // a time onto a channel. Cancelling ctx aborts the underlying HTTP request,
 // which is the whole of this codebase's cancel story for the agent call — see
-// chat.go's runTurn and DECISIONS.md's "One socket per session."
+// chat.go's runTurn and ARCHITECTURE.md's "One socket per session."
 func newAgentCaller(client *http.Client, baseURL string) agentCaller {
 	return func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
 		body, err := json.Marshal(req)
@@ -1796,9 +1746,8 @@ func newAgentCaller(client *http.Client, baseURL string) agentCaller {
 			defer close(events)
 			defer resp.Body.Close()
 			scanner := bufio.NewScanner(resp.Body)
-			// Titles carry overviews and posters for up to 20 candidates
-			// (TASKS.md T13's limit) — comfortably past the 64KiB default,
-			// nowhere near unbounded.
+			// Titles carry overviews and posters for up to 20 candidates —
+			// comfortably past the 64KiB default, nowhere near unbounded.
 			scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
 			for scanner.Scan() {
 				var ev agentEvent
@@ -1819,7 +1768,8 @@ func newAgentCaller(client *http.Client, baseURL string) agentCaller {
 			// early on "done"/"error" and falls through to an unconditional
 			// fallback otherwise, so whichever caused the drop, the browser
 			// still gets told the turn is incomplete rather than being left
-			// hanging (see runTurn and TASKS.md's dropped-stream rule).
+			// hanging — a dropped stream keeps what arrived and marks it
+			// incomplete, never stopping mid-sentence looking finished.
 			if err := scanner.Err(); err != nil {
 				slog.WarnContext(ctx, "agent stream ended abnormally", "error", err.Error())
 			}

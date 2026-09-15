@@ -10,7 +10,8 @@ execute them against TMDB, and return text. There is no service picker in the UI
 choosing what to reach for is this service's job.
 
 The agent is a pure function: history and context in, answer out. It retains nothing
-between turns and holds no conversation state — see `../DECISIONS.md`.
+between turns and holds no conversation state — see `../ARCHITECTURE.md`'s
+"One socket per session".
 
 ## Endpoints
 
@@ -143,7 +144,7 @@ else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`
 
 `chat.py`'s `stream_chat()` wraps `catalog_tool.search()` for `POST /chat`: a plain
 chunked HTTP response (`application/x-ndjson`), not a second WebSocket — the browser's
-socket belongs to the gateway alone (`../DECISIONS.md`). Each line is one event:
+socket belongs to the gateway alone (`../ARCHITECTURE.md`). Each line is one event:
 `intent` (as soon as `interpret()` resolves — well before the full pipeline finishes,
 via `search()`'s `on_intent` hook), `results` or `message` (candidates, or a plain reply
 when there are none — no subscriptions, nothing survived the relaxation ladder, or
@@ -159,7 +160,7 @@ HTTP call closes the response body, which stops `stream_chat()` iterating, which
 the background `search()` call — nothing bespoke on this side.
 
 `history` in the request body is the last few exchanges only, windowed by the gateway
-from a `messages` table that now persists the full conversation (`TASKS.md` T20) — this
+from a `messages` table that persists the full conversation — this
 agent still never reads that table itself, only the windowed slice handed to it per
 call. It is folded into the text handed to `interpret()`/`rank()` rather than changing
 `catalog_tool.py`'s `message: str` contract.
@@ -174,7 +175,7 @@ case is `all_shown` instead. Like verdicts, it does not filter a named-title loo
 and, symmetrically, a lookup turn does not *feed* the set either, nor does a turn whose
 cards the gateway dropped as cancelled — for a guest. An account's set is read back from
 `messages.title_refs`, which records neither distinction, so there a looked-up title can
-be suppressed from a later recommendation; TASKS.md T30 accepts that, and the clean fix
+be suppressed from a later recommendation; that is accepted, and the clean fix
 is a column rather than a heuristic on the stored text. The gateway keeps this window
 deliberately shorter than `MAX_DISCOVER_PAGES` pages of rows, so the window alone cannot
 outgrow what one query reaches past — verdicts exclude on top of it, though, so
@@ -205,7 +206,7 @@ detail — `TitleVerdict` carries no timestamp, so the agent cannot re-sort, or 
 notice if the order is lost. `services/gateway/verdicts.go` explains where that
 ordering is itself only a proxy.
 
-**Cold start (`TASKS.md` T21):** a brand-new account has `verdicts == []` and
+**Cold start:** a brand-new account has `verdicts == []` and
 `history == []`. Both are no-ops at that length — `_with_taste`/`_with_history` return
 the message unchanged — so `interpret()` and `rank()` see exactly what the caller typed,
 nothing folded in. There is no special-cased "new user" code path; the cold-start answer

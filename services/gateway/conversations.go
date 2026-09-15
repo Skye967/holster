@@ -23,7 +23,7 @@ const maxStoredHistoryMessages = 50
 // conversationTurn is the wire shape of GET /api/chat/history — one entry per
 // completed exchange. title_refs is deliberately not surfaced *to the browser*
 // here: nothing yet re-renders title cards from a reload, only the text (see
-// ARCHITECTURE.md's data model and DECISIONS.md's "One socket per session").
+// ARCHITECTURE.md's data model and its "One socket per session").
 // fetchRecentMessages does read the column — that is where an account's
 // already-shown set comes from (chat.go's shownFromHistory) — and this shape
 // simply drops it.
@@ -38,10 +38,9 @@ type conversationTurn struct {
 // loadConversationTurns (the reload-render path) — same query and scan,
 // different caps.
 //
-// Joined through conversations on user_id explicitly (T34), not left to
-// RLS's message_isolation policy alone — messages carries no user_id of its
-// own, so a role that bypasses RLS previously had no other guard on this
-// read at all.
+// Joined through conversations on user_id explicitly, not left to
+// RLS's message_isolation policy alone: messages carries no user_id of its
+// own, so this join is the only guard a role that bypasses RLS still meets.
 func fetchRecentMessages(ctx context.Context, tx pgx.Tx, userID, conversationID string, limit int) ([]historyTurn, error) {
 	// Newest-first with a limit, then reversed below, so the cap keeps the
 	// most recent messages rather than the oldest ones. Ordered by seq, not
@@ -118,14 +117,14 @@ const maxTitleLength = 60
 // defaultConversationTitle is what a sidebar row shows for a conversation
 // with no derived title yet — titleFromMessage's own fallback (an
 // empty/whitespace-only first message) and loadConversationSummaries'
-// coalesce fallback for a null title (a row from before T20.5 introduced
-// titles) share this one constant rather than each hardcoding "New chat".
+// coalesce fallback for a null title share this one constant rather than each
+// hardcoding "New chat".
 const defaultConversationTitle = "New chat"
 
-// titleFromMessage derives a conversation's title from its opening message
-// (TASKS.md T20.5: "generated from the first exchange, once, and stored") —
-// no second model call, the same principle as this file's interpretingLine
-// in chat.go. Whitespace is collapsed so a pasted multi-line question reads
+// titleFromMessage derives a conversation's title from its opening message —
+// generated from the first exchange, once, and stored, with no second model
+// call, the same principle as chat.go's interpretingLine. Whitespace is
+// collapsed so a pasted multi-line question reads
 // as one line. Only ever consulted by the winning side of saveMessages'
 // on-conflict insert, so the caller never needs to know whether this is
 // actually the conversation's first message — the constraint enforces
@@ -143,18 +142,15 @@ func titleFromMessage(text string) string {
 }
 
 // trimToGraphemeBoundary drops trailing rune(s) that titleFromMessage's
-// plain rune-count cutoff could otherwise leave dangling. Suffix truncation
-// (keep the first N runes) can only ever drop what comes *after* a kept
-// rune — so a combining mark, variation selector, or skin-tone modifier is
-// never stranded without its base: whichever one is last, the base right
-// before it (lower index) is always still there, and the result is always a
-// complete, if sometimes less-decorated, character. That leaves exactly two
-// genuine bisection hazards:
-//   - a trailing zero-width joiner, which joins *forward* to whatever
-//     would-be next emoji got cut away, leaving a dangling join; and
-//   - an odd-length trailing run of regional-indicator letters — each flag
-//     is an unordered pair (e.g. "US" is 🇺 U+1F1FA + 🇸 U+1F1F8), so an odd
-//     count means the last one is half a flag.
+// plain rune-count cutoff could leave dangling. Suffix truncation (keep the
+// first N runes) can only ever drop what comes *after* a kept rune, so a
+// combining mark, variation selector or skin-tone modifier is never stranded
+// without its base: whichever one is last, the base before it is still there.
+// That argument holds only for a suffix cut. The two hazards handled here:
+//   - a trailing zero-width joiner, which joins *forward* to the emoji that
+//     got cut away; and
+//   - an odd-length trailing run of regional-indicator letters — each flag is
+//     a pair (🇺 U+1F1FA + 🇸 U+1F1F8), so an odd count is half a flag.
 //
 // Not a full UAX #29 grapheme-cluster implementation — just these two.
 func trimToGraphemeBoundary(runes []rune) []rune {
@@ -172,7 +168,7 @@ func trimToGraphemeBoundary(runes []rune) []rune {
 }
 
 // loadConversation returns enough of conversationID's history to seed a
-// fresh WS connection's in-memory context (TASKS.md T20), or nil for a
+// fresh WS connection's in-memory context, or nil for a
 // conversation with nothing saved yet — a brand-new "new chat" id and a
 // foreign id both resolve the same way, via fetchRecentMessages' explicit
 // join and RLS both independently filtering down to zero rows. Capped at
@@ -194,15 +190,12 @@ func loadConversation(db *pgxpool.Pool) func(ctx context.Context, userID, conver
 }
 
 // loadConversationTurns pairs one conversation's stored messages into
-// completed exchanges for GET /api/chat/history/{conversationID}, and also
-// reports whether the conversation exists at all from this caller's point of
-// view. A foreign id and a genuinely nonexistent one are indistinguishable
-// here on purpose — the explicit user_id filter below and
-// conversation_isolation's RLS policy (20260904191046_conversations.sql)
-// both independently make another user's row invisible, not merely
-// filtered, the same ambiguity deleteConversationHandler already accepts for
-// the same reason — so exists is false for both, and chatHistory answers
-// both the same way (404) rather than pretending to tell them apart.
+// completed exchanges for GET /api/chat/history/{conversationID}, and reports
+// whether the conversation exists from this caller's point of view. A foreign
+// id and a nonexistent one both read as false, deliberately: the user_id
+// filter below and conversation_isolation's RLS policy each make another
+// user's row invisible rather than merely filtered, so chatHistory 404s both
+// rather than pretending to tell them apart.
 func loadConversationTurns(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error) {
 	return func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error) {
 		turns := []conversationTurn{}
@@ -228,38 +221,29 @@ func loadConversationTurns(db *pgxpool.Pool) func(ctx context.Context, userID, c
 	}
 }
 
-// saveMessages persists one completed turn against conversationID, lazily
-// creating that conversation row on first use rather than at WS-connect or
-// "new chat" time — the same lazy-provisioning shape as upsertUser, so
-// opening the app or clicking "New chat" without ever sending a message
-// leaves no orphaned row for the sidebar to show. Reports whether this call
-// is the one that actually created conversationID's row — RowsAffected() on
-// the conflict-checked insert, the same outcome-bool idiom deleteConversation
-// uses below — so chat.go's finishTurn can tell the browser exactly once,
-// right after the row genuinely exists, instead of inferring "there's
-// probably something new to show" from the WS event sequence. Only
-// meaningful when err is nil: a later failure in this same transaction (the
-// messages insert) rolls back the conversations insert too, so a caller must
-// not trust created on a non-nil error.
+// saveMessages persists one completed turn against conversationID, creating
+// that conversation row lazily on first use so opening the app or clicking
+// "New chat" without sending a message leaves no orphaned row in the sidebar.
 //
-// conversationID is always supplied by the caller (client-generated — see
-// web/src/lib/chat-socket.ts) rather than discovered here, so — unlike T20's
-// design — this never needs to hand an id back to its caller and never needs
-// RETURNING. The create is `on conflict (id) do nothing`: a second, third,
-// ... message against the same conversation simply no-ops the conversations
-// insert (title is set once, from the first, and created is then false) and
-// proceeds straight to the messages insert below.
+// Reports whether this call created the row, so finishTurn can tell the
+// browser exactly once. Only meaningful when err is nil: the messages insert
+// failing rolls the conversations insert back too.
 //
-// A conversationID belonging to another user fails closed, not silently: the
-// conversations insert's DO NOTHING never touches that pre-existing row, and
-// the messages insert immediately after joins through conversations on
-// user_id explicitly (T34) — a foreign id matches no row, inserts nothing,
-// and the RowsAffected check below turns that into errConversationNotWritable
-// rather than a silent no-op. message_isolation's RLS policy stays wired to
-// the same tables as a second, independent layer, not the only one: a random
-// client-generated UUID isn't a guessable oracle, and this is a materially
-// different trust profile than turn ids (never persisted, never a primary
-// key elsewhere).
+// conversationID is minted by the browser before the socket frame is sent —
+// by the /chat routes and the sidebar's "New chat" (web/src/app/(app)/chat/
+// page.tsx, [id]/page.tsx, components/app-sidebar.tsx), never here — so no
+// RETURNING is needed. A random client-chosen UUID is safe as the primary key
+// because it is not a guessable oracle: the create is `on conflict (id) do
+// nothing`, so a colliding id is absorbed rather than raising, and later
+// messages against the same conversation no-op it — the title is set once,
+// from the first. What rejects a *foreign* id is the messages insert below,
+// which joins through conversations on user_id.
+//
+// A conversationID belonging to another user fails closed: DO NOTHING leaves
+// the foreign row untouched, and the messages insert joins through
+// conversations on user_id, so it matches nothing and the RowsAffected
+// check below raises errConversationNotWritable. message_isolation's RLS
+// policy is a second, independent layer over the same tables.
 func saveMessages(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error) {
 	return func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error) {
 		// jsonb null (via a nil parameter), not the JSON literal "null" — a
@@ -309,9 +293,9 @@ func saveMessages(db *pgxpool.Pool) func(ctx context.Context, userID, conversati
 // errConversationNotWritable is saveMessages' own signal that conversationID
 // doesn't belong to this caller — the explicit join finding no matching row,
 // independent of RLS. chat.go's finishTurn treats this the same as
-// isRLSRejection (main.go): the one persist failure that must reach the
-// browser rather than stay a silent log (T32/DECISIONS.md: "always a
-// terminal frame").
+// isRLSRejection (main.go): the one persist failure the browser must be told
+// about rather than only logged, since a turn always ends in a terminal frame
+// (ARCHITECTURE.md).
 var errConversationNotWritable = errors.New("conversation does not belong to the caller")
 
 // conversationSummary is one entry of GET /api/conversations — enough for the
@@ -322,11 +306,8 @@ type conversationSummary struct {
 }
 
 // loadConversationSummaries lists the caller's conversations, newest first
-// (TASKS.md T20.5: "the sidebar lists past conversations, newest first").
-// coalesce(title, ...): every row created after this task always has a
-// title (saveMessages sets it at creation, once); only a row created before
-// T20.5 shipped, under T20's original one-conversation-per-user model, could
-// still hold a null one.
+// — what the sidebar lists. coalesce(title, ...) covers rows predating titles:
+// saveMessages sets one at creation, so only older rows can hold a null.
 func loadConversationSummaries(db *pgxpool.Pool) func(ctx context.Context, userID string) ([]conversationSummary, error) {
 	return func(ctx context.Context, userID string) ([]conversationSummary, error) {
 		summaries := []conversationSummary{}
@@ -383,8 +364,8 @@ func deleteConversation(db *pgxpool.Pool) func(ctx context.Context, userID, conv
 	}
 }
 
-// chatHistory is GET /api/chat/history/{conversationID} (TASKS.md T20/T20.5)
-// — the web client's mount-time hydration so opening a conversation
+// chatHistory is GET /api/chat/history/{conversationID} — the web client's
+// mount-time hydration so opening a conversation
 // re-renders its last exchanges rather than starting blank. Degrades the
 // same way watchlist() and verdicts() do: a load failure is a 503, never a
 // silent empty conversation.
@@ -443,8 +424,7 @@ func (h *Handler) conversations(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
-// deleteConversationHandler is DELETE /api/conversations/{id} (TASKS.md
-// T20.5: "conversations can be deleted").
+// deleteConversationHandler is DELETE /api/conversations/{id}.
 func (h *Handler) deleteConversationHandler(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(ctxUserID).(string)
 	id := r.PathValue("id")
@@ -473,15 +453,12 @@ func (h *Handler) deleteConversationHandler(w http.ResponseWriter, r *http.Reque
 	// suppress another user's still-legitimate straggling turn just by
 	// attempting to delete their conversation id.
 	//
-	// Accepted, narrow race: between h.deleteConversation's commit and this
-	// bump, a straggling finishTurn on this same id could check
-	// conversationDeletions.generation and see the pre-bump value, then
-	// resurrect the row via saveMessages' own on-conflict-do-nothing insert.
-	// Closing it would mean bumping before knowing `deleted` (violating the
-	// no-op-must-not-tombstone rule above) or a cross-process synchronization
-	// this single-instance, in-memory design doesn't have. The window is one
-	// Go statement wide and requires exact timing against a genuine
-	// straggler; not worth the complexity at this app's scale.
+	// Bumped after the commit, which leaves one statement in which a
+	// straggling finishTurn can read the pre-bump generation and recreate the
+	// row it just deleted. Closing it means either bumping before `deleted` is
+	// known — which would tombstone a no-op delete, the case above — or
+	// cross-process synchronisation this single-instance design has no way to
+	// do. Accepted: the window needs exact timing against a real straggler.
 	if deleted {
 		h.conversationDeletions.bump(id)
 	}

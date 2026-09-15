@@ -1,9 +1,8 @@
 import { SESSION_EXPIRED_TEXT } from "@/lib/gateway"
 
-// Shown in place of a redirect when GET /api/conversations fails — distinct
-// from MissingServicesNotice's "zero conversations, nothing wrong" case.
-// chat/page.tsx used to conflate the two, silently minting a fresh orphaned
-// conversation id on every load failure.
+// Shown in place of chat/page.tsx's redirect when GET /api/conversations
+// fails — a load failure, not an account with no conversations, which
+// redirects to a fresh id like any other.
 export function ChatListUnavailableNotice({
   sessionExpired,
 }: {
