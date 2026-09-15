@@ -36,7 +36,7 @@ interface Turn {
   userText: string
   interpreting?: string
   picks?: AgentPick[]
-  // Why this list was widened, when it was — see the agent's _relaxed_note.
+  // Why the search was widened, when it was — see the agent's _relaxed_note.
   note?: string
   tokenText?: string
   error?: string
@@ -131,8 +131,9 @@ function TurnView({
     expectedVerdict: Verdict,
   ) => void
 }) {
-  // No field has arrived yet — "Thinking…" rather than a blank screen.
-  // Update alongside applyEvent if Turn gains a new optional field.
+  // No field has arrived yet — "Thinking…" rather than a blank screen. `note`
+  // is left out because it only ever arrives with `picks`; a Turn field that
+  // can arrive alone belongs here, added alongside applyEvent.
   const pending =
     !turn.interpreting &&
     !turn.picks &&
@@ -203,7 +204,7 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
   // Every verdict the caller has set, hydrated once so a title's saved/judged
   // state is correct on first render rather than only after it's touched
   // this session — e.g. a title marked in an earlier conversation that
-  // resurfaces here. One GET, not one request per card (TASKS.md T18).
+  // resurfaces here. One GET, not one request per card.
   const [verdicts, setVerdicts] = useState<Record<string, Verdict>>({})
   // One entry per title, not per control: the bookmark button and the
   // judgment menu both write the same title_verdicts row, so both must
@@ -250,8 +251,8 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
   }, [isLoaded, getToken, guest])
 
   // Rehydrates conversationId's last exchanges on mount, so a page reload
-  // keeps the conversation (TASKS.md T20). A switch to a different
-  // conversation (TASKS.md T20.5) is a fresh mount, not a change this
+  // keeps the conversation. A switch to a different
+  // conversation is a fresh mount, not a change this
   // effect reacts to — [id]/page.tsx keys ChatPanel by conversationId, so
   // `turns` genuinely starts empty here, which is what the
   // "sent a message before the GET resolves" race below relies on. No
@@ -283,8 +284,8 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
   }, [isLoaded, getToken, conversationId, guest])
 
   // Shared by setVerdict/clearVerdict: optimistic update, then the write,
-  // reverting on failure — streaming-picker.tsx's toggle() pattern (TASKS.md's
-  // cross-cutting rule: "optimistic UI needs a rollback path").
+  // reverting on failure — streaming-picker.tsx's toggle() pattern. Optimistic
+  // UI needs a rollback path (ARCHITECTURE.md's Failure rules).
   //
   // expectedVerdict only matters when verdict is undefined (a DELETE): it's
   // the verdict this card is currently showing, sent as ?expect=<verdict> so
@@ -419,13 +420,10 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
     [writeVerdict],
   )
 
-  // Only renders the event into the turn it belongs to — whether that turn
-  // is still the active one, and clearing busy when it isn't, is
-  // chat-session-provider.tsx's job now (T32): it's the one thing that
-  // outlives this panel across a conversation switch, so it's the only
-  // reliable owner of that state. A stale/superseded turn's terminal event
-  // still lands here and still renders (e.g. the error text on an earlier,
-  // superseded turn) — it just doesn't touch the composer's disabled state.
+  // Only renders the event into the turn it belongs to; tracking which turn
+  // is active is chat-session-provider.tsx's job. A superseded turn's
+  // terminal event still lands here and still renders — it just doesn't
+  // touch the composer's disabled state.
   const handleEvent = useCallback((ev: ChatEvent) => {
     setTurns((prev) =>
       prev.map((t) => (t.id === ev.turn ? applyEvent(t, ev) : t)),
@@ -434,12 +432,10 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
 
   // Registers this mounted panel as the shared socket's current listener —
   // ChatSessionProvider forwards every event to whichever ChatPanel last
-  // called this, which is always the one for the conversation currently on
-  // screen. No onDisconnect: a disconnect mid-turn now reaches this panel as
-  // an ordinary "error" event on the turn it belongs to, synthesized by
-  // chat-session-provider.tsx (which is what actually knows which turn was
-  // active) and delivered through onEvent above like any other event — this
-  // panel has nothing else to do on a bare disconnect.
+  // called this, always the one on screen. No onDisconnect: a disconnect
+  // mid-turn reaches this panel as an ordinary "error" event on its turn,
+  // synthesized by chat-session-provider.tsx, which is what knows which turn
+  // was active.
   useEffect(() => {
     setListener({ onEvent: handleEvent })
     return () => clearListener()

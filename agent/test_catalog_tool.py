@@ -48,6 +48,8 @@ from testutil import (
     ALL_JUDGED,
     CAPABILITY_QUESTION,
     DISCOVER_RAISED,
+    GATEWAY_MAX_SEEDED_MESSAGES,
+    GATEWAY_MAX_SHOWN_REFS,
     INTERPRET_RAISED,
     MOVIE_A,
     NEEDS_CLARIFICATION,
@@ -602,7 +604,7 @@ def test_search_does_not_relax_when_the_first_query_fills_the_floor() -> None:
     assert result.relaxed == []
 
 
-# --- Enrichment (TASKS.md T16: runtime, cast, genre names, availability) ---
+# --- Enrichment: runtime, cast, genre names, availability ------------------
 
 
 def test_search_enriches_picks_with_runtime_cast_genres_availability() -> None:
@@ -907,7 +909,7 @@ def test_enrich_watchlist_does_not_short_circuit_on_empty_providers() -> None:
     assert pick["available_on"] == []
 
 
-# --- verdicts: exclusion and taste (T19) ------------------------------------
+# --- verdicts: exclusion and taste ------------------------------------------
 
 
 def _verdict(
@@ -1010,7 +1012,7 @@ def test_search_verdict_excludes_only_its_own_media_type() -> None:
 
 
 def test_search_relaxes_for_a_page_the_user_has_entirely_judged() -> None:
-    """The ladder's count is exclusion-aware (T30), so a page whose every row
+    """The ladder's count is exclusion-aware, so a page whose every row
     the user has rated reads as below the floor and the rungs fire. That is
     the useful answer — offering longer heist films beats a dead end — and it
     is safe because rungs accumulate: a rung that finds nothing changes
@@ -1042,13 +1044,13 @@ def test_search_relaxes_for_a_page_the_user_has_entirely_judged() -> None:
     assert fake_tmdb.count("/discover/movie") == 2
 
 
-# --- verdicts: pagination top-up (T19.5) ------------------------------------
+# --- verdicts: pagination top-up --------------------------------------------
 
 
 def test_search_reads_the_next_page_when_exclusion_leaves_too_few() -> None:
     """A judged-out first page still returns a full set of picks. Reading page
     2 of the query as asked is the answer to a thin page — never a wider
-    question (T30) — so this runs before the relaxation ladder, not after it."""
+    question — so this runs before the relaxation ladder, not after it."""
     fake_tmdb = FakeTMDB()
     # A full page is the only kind TMDB has more rows after.
     fake_tmdb.ok(
@@ -1361,7 +1363,7 @@ def test_search_drops_only_the_bad_taste_line_not_the_whole_hint() -> None:
     assert TASTE_HEADER in rank_saw[0]
 
 
-# --- cold start (T21) --------------------------------------------------------
+# --- cold start --------------------------------------------------------------
 
 
 def test_search_with_no_verdicts_sends_rank_the_bare_message() -> None:
@@ -1382,8 +1384,9 @@ def test_search_with_no_verdicts_sends_rank_the_bare_message() -> None:
 
 
 def test_enrich_watchlist_degrades_on_an_unusable_tmdb_body() -> None:
-    """TASKS.md's "degrade rather than fail wherever there is stored data" at
-    the endpoint that owes it. A 2xx carrying an error envelope is truthy, so
+    """Degrade rather than fail wherever there is stored data
+    (ARCHITECTURE.md's Failure rules), at the endpoint that owes it. A 2xx
+    carrying an error envelope is truthy, so
     title_with_details' empty-body check misses it and _trim_title_from_full
     would KeyError - which escapes _safe (TMDBError only), escapes
     enrich_known_title's plain gather, and 500s POST /titles, losing the whole
@@ -1405,7 +1408,7 @@ def test_enrich_watchlist_degrades_on_an_unusable_tmdb_body() -> None:
     assert picks[0]["unavailable"] is True
 
 
-# --- Named-title lookup (T27) ------------------------------------------------
+# --- Named-title lookup ------------------------------------------------------
 
 
 def _names(tiers: tuple[list[Title], list[Title], list[Title]]) -> list[str]:
@@ -1798,7 +1801,7 @@ def test_whitespace_only_title_is_not_a_lookup() -> None:
 
 
 def test_title_lookup_never_names_a_service_the_user_lacks() -> None:
-    # TASKS.md T13's availability invariant, on this path. Without a provider the
+    # The availability invariant, on this path. Without a provider the
     # caller doesn't have in the response, deleting the filter would keep every
     # other lookup test green.
     fake_tmdb = FakeTMDB()
@@ -2223,7 +2226,7 @@ def test_title_lookup_ignores_an_explicit_limit() -> None:
     assert len(result.picks) == MAX_TITLE_MATCHES
 
 
-# --- result sizing: the floor, the ceiling, and accumulation (T30) ----------
+# --- result sizing: the floor, the ceiling, and accumulation ----------------
 
 
 def _page(*ids: int) -> dict[str, Any]:
@@ -2253,8 +2256,8 @@ def _search(
 
 
 def test_search_relaxes_a_partial_page_not_only_an_empty_one() -> None:
-    """The T30 change to T13.5's ladder: three results is a short answer, not
-    a satisfied one, so the rungs fire below RESULT_FLOOR rather than at nil."""
+    """Three results is a short answer, not a satisfied one, so the rungs fire
+    below RESULT_FLOOR rather than only at nil."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
@@ -2498,7 +2501,7 @@ def test_what_reaches_rank_is_bounded_by_the_paging_stop() -> None:
     assert seen and seen[0] <= RESULT_CEILING - 1 + PAGE_SIZE
 
 
-# --- genres: the one rung that needs a subject to survive (T30) -------------
+# --- genres: the one rung that needs a subject to survive -------------------
 
 
 def test_genres_bends_when_an_actor_still_says_what_the_search_is_about() -> None:
@@ -2557,7 +2560,7 @@ def test_genres_holds_when_the_genre_never_reached_the_query() -> None:
     assert "with_genres" not in fake_tmdb.all_params_for("/discover/tv")[0]
 
 
-# --- the rating bar: the last rung, and the only one about ordering (T31) ----
+# --- the rating bar: the last rung, and the only one about ordering ----------
 
 
 def test_the_rating_bar_bends_for_a_narrow_best_query() -> None:
@@ -2613,7 +2616,7 @@ def test_the_rating_bar_bends_after_every_constraint_the_user_stated() -> None:
     assert result.exact_matches == 1
 
 
-# --- the ladder's own budget (T31) ------------------------------------------
+# --- the ladder's own budget ------------------------------------------------
 
 
 def test_the_ladder_stops_widening_once_its_budget_is_spent(
@@ -2706,7 +2709,7 @@ def test_a_deep_session_pages_further_rather_than_widening() -> None:
     """The gateway's shown window is 40, and verdicts exclude on top of it, so
     the pages read have to reach past both — otherwise a "show me 10 more"
     several rounds in comes back thin and the ladder drops a year the user
-    actually typed while unshown rows sit one page away (TASKS.md T31)."""
+    actually typed while unshown rows sit one page away."""
     fake_tmdb = FakeTMDB()
     for start in (101, 121, 141, 161):
         fake_tmdb.ok("/discover/movie", _page(*range(start, start + PAGE_SIZE)))
@@ -2730,7 +2733,7 @@ def test_a_deep_session_pages_further_rather_than_widening() -> None:
         assert params["primary_release_date.gte"].startswith("1990")
 
 
-# --- what was asked for keeps its place in the list (T30) -------------------
+# --- what was asked for keeps its place in the list -------------------------
 
 
 def test_a_widened_query_never_loses_an_exact_match() -> None:
@@ -2814,16 +2817,29 @@ def test_nothing_is_reserved_when_the_query_was_never_widened() -> None:
 
 
 def test_the_shown_window_stays_shorter_than_this_paging_reach() -> None:
-    """services/gateway/chat.go's maxShownRefs, mirrored. Its own
-    TestShownWindowStaysShorterThanTheAgentsPagingReach can only see the Go
-    side, so a change to MAX_DISCOVER_PAGES or PAGE_SIZE would break the pair
-    with every suite still green. Both sides assert it; either edit fails."""
-    gateway_max_shown_refs = 40
-    spare = MAX_DISCOVER_PAGES * PAGE_SIZE - gateway_max_shown_refs
+    """Pins MAX_DISCOVER_PAGES and PAGE_SIZE against the gateway's maxShownRefs:
+    paging must reach far enough past the shown window to still have rows left,
+    or a "show me more" reports all_shown for a query that has pages."""
+    spare = MAX_DISCOVER_PAGES * PAGE_SIZE - GATEWAY_MAX_SHOWN_REFS
     assert spare >= RESULT_CEILING, (
         f"maxShownRefs leaves only {spare} unshown rows; "
         f"a 'show me more' run past that reports all_shown for a query "
         f"that still has pages"
+    )
+
+
+def test_the_seeded_message_budget_covers_the_shown_window() -> None:
+    """Pins RESULT_FLOOR against the gateway's maxSeededMessages and
+    maxShownRefs. The gateway refills `shown` from stored messages, which
+    interleave user and assistant rows, so half the budget carries refs —
+    RESULT_FLOOR each, the floor being the weaker target a thin turn still
+    tends toward. A turn can return fewer, so this is a budget, not a floor on
+    what arrives."""
+    refs = (GATEWAY_MAX_SEEDED_MESSAGES // 2) * RESULT_FLOOR
+    assert refs >= GATEWAY_MAX_SHOWN_REFS, (
+        f"maxSeededMessages budgets only {refs} refs at a floor of "
+        f"{RESULT_FLOOR}, short of maxShownRefs {GATEWAY_MAX_SHOWN_REFS}; "
+        f"a reconnect would forget titles the guest still has on screen"
     )
 
 
@@ -2844,7 +2860,7 @@ def test_a_named_person_is_never_a_rung() -> None:
         assert params["with_cast"] == "31"
 
 
-# --- already shown: "show me 10 more" means ten different ones (T30) --------
+# --- already shown: "show me 10 more" means ten different ones --------------
 
 
 def test_shown_titles_never_come_back() -> None:

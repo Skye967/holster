@@ -154,7 +154,7 @@ func (p clerkUserPayload) primaryEmail() string {
 	return ""
 }
 
-// deleteUser removes id's row (TASKS.md T22.5). withUser is called with the
+// deleteUser removes id's row. withUser is called with the
 // target's own id, not a caller's — there is no authenticated caller here,
 // only Clerk telling us which account is gone — which is exactly the id the
 // users RLS policy requires to let the delete through. Every other table
@@ -174,10 +174,10 @@ func deleteUser(db *pgxpool.Pool) func(ctx context.Context, id string) error {
 }
 
 // updateUserEmail keeps the stored email current on Clerk's user.updated
-// event (TASKS.md T22.5). Update only, not upsert: a user who has never hit
+// event. Update only, not upsert: a user who has never hit
 // the gateway has no row yet, and upsertUser provisions one with the current
-// email the first time they do — the same self-healing reasoning T8 gives
-// for running upsertUser per-request instead of off user.created.
+// email the first time they do — the same self-healing reason upsertUser runs
+// per-request instead of off user.created.
 func updateUserEmail(db *pgxpool.Pool) func(ctx context.Context, id, email string) error {
 	return func(ctx context.Context, id, email string) error {
 		return withUser(ctx, db, id, func(tx pgx.Tx) error {

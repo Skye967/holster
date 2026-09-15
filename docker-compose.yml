@@ -48,7 +48,7 @@ services:
       CLERK_AUDIENCE: ${CLERK_AUDIENCE}
       CLERK_WEBHOOK_SECRET: ${CLERK_WEBHOOK_SECRET}
       # Defaults to the compose-network Postgres, as gateway_app — the
-      # least-privilege role RLS applies to (T10). `localhost` in DATABASE_URL
+      # least-privilege role RLS applies to. `localhost` in DATABASE_URL
       # means the gateway's own container, not the database — set the host to
       # `postgres`, or leave it unset to take this default.
       DATABASE_URL: ${DATABASE_URL:-postgresql://gateway_app:password@postgres:5432/holster}
@@ -58,7 +58,7 @@ services:
       # on the host: the gateway is the only thing that ever calls it.
       AGENT_SERVICE_URL: ${AGENT_SERVICE_URL:-http://agent:8000}
     healthcheck:
-      # /health is unauthenticated and touches nothing (T7), so it answers
+      # /health is unauthenticated and touches nothing, so it answers
       # whether the process is listening — which is exactly what web waits on.
       test: ["CMD-SHELL", "wget -q -O - http://localhost:${GATEWAY_PORT:-8080}/health || exit 1"]
       interval: 10s
@@ -98,7 +98,7 @@ services:
       retries: 3
       start_period: 10s
 
-  # --- One-shot: give the T10 roles a local login --------------------------
+  # --- One-shot: give the service roles a local login ----------------------
   # gateway_app and agent_ro are created NOLOGIN by the migration (a committed
   # migration carries no password). This grants them the throwaway compose
   # password once Postgres is up; Supabase sets these in the dashboard instead.

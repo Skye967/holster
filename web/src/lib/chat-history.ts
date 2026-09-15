@@ -14,8 +14,8 @@ export interface ConversationTurn {
 
 // One round trip for one conversation's stored messages, so chat-panel.tsx
 // can re-render its last exchanges on mount instead of starting blank —
-// on a page reload (TASKS.md T20) or a switch to a different conversation
-// (TASKS.md T20.5). Picks aren't part of this shape — only text is persisted
+// on a page reload or a switch to a different conversation.
+// Picks aren't part of this shape — only text is persisted
 // for reload today, so a rehydrated turn renders as plain text.
 export async function fetchChatHistory(
   getToken: GetToken,

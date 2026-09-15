@@ -1,4 +1,4 @@
-// A guest is a browser with no Clerk session (TASKS.md Phase 7). Its ticked
+// A guest is a browser with no Clerk session. Its ticked
 // streaming services live in this cookie rather than streaming_subscriptions,
 // written only through guest-actions.ts so Next's client cache is invalidated
 // on every change. No next/headers import here: this module is shared with

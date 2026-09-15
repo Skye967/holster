@@ -27,8 +27,9 @@ Every service recommends from its own catalog; Holster recommends across all of 
 | `gateway` | Go | The only endpoint the browser reaches. Verifies session, owns all writes |
 | `agent` | Python | LangChain orchestration, TMDB catalog tools |
 
-Three services and a database. There is no OAuth anywhere in the system — see
-[DECISIONS.md](../DECISIONS.md) for why that was cut.
+Three services and a database. There is no OAuth anywhere in the system: the streaming
+services publish none, so there is nothing to connect to, and adding a provider that did
+would mean reintroducing user tokens, refresh, encryption at rest and revocation.
 
 ## The thing this architecture is actually about
 
@@ -67,6 +68,31 @@ and only app-level keys.
 `insert`, `update` or `delete` grant. A bug or an injected instruction hits a
 permission error rather than a modified row.
 
+**Sign-in is optional, and what it costs is stated honestly.** A guest reaches the
+product without an account; everything user-scoped is a sign-in prompt rather than a
+wall. Signing out lands in the product, signed out — never on an onboarding screen that
+reads as though the account was wiped.
+
+A guest's chat history dies with the socket and a reload starts over. Signing in carries
+the provider picks and **not** the guest thread, which is why the prompt says "save
+future chats" and must never promise to keep the current one.
+
+**One socket per session.** A chat session holds a single WebSocket, shared across
+conversation switches and reconnects, carrying messages up and curated events down. One
+turn is *current* at a time, which is why the composer disables while streaming and why
+turn ids — not connections — are what a reply is matched against; a superseded turn's
+goroutine keeps running until it reports, so more than one can be outstanding.
+
+An open socket is also what makes cancel unambiguous: a `cancel` frame naming a turn
+arrives on the same line the turn was dispatched on, and aborting the agent's HTTP call
+*is* the cancel — the agent needs no cancel protocol of its own. That only works because
+the agent keeps no state between turns and has **no checkpointer**: a cancelled turn
+would otherwise leave saved graph state holding a `tool_use` with no matching
+`tool_result`, and the next message on that thread would resume into it and be rejected.
+
+What the gateway persists is a curated view — clean text and the title ids shown — never
+the agent's internals.
+
 **A guest — a browser with no session — reaches only the catalog cache and the agent.**
 `GET /guest/providers` and `/ws/chat?guest=1` are the whole browser-facing guest
 surface; a socket with neither a ticket nor that flag is refused. (`GET /health` and
@@ -82,7 +108,8 @@ written for it.
 They work for every user on first load.
 
 There is no second class. Connected tools requiring per-user OAuth were considered at
-length and cut; the reasoning is in [DECISIONS.md](../DECISIONS.md).
+length and cut — the credential architecture they need is the thing this design exists
+without.
 
 ## Flow: choosing streaming services
 
@@ -171,11 +198,39 @@ messages                  conversation_id, role, content, title_refs,
                           one created_at
 ```
 
-`users` rows are created on first authenticated request, not by Clerk — see
-[TASKS.md](../TASKS.md) T8. Everything user-scoped has a foreign key to it.
+`users` rows are created on first authenticated request, not by Clerk, so an account
+that never calls the gateway leaves no row. Everything user-scoped has a foreign key
+to it.
+
+**A locked judgment can be cleared, never overwritten in one step.** `want_to_watch`
+is an intention with a lifecycle and stays mutable; the four judgments do not. Changing
+one means clearing it and setting the new value — two steps, so a stale client cannot
+silently replace a rating the user meant to keep.
 
 No table holds a secret. Row-level security on every user-scoped table, keyed on the
 Clerk user ID. `on delete cascade` throughout.
+
+## Failure rules
+
+Every surface follows these. They are invariants, not guidelines — a comment states
+the rule it depends on and then cites this section, never the citation alone.
+
+- **"Nothing matched" and "something broke" must never look alike.** Both produce an
+  empty screen and they mean opposite things: one says *change your question*, the
+  other *not your fault, try later*.
+- **Never show a status code.** Each message says whether waiting will help: *"Can't
+  reach the film database right now"*, *"I'm having trouble thinking"*, *"Couldn't
+  save that — try again"*.
+- **Optimistic UI needs a rollback path.** Toggles and bookmarks show success before
+  the server confirms. If a save fails and nothing reverts, the interface is lying.
+- **A dropped stream keeps what arrived**, marks it incomplete, and offers a retry. It
+  never stops mid-sentence looking finished.
+- **A turn always ends in a terminal frame.** Whatever happens to a chat turn —
+  success, supersede, deadline, a persist the user must know failed — the browser is
+  told. Nothing is left silently unresolved.
+- **Degrade rather than fail wherever there is stored data.** The provider cache keeps
+  the picker working while TMDB is down. The chat is the exception: it cannot degrade,
+  so if the model is unreachable, say so.
 
 ## Security properties
 

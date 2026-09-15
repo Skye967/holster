@@ -261,8 +261,8 @@ func TestSetSubscriptionDegradesOnWriteFailure(t *testing.T) {
 
 // The real routes, not a stand-in: main_test.go's TestRoutesRequireAuthOnEveryMethod
 // used to prove a subscriptions-shaped route inherits auth via a placeholder
-// registered on its own mux. This proves it on the actual routes this task
-// added, via the actual h.routes() — see TASKS.md T15.
+// registered on its own mux. This proves it on the real subscription routes,
+// via the actual h.routes().
 func TestProviderRoutesRequireAuth(t *testing.T) {
 	srv, _ := newProvidersTestServer(t, noopChatCtx, noopLoadProviders, noopSaveSubscription)
 
@@ -278,7 +278,7 @@ func TestProviderRoutesRequireAuth(t *testing.T) {
 	}
 }
 
-// --- GET /guest/providers (TASKS.md T27) ------------------------------------
+// --- GET /guest/providers ---------------------------------------------------
 
 func TestGuestProvidersIsPublicAndOmitsSubscribed(t *testing.T) {
 	loadChatCtx := func(context.Context, string) (chatContext, error) {

@@ -21,8 +21,8 @@ import (
 var watchlistTimeout = 20 * time.Second
 
 // watchlistItem is one title_verdicts row scoped to want_to_watch — the DB
-// half of "saved" (T17's migration comment describes want_to_watch as "an
-// intention with a lifecycle," the read this task is built on).
+// half of "saved": want_to_watch is an intention with a lifecycle, and this
+// is the read over it (20260903002450_verdicts.sql).
 type watchlistItem struct {
 	TMDBID    int
 	MediaType string
@@ -30,6 +30,10 @@ type watchlistItem struct {
 
 // loadWatchlistItems mirrors loadVerdicts' shape (verdicts.go): every
 // want_to_watch row for the caller, newest first.
+//
+// Ordered by created_at, which is only ever set on insert: a row can only
+// become want_to_watch by being inserted, and a cleared-then-rebookmarked one
+// is a fresh insert with a fresh timestamp, so "newest" stays honest.
 func loadWatchlistItems(db *pgxpool.Pool) func(ctx context.Context, userID string) ([]watchlistItem, error) {
 	return func(ctx context.Context, userID string) ([]watchlistItem, error) {
 		var items []watchlistItem
@@ -107,10 +111,10 @@ func newAgentTitlesCaller(client *http.Client, baseURL string) agentTitlesCaller
 	}
 }
 
-// watchlist is GET /api/watchlist (TASKS.md T18.5): every want_to_watch
+// watchlist is GET /api/watchlist: every want_to_watch
 // title, enriched fresh from TMDB on every call — title_verdicts holds only
-// tmdb_id/media_type/verdict, nothing to re-serve even if this wanted to
-// (T17), which is what makes "re-check availability at read time" the only
+// tmdb_id/media_type/verdict, nothing to re-serve even if this wanted to,
+// which is what makes "re-check availability at read time" the only
 // possible read path here, not a design choice made in this handler.
 func (h *Handler) watchlist(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(ctxUserID).(string)

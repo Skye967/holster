@@ -12,11 +12,10 @@ export default async function ChatConversationPage({
   const { id } = await params
   // A malformed route param (hand-edited, or a stale bookmark) must never
   // reach the socket — redirect to a fresh conversation, the same fallback
-  // /chat's own index page uses. needsOnboarding is chat/layout.tsx's job
-  // now, not this page's — it runs before this page ever does.
+  // /chat's own index page uses.
   if (!isValidConversationId(id)) redirect(`/chat/${crypto.randomUUID()}`)
 
-  // Keyed by conversationId so switching conversations (TASKS.md T20.5)
+  // Keyed by conversationId so switching conversations
   // remounts ChatPanel with fresh state, rather than relying on manual
   // resets when a prop changes — the standard React idiom, and simpler
   // than reproducing what a remount already gives for free.

@@ -44,7 +44,7 @@ const nav = [
   { title: "Connections", href: "/connections", icon: Plug },
 ]
 
-// The sidebar's conversation list (TASKS.md T20.5) — newest first, a "New
+// The sidebar's conversation list — newest first, a "New
 // chat" action, and per-row delete. Kept local to the sidebar rather than a
 // shared context: nothing else in the tree needs this list, only the one
 // cross-subtree signal a completed turn sends (CONVERSATIONS_CHANGED_EVENT).

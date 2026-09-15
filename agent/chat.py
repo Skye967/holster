@@ -35,8 +35,8 @@ Event shapes on the wire (one JSON object per line):
 
 This is the agent-internal protocol, not the browser-facing one. The gateway
 owns the public event vocabulary (interpreting/results/token/done/error) and
-templates it from these — see ../DECISIONS.md and ../CLAUDE.md on the gateway
-deciding what leaves. Nothing here assumes anything about WebSockets; this
+templates it from these — see chat.go's outboundEvent for the vocabulary the
+browser actually sees. Nothing here assumes anything about WebSockets; this
 module has no transport opinion beyond "an async stream of dicts."
 
 Cancellation is plain asyncio cancellation, nothing bespoke: the caller
@@ -44,7 +44,7 @@ Cancellation is plain asyncio cancellation, nothing bespoke: the caller
 which cancels this generator at its current `await queue.get()`, which the
 `finally` block turns into cancelling the background search() task — so an
 in-flight TMDB or model call unwinds the same way any cancelled asyncio call
-does. See ../DECISIONS.md "One socket per session" for why the agent needs no
+does. See ARCHITECTURE.md's "One socket per session" for why the agent needs no
 cancel protocol of its own.
 """
 
@@ -78,9 +78,8 @@ logger = logging.getLogger("holster.chat")
 #
 # Counted in messages, not exchanges: HistoryTurn is one row. Deliberately well
 # clear of services/gateway's windowHistory (maxHistoryExchanges*2 = 10), which
-# is the real policy. A backstop sitting at the operating point stops being a
-# backstop and becomes a second window — that is how this silently cut the
-# gateway's five exchanges back to three.
+# is the real policy — a backstop sitting at the operating point stops being a
+# backstop and silently becomes a second, tighter window.
 MAX_HISTORY_TURNS = 20
 
 # The same backstop for `shown`, and sized the same way: the gateway sends at
@@ -126,17 +125,17 @@ class ChatRequest(BaseModel):
     # can name the caller's services without a second TMDB lookup.
     watch_provider_names: list[str] = Field(default_factory=list)
     # The last few exchanges only — the gateway's job to window. A messages
-    # table persists the full conversation now (TASKS.md T20), but this agent
+    # table persists the full conversation now, but this agent
     # still never reads it directly; it only ever sees this windowed slice,
     # handed to it fresh on every call. Oldest-first, current message not
     # included here.
     history: list[HistoryTurn] = Field(default_factory=list)
     # The caller's whole title_verdicts set, loaded by the gateway with the
-    # message (TASKS.md T19). Passed straight through; catalog_tool.search()
+    # message. Passed straight through; catalog_tool.search()
     # decides what each value means.
     verdicts: list[TitleVerdict] = Field(default_factory=list)
     # What the gateway has already shown on this connection, so "show me 10
-    # more" means ten different titles (TASKS.md T30). Bounded and windowed
+    # more" means ten different titles. Bounded and windowed
     # by the gateway, the same division of labour as `history` above; this
     # agent holds nothing between turns.
     shown: list[TitleRef] = Field(default_factory=list)
@@ -144,15 +143,12 @@ class ChatRequest(BaseModel):
 
 def _with_history(message: str, history: list[HistoryTurn]) -> str:
     """Fold recent turns into the text handed to interpret()/rank(), rather
-    than changing catalog_tool.py's message: str contract. Keeps that
-    shipped, tested module untouched for a concern that is still settling.
+    than changing catalog_tool.py's message: str contract.
 
-    One of three folding sites now: catalog_tool's _with_taste prepends the
-    liked-title hint to the same string, for rank() only, precisely because
-    this function leaves "Current message: ..." at the end. _with_target_count
-    then appends one line after it — the one thing that may come between the
-    current message and the candidate list, and see its docstring for why it
-    is worth the exception."""
+    Leaves "Current message: ..." last, which is why catalog_tool's _with_taste
+    prepends its liked-title hint. _with_target_count then appends one line
+    after it — the only thing that comes between the current message and the
+    candidate list."""
     if not history:
         return message
     lines = [
@@ -231,17 +227,14 @@ def _nothing_found_message(
 def _relaxed_note(relaxed: Sequence[str], exact_matches: int, total: int) -> str:
     """The line above a result set the ladder had to widen to fill.
 
-    Composed here, beside _nothing_found_message, rather than in the gateway
-    where interpretingLine lives: this is the same relaxation story that
-    function tells, reading the same labels, and splitting the two across
-    services would duplicate _RELAXED_LABELS and let the halves drift.
+    Composed here rather than in the gateway so _RELAXED_LABELS isn't
+    duplicated across two services and left to drift.
 
-    Without this the widening is invisible and reads as the assistant
-    ignoring half the request. It describes what is on screen rather than
-    claiming anything about the catalog — "only the first two match exactly"
-    is true whether the narrow query found nothing or found things the user
-    had already rated, where "only two matched" would be false in the second
-    case. search() orders picks exactness-first, so "the first" is accurate.
+    Without this the widening is invisible and reads as the assistant ignoring
+    half the request. It describes what is on screen rather than the catalog —
+    "only the first two match exactly" holds whether the narrow query found
+    nothing or found things the user had already rated. search() orders picks
+    exactness-first, so "the first" is accurate.
 
     Empty when nothing was relaxed, and also when widening changed nothing
     that reached the screen — a note about a wider search that contributed no
@@ -268,10 +261,9 @@ def _relaxed_note(relaxed: Sequence[str], exact_matches: int, total: int) -> str
 def _capability_message(provider_names: Sequence[str]) -> str:
     """Capability-question answer: names the caller's own services (if
     resolved — provider_names can be empty while the per-country name
-    cache warms up) plus example phrasing, never a feature list
-    (TASKS.md T16.5). No concrete numbers in the example: this text
-    becomes conversation history and feeds the next turn's interpret()
-    (_with_history, below).
+    cache warms up) plus example phrasing, never a feature list. No concrete
+    numbers in the example: this text becomes conversation history and feeds
+    the next turn's interpret() (_with_history, above).
     """
     where = f" on {_human_join(provider_names)}" if provider_names else ""
     return (
@@ -365,8 +357,7 @@ async def stream_chat(
 
         # is_capability_question checked first, deliberately: the two fields
         # are independent (nothing stops the model setting both), and a
-        # capability question is the more specific signal when it happens —
-        # see test_capability_question_takes_precedence_over_clarifying_question.
+        # capability question is the more specific signal when it happens.
         if result.intent is not None and result.intent.is_capability_question:
             await queue.put(
                 {

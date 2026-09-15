@@ -1,13 +1,9 @@
 """Shared test doubles for the offline test suites.
 
-Not named test_*.py so pytest never tries to collect it as a test module —
-it's a plain module imported by test_tmdb.py, test_catalog_tool.py, and
-test_chat.py, the same way each of those imports tmdb.py/catalog_tool.py.
+Not named test_*.py so pytest never collects it as a test module — it's a plain
+module the test files import, the same way each imports tmdb.py/catalog_tool.py.
 
-FakeTMDB started as test_tmdb.py's own fake, then got copied into
-test_catalog_tool.py and test_chat.py as each needed it, drifting slightly
-apart in which methods each copy carried. This is the union of all three —
-every test file uses a subset of it now instead of maintaining its own copy.
+FakeTMDB is the union of what those suites need; each uses a subset.
 """
 
 from __future__ import annotations
@@ -18,6 +14,12 @@ import httpx2
 
 from catalog_tool import DiscoverIntent, Ranker, RankResult
 from tmdb import Title, TMDBClient
+
+# services/gateway's constants, hand-copied -- the two services share no code.
+# Nothing enforces the copy: update these by hand when chat.go changes.
+GATEWAY_MAX_SHOWN_REFS = 40
+GATEWAY_MAX_SEEDED_MESSAGES = 20
+GATEWAY_MAX_HISTORY_EXCHANGES = 5
 
 # The reasons rank() must not be reached, shared so a typo at a call site is
 # a NameError rather than a silently drifted string.
@@ -78,9 +80,8 @@ def raw_movie_full(tmdb_id: int, title: str) -> dict[str, Any]:
     }
 
 
-# Spelled out rather than derived from raw_movie(): the pre-existing suite
-# asserts against these values, and a field added to raw_movie for a new
-# fixture must not change them underneath those tests.
+# Spelled out rather than derived from raw_movie(): tests assert against these
+# values, and a field added to raw_movie must not change them underneath.
 MOVIE_A = {
     "id": 101,
     "title": "Fake Heist",

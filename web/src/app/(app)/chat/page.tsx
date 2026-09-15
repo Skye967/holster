@@ -6,12 +6,10 @@ import { GatewaySessionExpiredError } from "@/lib/gateway"
 import { getSession } from "@/lib/session"
 
 // The bare /chat route resolves "where was I" from the conversations table
-// itself (TASKS.md T15.5's "no new flag, derive it" precedent) rather than
-// storing a separate pointer: the most recent conversation if one exists,
+// itself rather than storing a separate pointer: the most recent conversation
+// if one exists,
 // otherwise a fresh id — the sidebar's "New chat" button generates the id
-// client-side, so a brand-new account gets the identical URL shape either
-// way. needsOnboarding is chat/layout.tsx's job now, not this page's — it
-// runs before this page ever does.
+// client-side, so a brand-new account gets the identical URL shape either way.
 export default async function ChatIndexPage() {
   const { userId, getToken } = await getSession()
   // A guest has no conversations to resume — nothing is persisted for it —
@@ -31,9 +29,8 @@ export default async function ChatIndexPage() {
       />
     )
   }
-  // Known limitation: two racing requests for a zero-conversation account
-  // (two tabs, or two quick reloads before the first message) can each mint
-  // a different id here, forking that account's history. Accepted for now —
-  // narrow window, brand-new accounts only.
+  // Two racing loads on a zero-conversation account each mint a different id
+  // here, forking that account's history. Accepted: the window is one request
+  // wide and only open on an account that has never sent a message.
   redirect(`/chat/${conversations[0]?.id ?? crypto.randomUUID()}`)
 }

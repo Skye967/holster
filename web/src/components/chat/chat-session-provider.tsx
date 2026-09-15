@@ -27,8 +27,8 @@ interface ChatSessionContextValue {
 const ChatSessionContext = createContext<ChatSessionContextValue | null>(null)
 
 // Lifts useChatSocket above the per-conversation page (chat/[id]/page.tsx)
-// so the one socket (DECISIONS.md "One socket per session") survives
-// switching between conversations (TASKS.md T20.5) instead of tearing down
+// so the one socket (ARCHITECTURE.md's "One socket per session") survives
+// switching between conversations instead of tearing down
 // and reconnecting on every navigation — mintTicket's round trip plus the WS
 // handshake (chat-socket.ts's SOCKET_OPEN_TIMEOUT_MS bound) is real cost to
 // pay per click. Scoped to chat/layout.tsx, not the app-wide layout, so the
@@ -49,24 +49,16 @@ export function ChatSessionProvider({
 }) {
   const listenerRef = useRef<ChatListener | null>(null)
 
-  // Lives here, not in ChatPanel, because only one turn may ever be in
-  // flight on the shared socket (TASKS.md T14: "disable send while
-  // streaming so two are never in flight") — a session-wide invariant, not
-  // a per-conversation one. ChatPanel is keyed by conversationId and
-  // remounts on every switch, so component-local busy state there used to
-  // reset on a switch even while a turn dispatched from the *previous*
-  // panel was still genuinely running — leaving nothing to ever disable the
-  // composer for it, and (once a stale turn's terminal frame stopped being
-  // silently dropped, see chat.go's T32 fix) nothing to clear it either.
-  // This provider is the one thing that outlives every panel for the life
-  // of a chat session (see the module comment above), so it's the only
-  // reliable owner.
+  // Lives here, not in ChatPanel, because only one turn may ever be in flight
+  // on the shared socket — a session-wide invariant, not a
+  // per-conversation one. ChatPanel is keyed by conversationId and remounts on
+  // every switch, so busy state held there would reset while a turn dispatched
+  // from the previous panel was still running. This provider outlives every
+  // panel for the life of a chat session, so it is the only reliable owner.
   //
-  // A ref alongside the state, kept in lockstep, for the same reason
-  // ChatPanel used to pair activeTurnIdRef with activeTurnId: handleDisconnect
-  // is invoked from chat-socket.ts's WebSocket "close" listener, outside
-  // React's render cycle, and needs a value it can read synchronously that's
-  // never stale.
+  // A ref alongside the state, kept in lockstep: handleDisconnect is invoked
+  // from chat-socket.ts's WebSocket "close" listener, outside React's render
+  // cycle, and needs a value it can read synchronously without going stale.
   const [activeTurn, setActiveTurn] = useState<string | null>(null)
   const activeTurnRef = useRef<string | null>(null)
 
@@ -87,11 +79,9 @@ export function ChatSessionProvider({
       (ev.type === "done" || ev.type === "error") &&
       activeTurnRef.current === ev.turn
     ) {
-      // A stale/superseded turn's terminal frame now always arrives
-      // (chat.go's T32 fix) but carries a different turn id than whatever's
-      // active, so the match above is what makes this correctly a no-op
-      // for it — only the currently-tracked turn's own terminal frame
-      // clears busy.
+      // A stale turn's terminal frame also arrives, carrying its own turn
+      // id, so the match above makes this a no-op for it: only the
+      // currently-tracked turn clears busy.
       activeTurnRef.current = null
       setActiveTurn(null)
     }
@@ -99,14 +89,12 @@ export function ChatSessionProvider({
   }, [])
 
   // Fires when the socket drops out from under an in-flight turn (network
-  // blip, proxy idle-kill, server restart) — chat-socket.ts's own
-  // "close" listener has no turn id for this, since it isn't about any one
-  // turn. Synthesizes an "error" event for whichever turn was active, the
-  // same shape ChatPanel used to build itself, routed through the normal
-  // onEvent path so ChatPanel's own applyEvent attaches it without needing
-  // to track a turn id of its own. Nothing to do when no turn was active:
-  // there's no per-turn error to synthesize, and no other listener hook
-  // exists for a bare disconnect.
+  // blip, proxy idle-kill, server restart) — chat-socket.ts's "close"
+  // listener has no turn id for this, since it isn't about any one turn.
+  // Synthesizes an "error" event for whichever turn was active, routed
+  // through the normal onEvent path so ChatPanel's applyEvent attaches it
+  // without tracking a turn id of its own. Nothing to do when no turn was
+  // active: there is no per-turn error to synthesize.
   const handleDisconnect = useCallback((text: string) => {
     const id = activeTurnRef.current
     if (id !== null) {

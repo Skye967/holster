@@ -89,7 +89,7 @@ func TestUpsertUser(t *testing.T) {
 		return n
 	}
 
-	// First sight creates exactly one row — T8's done-when.
+	// First sight creates exactly one row.
 	if err := ensure(ctx, id, "first@example.com"); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestRLSEnabledOnUsers(t *testing.T) {
 }
 
 // TestVerifyRoleIsSafeRejectsTheMigrationRole proves main.go's startup check
-// (T34) actually rejects a role that bypasses RLS: testPool's own connection
+// actually rejects a role that bypasses RLS: testPool's own connection
 // is the TEST_DATABASE_URL superuser and the owner of every migrated table
 // (see TestRLSEnabledOnUsers' comment), exactly the shape production must
 // never boot as.
@@ -181,7 +181,7 @@ func TestVerifyRoleIsSafeAcceptsGatewayApp(t *testing.T) {
 
 // asRole runs fn inside a rolled-back transaction with the session role dropped
 // to role. The suite connects as the migration/superuser role, which bypasses
-// RLS and every grant; SET ROLE is what makes the T10 policies and grants under
+// RLS and every grant; SET ROLE is what makes the policies and grants under
 // test actually apply. Nothing is committed.
 func asRole(t *testing.T, pool *pgxpool.Pool, role string, fn func(context.Context, pgx.Tx)) {
 	t.Helper()
@@ -225,7 +225,8 @@ func probe(t *testing.T, ctx context.Context, tx pgx.Tx, sql string) error {
 // context; verdicts are loaded separately by runTurn — see chat.go's
 // chatContext for why. The provider-name lookup must degrade to an empty
 // list, not an error, when streaming_providers has no row yet for the
-// country (T15 owns keeping that cache fresh — see chat.go's loadChatContext).
+// country (providers.go keeps that cache fresh — see chat.go's
+// loadChatContext).
 func TestLoadChatContext(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -294,7 +295,7 @@ func TestLoadChatContext(t *testing.T) {
 }
 
 // loadVerdicts (verdicts.go) serves two consumers: the browser's hydration of
-// GET /api/verdicts, and the chat context runTurn hands the agent (T19). The
+// GET /api/verdicts, and the chat context runTurn hands the agent. The
 // ordering is what the agent depends on -- it keeps only the first few liked
 // titles and has no timestamp of its own to sort by.
 func TestLoadVerdicts(t *testing.T) {
@@ -387,7 +388,7 @@ func TestLoadVerdicts(t *testing.T) {
 	}
 }
 
-// loadProviders (providers.go, T15): no cache refreshes and caches; a fresh
+// loadProviders (providers.go): no cache refreshes and caches; a fresh
 // cache is served without another refresh; a stale cache refreshes and
 // overwrites; a failing refresh degrades to whatever is cached.
 func TestLoadProviders(t *testing.T) {
@@ -576,7 +577,7 @@ func TestLoadProvidersRefreshSurvivesTheLeaderGoingAway(t *testing.T) {
 	}
 }
 
-// saveSubscription (providers.go, T15): subscribing inserts, unsubscribing
+// saveSubscription (providers.go): subscribing inserts, unsubscribing
 // deletes, and repeating either is a no-op rather than an error — matches
 // the picker's "flip a switch" semantics, not a form submit.
 func TestSaveSubscription(t *testing.T) {
@@ -618,10 +619,20 @@ func TestSaveSubscription(t *testing.T) {
 	}
 }
 
-// T10's core invariant: agent_ro has no write path to any table. It also has no
-// read grants yet -- those are added by the task that needs each one -- but
-// "never writes" is the property that must not regress, so that is what this
-// pins.
+// The agent's core invariant: agent_ro has no write path to any table. Its read
+// grants are narrow and added one at a time (today: select on conversations and
+// messages, 20260904191046_conversations.sql), but "never writes" is the property
+// that must not regress, so that is what this pins.
+//
+// Probes every table the gateway writes, including the two agent_ro can read --
+// a table it can reach is where a stray write grant would matter most. Coverage
+// is per statement and not exhaustive. Add a table here when you add one.
+//
+// Every policy on these tables is scoped to gateway_app, so an INSERT that
+// agent_ro was wrongly granted still raises 42501 from RLS and this probe
+// stays green. UPDATE and DELETE have no such second layer: RLS filters rows
+// rather than raising, so a stray grant there returns "0 rows" and no error,
+// and the probe fails.
 func TestAgentRoleIsReadOnly(t *testing.T) {
 	pool := testPool(t)
 
@@ -639,6 +650,14 @@ func TestAgentRoleIsReadOnly(t *testing.T) {
 			where user_id = 'nobody' and tmdb_id = 550 and media_type = 'movie'`,
 		"delete verdict": `delete from title_verdicts
 			where user_id = 'nobody' and tmdb_id = 550 and media_type = 'movie'`,
+		"insert conversation": `insert into conversations (id, user_id, title)
+			values (gen_random_uuid(), 'agent_probe', 'x')`,
+		"update conversation": `update conversations set title = 'y' where user_id = 'nobody'`,
+		"delete conversation": `delete from conversations where user_id = 'nobody'`,
+		"insert message": `insert into messages (conversation_id, role, content)
+			values (gen_random_uuid(), 'user', 'x')`,
+		"update message": `update messages set content = 'y' where role = 'nobody'`,
+		"delete message": `delete from messages where role = 'nobody'`,
 	}
 	asRole(t, pool, "agent_ro", func(ctx context.Context, tx pgx.Tx) {
 		for name, sql := range writes {
@@ -649,7 +668,7 @@ func TestAgentRoleIsReadOnly(t *testing.T) {
 	})
 }
 
-// T10's first half: under gateway_app, holster.user_id fences every user-scoped
+// Under gateway_app, holster.user_id fences every user-scoped
 // table -- a user sees only their rows and cannot write rows tagged with another
 // user's id.
 func TestGatewayRoleEnforcesUserIsolation(t *testing.T) {
@@ -798,7 +817,7 @@ func TestGatewayRoleDeniesWithoutUserContext(t *testing.T) {
 
 // TestGatewayRoleEnforcesIsolationOnDeleteAndUpdate closes the coverage gap
 // TestGatewayRoleEnforcesUserIsolation leaves: deleteUser/updateUserEmail
-// (webhooks.go, T22.5) lean on this same user_isolation policy as their only
+// (webhooks.go) lean on this same user_isolation policy as their only
 // backstop against a webhook payload naming the wrong id -- unlike every
 // other withUser caller, id there comes from a Clerk webhook payload, not a
 // verified JWT subject.
@@ -890,12 +909,12 @@ func newTestUser(t *testing.T, pool *pgxpool.Pool, ctx context.Context, id strin
 	}
 }
 
-// saveVerdict (verdicts.go, T18): want_to_watch is fully mutable and the only
+// saveVerdict (verdicts.go): want_to_watch is fully mutable and the only
 // value a judgment may still be set from; once one of the four judgments is
 // set, a direct overwrite to a *different* verdict is locked — title_verdicts'
 // migration comment (20260903002450_verdicts.sql) states those "never change."
-// Since T19.5 (DECISIONS.md, "Locked judgments can be cleared") the row can
-// still be cleared and re-judged; only the one-step overwrite stays rejected.
+// The row can still be cleared and re-judged (ARCHITECTURE.md's "A locked
+// judgment can be cleared"); only the one-step overwrite stays rejected.
 // A fake-backed unit test (verdicts_test.go) covers the HTTP layer; only a
 // real database proves the WHERE-guarded upsert's SQL and its
 // RowsAffected-based lock detection actually work, the same reason
@@ -911,8 +930,8 @@ func TestSaveVerdictLocksJudgments(t *testing.T) {
 	newTestUser(t, pool, ctx, id)
 
 	// want_to_watch is freely settable from nothing, and the expected
-	// transition into a judgment succeeds (T17: "expected to become seen
-	// later").
+	// transition into a judgment succeeds — want_to_watch is an intention
+	// expected to become seen later.
 	if err := save(ctx, id, 550, "movie", strPtr("want_to_watch"), ""); err != nil {
 		t.Fatalf("set want_to_watch: %v", err)
 	}
@@ -1060,8 +1079,8 @@ func TestSaveVerdictClearIsScopedToExpectedVerdict(t *testing.T) {
 
 	t.Run("judgment happy path", func(t *testing.T) {
 		// Clearing a locked judgment when the expected value matches
-		// exactly actually removes it (T19.5, DECISIONS.md "Locked
-		// judgments can be cleared").
+		// exactly actually removes it (ARCHITECTURE.md's "A locked
+		// judgment can be cleared").
 		if err := save(ctx, id, 603, "movie", strPtr("liked"), ""); err != nil {
 			t.Fatalf("seed liked: %v", err)
 		}
@@ -1106,12 +1125,12 @@ func TestSaveVerdictClearIsScopedToExpectedVerdict(t *testing.T) {
 	})
 }
 
-// --- conversations.go (T20/T20.5) -------------------------------------------
+// --- conversations.go ---------------------------------------------------------
 
 // TestLoadConversationReturnsEmptyForANewCaller proves loadConversation
 // degrades to nil, not an error, for a conversation id with nothing saved yet
-// — the shape both a brand-new "new chat" id and a not-yet-created id share
-// (TASKS.md T20.5). runChatConnection treats that as "start blank."
+// — the shape both a brand-new "new chat" id and a not-yet-created id share.
+// runChatConnection treats that as "start blank."
 func TestLoadConversationReturnsEmptyForANewCaller(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -1130,7 +1149,7 @@ func TestLoadConversationReturnsEmptyForANewCaller(t *testing.T) {
 }
 
 // TestLoadConversationOrdersAndCapsHistory seeds more than loadConversation's
-// own cap (windowHistory's window, not maxStoredHistoryMessages — that one
+// own cap (maxSeededMessages, not maxStoredHistoryMessages — that one
 // bounds GET /api/chat/history/{conversationID} instead, see
 // TestLoadConversationTurns*) and confirms it returns only the most recent
 // ones, oldest-first — windowHistory and the agent both depend on
@@ -1182,7 +1201,7 @@ func TestLoadConversationOrdersAndCapsHistory(t *testing.T) {
 }
 
 // TestLoadConversationCarriesStoredTitleRefs proves the already-shown set
-// (T30) round-trips through the database, which is what makes a reconnect cost
+// round-trips through the database, which is what makes a reconnect cost
 // an account nothing: the refs a previous connection persisted come back on
 // the next message's load, keyed on the conversation by the query itself. A
 // user row's null title_refs must read as nil, not an error.
@@ -1276,7 +1295,7 @@ func TestLoadConversationTurnsPairsMessages(t *testing.T) {
 }
 
 // TestLoadConversationTurnsReportsNotExistsForAnUnknownID is the regression
-// guard for T32's 404: a conversation id nothing has ever written reports
+// guard for chatHistory's 404: a conversation id nothing has ever written reports
 // exists=false (and, per that field's own contract, so does one belonging to
 // another user — see TestLoadConversationTurnsHidesAForeignConversation and
 // loadConversationTurns' own doc comment for why the two can't be told apart
@@ -1304,10 +1323,10 @@ func TestLoadConversationTurnsReportsNotExistsForAnUnknownID(t *testing.T) {
 
 // TestLoadConversationTurnsHidesAForeignConversation proves RLS still
 // independently blocks this on its own, as a second layer behind
-// loadConversationTurns' own explicit user_id filter (T34,
-// TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel below) —
-// with a naive, unfiltered `select exists(...)` of the shape the query used
-// before T34, run under an explicit asRole("gateway_app") with
+// loadConversationTurns' own explicit user_id filter
+// (TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel below) —
+// with a naive, unfiltered `select exists(...)`, run under an explicit
+// asRole("gateway_app") with
 // holster.user_id bound to the *other* user, the only way to make RLS apply
 // at all (testPool otherwise connects as the table owner, which bypasses it).
 func TestLoadConversationTurnsHidesAForeignConversation(t *testing.T) {
@@ -1340,12 +1359,11 @@ func TestLoadConversationTurnsHidesAForeignConversation(t *testing.T) {
 }
 
 // TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel proves
-// T34's explicit user_id join independently of RLS: unlike the
+// the explicit user_id join independently of RLS: unlike the
 // asRole-based tests above, this calls loadConversation and
 // loadConversationTurns directly through testPool, which connects as the
-// migration/superuser role and bypasses RLS entirely. Before T34 this would
-// have returned the other user's history; now the join itself, not RLS,
-// is what has to fail this.
+// migration/superuser role and bypasses RLS entirely, so the join itself, not
+// RLS, is what has to fail this.
 func TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -1388,8 +1406,8 @@ func TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel(t *testin
 // TestSaveMessagesCreatesConversationOnFirstUseThenAppends proves the
 // lazy-create shape: saveMessages' first call against a client-generated
 // conversation id creates the row, and a second call against the same id
-// appends to it rather than creating a second one (TASKS.md T20.5: ids are
-// always supplied by the caller, never discovered here).
+// appends to it rather than creating a second one — ids are always supplied by
+// the caller, never discovered here.
 func TestSaveMessagesCreatesConversationOnFirstUseThenAppends(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -1427,7 +1445,7 @@ func TestSaveMessagesCreatesConversationOnFirstUseThenAppends(t *testing.T) {
 
 // TestSaveMessagesCreatesConversationWithDerivedTitle proves the create side
 // of saveMessages' on-conflict insert sets title from the first message
-// (TASKS.md T20.5: "generated from the first exchange, once, and stored").
+// — generated from the first exchange, once, and stored.
 func TestSaveMessagesCreatesConversationWithDerivedTitle(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -1482,8 +1500,8 @@ func TestSaveMessagesSecondCallDoesNotOverwriteTitle(t *testing.T) {
 }
 
 // TestSaveMessagesPersistsTitleRefsOnAssistantRowOnly proves saveMessages
-// writes the shown title ids onto the assistant row (DECISIONS.md's "the
-// title IDs shown") and leaves the user row's title_refs null, and that a nil
+// writes the shown title ids onto the assistant row and leaves the user row's
+// title_refs null, and that a nil
 // slice persists as SQL NULL rather than the JSON literal "null".
 func TestSaveMessagesPersistsTitleRefsOnAssistantRowOnly(t *testing.T) {
 	pool := testPool(t)
@@ -1536,7 +1554,7 @@ func TestSaveMessagesPersistsTitleRefsOnAssistantRowOnly(t *testing.T) {
 }
 
 // TestSaveMessagesConcurrentCallsSameNewIDConvergeOnOneRow proves the
-// replacement for T20's old per-user upsert race: several callers racing to
+// id-scoped create: several callers racing to
 // create the *same client-generated conversation id* (two tabs opening "New
 // chat" would never collide on an id in practice, but two turns on one
 // connection completing close enough together against a brand-new id can)
@@ -1620,11 +1638,11 @@ func TestSaveMessagesReportsWhetherItCreatedTheConversation(t *testing.T) {
 
 // TestSaveMessagesRejectsForeignConversationID proves message_isolation's RLS
 // policy still independently blocks this on its own, as a second layer
-// behind saveMessages' own explicit join (T34,
-// TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel below) — not by
+// behind saveMessages' own explicit join
+// (TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel below) — not by
 // calling the production closure (whose current statement text this no
-// longer mirrors), but with a plain, naive multi-row insert of the shape
-// saveMessages used before T34, run under an explicit
+// longer mirrors), but with a plain, naive multi-row insert carrying no
+// ownership join of its own, run under an explicit
 // asRole("gateway_app") — the only way to make RLS apply at all, since
 // testPool otherwise connects as the table owner, which bypasses it.
 func TestSaveMessagesRejectsForeignConversationID(t *testing.T) {
@@ -1678,12 +1696,11 @@ func TestSaveMessagesRejectsForeignConversationID(t *testing.T) {
 	}
 }
 
-// TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel proves T34's
+// TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel proves the
 // explicit join, independently of RLS: it calls the real saveMessages
 // closure directly through testPool, which connects as the migration/
 // superuser role and bypasses RLS entirely (see TestRLSEnabledOnUsers'
-// comment). Before T34 this call would have silently succeeded; now the
-// join itself, not RLS, is what has to reject it.
+// comment), so the join itself, not RLS, is what has to reject it.
 func TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -1715,7 +1732,7 @@ func TestSaveMessagesRejectsForeignConversationIDAtTheAppLevel(t *testing.T) {
 }
 
 // TestLoadConversationSummariesOrdersNewestFirst proves the sidebar's list
-// (TASKS.md T20.5) is ordered by created_at desc and reports a fallback
+// is ordered by created_at desc and reports a fallback
 // title for a row saved before titles existed.
 func TestLoadConversationSummariesOrdersNewestFirst(t *testing.T) {
 	pool := testPool(t)
@@ -1858,8 +1875,8 @@ func TestDeleteConversationIsIdempotent(t *testing.T) {
 }
 
 // TestAgentRoleCanReadConversationsAndMessages is agent_ro's first positive
-// read test (T10 gave it no grants at all; T20's own migration comment names
-// this task as the one that adds them). Proves the select grant and per-user
+// read test — it starts with no grants at all, and the conversations migration
+// is what adds these. Proves the select grant and per-user
 // policy actually work, not just that writes are still denied.
 func TestAgentRoleCanReadConversationsAndMessages(t *testing.T) {
 	pool := testPool(t)
@@ -1966,7 +1983,7 @@ func TestMessagePolicyEnforcesUserIsolation(t *testing.T) {
 	})
 }
 
-// --- webhooks.go (T22.5) -----------------------------------------------------
+// --- webhooks.go -------------------------------------------------------------
 
 // TestDeleteUser proves the task's done-when line directly: removing the
 // users row takes every dependent table with it via ON DELETE CASCADE, and a

@@ -106,12 +106,12 @@ func TestChatHistoryCanonicalizesTheConversationID(t *testing.T) {
 	}
 }
 
-// TestChatHistoryReturns404WhenNotVisible is the regression guard for T32's
-// "return 404 for a conversation that is not the caller's": loadConversationTurns
+// TestChatHistoryReturns404WhenNotVisible is the regression guard for
+// returning 404 for a conversation that is not the caller's: loadConversationTurns
 // reports exists=false for both a foreign conversation id and a genuinely
 // nonexistent one (RLS makes them indistinguishable — see that function's own
-// doc comment), and chatHistory must 404 either way rather than the 200 []
-// it used to return for "nothing saved yet."
+// doc comment), and chatHistory must 404 either way rather than answering
+// 200 [] for "nothing saved yet."
 func TestChatHistoryReturns404WhenNotVisible(t *testing.T) {
 	loadConversationTurns := func(context.Context, string, string) ([]conversationTurn, bool, error) {
 		return nil, false, nil

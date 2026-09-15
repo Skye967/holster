@@ -112,11 +112,10 @@ type Handler struct {
 	audience string
 	parties  map[string]struct{}
 	// Injected so the auth path is testable without a database. Production
-	// wiring is upsertUser; the SQL itself is covered by its own test.
-	// Same signature as updateUserEmail below (webhooks.go) but not
-	// interchangeable with it — ensureUser upserts (creates on first
-	// sight), updateUserEmail only ever updates an existing row. newHandler
-	// takes both positionally; double-check the call site if either moves.
+	// wiring is upsertUser. Shares updateUserEmail's signature but not its
+	// meaning: ensureUser creates on first sight, updateUserEmail only ever
+	// updates an existing row. newHandler takes both positionally, so a
+	// transposition compiles — check the call site if either moves.
 	ensureUser func(ctx context.Context, id, email string) error
 
 	// The chat socket — see chat.go. loadChatCtx and callAgent follow
@@ -131,7 +130,7 @@ type Handler struct {
 	callAgent        agentCaller
 	tickets          *chatTicketStore
 	// chat.go: tracks conversations deleted while a turn was still in
-	// flight on them (TASKS.md T20.5's delete race) — same in-memory,
+	// flight on them — same in-memory,
 	// single-instance shape as tickets above.
 	conversationDeletions *conversationDeletions
 	originPatterns        []string
@@ -140,29 +139,29 @@ type Handler struct {
 	// test lowering it mutates one handler rather than process state — the
 	// latter can never run in parallel with another guest test.
 	guestTurnCap int
-	// chat.go's per-IP guest message rate limit (TASKS.md T33) — a field for
+	// chat.go's per-IP guest message rate limit — a field for
 	// the same reason as guestTurnCap above.
 	guestLimiters *guestRateLimiters
 
-	// providers.go (T15): the region catalog cache and the per-user
+	// providers.go: the region catalog cache and the per-user
 	// subscription write, injected the same way as ensureUser/loadChatCtx
 	// above so both are fakeable in tests without a real database or agent.
 	loadProviders    func(ctx context.Context, country string) ([]Provider, error)
 	saveSubscription func(ctx context.Context, userID string, providerID int, subscribed bool) error
 
-	// verdicts.go (T18): the caller's verdict set and the per-title write,
+	// verdicts.go: the caller's verdict set and the per-title write,
 	// injected the same way as loadProviders/saveSubscription above.
 	// loadVerdicts serves both /api/verdicts and runTurn — see it for why.
 	loadVerdicts func(ctx context.Context, userID string) ([]Verdict, error)
 	saveVerdict  func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error
 
-	// watchlist.go (T18.5): the caller's want_to_watch rows and the agent
+	// watchlist.go: the caller's want_to_watch rows and the agent
 	// call that enriches them, injected the same way as loadVerdicts/
 	// callAgent above.
 	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error)
 	callAgentTitles    agentTitlesCaller
 
-	// conversations.go (T20/T20.5): one conversation's history (for seeding a
+	// conversations.go: one conversation's history (for seeding a
 	// WS connection when the browser names it) and paired turns (for GET
 	// /api/chat/history/{conversationID}), the caller's conversation list and
 	// its delete, and the write that persists one completed turn — injected
@@ -173,7 +172,7 @@ type Handler struct {
 	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error)
 	deleteConversation        func(ctx context.Context, userID, conversationID string) (bool, error)
 
-	// webhooks.go (T22.5): the Clerk/Svix signing secret and the user
+	// webhooks.go: the Clerk/Svix signing secret and the user
 	// delete/email-update writes it triggers, injected the same way as
 	// every other DB write above. updateUserEmail shares ensureUser's
 	// signature above — see that comment.
@@ -374,7 +373,7 @@ type queryRower interface {
 // security entirely — a superuser, a role with the bypassrls attribute, or
 // the owner of any app table all skip every policy in
 // ../../supabase/migrations, turning RLS into dead code rather than a
-// backstop (T34). gateway_app is deliberately none of these
+// backstop. gateway_app is deliberately none of these
 // (20260831233121_rls_roles.sql); this catches a DATABASE_URL pointed at the
 // wrong role at startup, before it becomes a silent cross-user data leak.
 // Ownership is checked against every public table, not just users: table
@@ -408,8 +407,7 @@ func verifyRoleIsSafe(ctx context.Context, q queryRower) error {
 // request-scoped path; the one exception is webhooks.go's deleteUser/
 // updateUserEmail, where there is no HTTP caller and id instead names the
 // account a signature-verified Clerk webhook payload is about. This is the
-// shape every user-scoped database operation follows — see
-// ../../DECISIONS.md and TASKS.md T10.
+// shape every user-scoped database operation follows.
 //
 // The transaction is not optional. The gateway connects as gateway_app, a
 // non-owner role subject to row-level security. set_config with is_local => true
@@ -428,10 +426,10 @@ func withUser(ctx context.Context, db *pgxpool.Pool, userID string, fn func(pgx.
 }
 
 // upsertUser mirrors the Clerk identity into users. Runs on every request rather
-// than on a user.created webhook because it repairs itself; see ../../DECISIONS.md.
+// than on a user.created webhook because it repairs itself.
 //
 // The WHERE guard is what makes that affordable: without it ON CONFLICT DO UPDATE
-// rewrites the row every time. TestUpsertUser holds it to that.
+// rewrites the row every time.
 func upsertUser(db *pgxpool.Pool) func(context.Context, string, string) error {
 	return func(ctx context.Context, id, email string) error {
 		return withUser(ctx, db, id, func(tx pgx.Tx) error {
@@ -449,14 +447,10 @@ func upsertUser(db *pgxpool.Pool) func(context.Context, string, string) error {
 // so the message would carry the user's own data. Everything else — connection,
 // timeout, cancellation — has no row data in it and is logged as-is.
 //
-// For logging only — nothing should compare its string output against a
-// SQLSTATE to classify an error. That string has no stability contract (it's
-// free to change to suit a log line) and doing so would also skip the
-// non-PgError branch's meaning entirely, since a random error's own
-// err.Error() text could coincidentally match. isRLSRejection below is the
-// typed check for exactly the one case this package currently needs to branch
-// on, matching db_test.go's denied() and verdicts.go's sentinel-error idiom
-// for the same kind of decision instead of introducing a third way.
+// For logging only — never compare its output against a SQLSTATE to classify
+// an error: the string has no stability contract, and a non-PgError's
+// err.Error() text could coincidentally match one. isRLSRejection below is the
+// typed check for the one case this package branches on.
 func dbError(err error) string {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -469,13 +463,11 @@ func dbError(err error) string {
 // violation (SQLSTATE 42501, "insufficient_privilege") — the code a write
 // against a row this session's RLS policies don't allow it to touch returns.
 // chat.go's finishTurn is the current caller, alongside
-// errConversationNotWritable (conversations.go): a conversation id this
-// session can't write into (foreign, or deleted between dispatch and
-// persist) is the one persist failure that must reach the browser rather
-// than stay a silent log (T32/DECISIONS.md: "always a terminal frame").
-// saveMessages' own explicit ownership check (T34) is what actually catches
-// this case now; RLS's message_isolation policy staying wired to the same
-// browser-visible path is the second, independent layer, not the only one.
+// errConversationNotWritable (conversations.go): the one persist failure the
+// browser must be told about rather than only logged, since a turn always ends
+// in a terminal frame (ARCHITECTURE.md). saveMessages' explicit ownership check
+// catches a foreign or deleted conversation id first, so this fires only when
+// RLS — the second, independent layer — is what rejected the write.
 func isRLSRejection(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "42501"
@@ -503,12 +495,9 @@ func (h *Handler) originAllowed(origin string) bool {
 // would silently drift the first time a route added a verb without anyone
 // remembering a second place to update.
 //
-// Wraps only the /api/ mux: /health is never called from a browser, and
-// /ws/chat's own handshake isn't subject to fetch's CORS rules. Nothing under
-// /api/ needed this until T15 — chat's WebSocket and its ticket mint are both
-// same-origin-safe in a way a browser fetch() with an Authorization header is
-// not, so this had no reason to exist before the picker's plain GET/PUT/DELETE
-// calls.
+// Wraps the /api/ and /guest/ muxes, each with its own allowMethods. Not
+// /health, which no browser calls, and not /ws/chat, whose handshake isn't
+// subject to fetch's CORS rules.
 //
 // Runs outside authMiddleware: a preflight OPTIONS request never carries the
 // real Authorization header, so answering it inside auth would 401 every
@@ -571,10 +560,10 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 		// Fail closed: without the row, anything with a user foreign key would
 		// fail later and less clearly.
 		//
-		// The deadline matters because r.Context() has none — no http.Server
-		// timeout cancels it, only client disconnect — so a database that
-		// blackholes packets would otherwise hold this goroutine until TCP gives
-		// up, minutes later, with no 503 ever written.
+		// The deadline matters because r.Context() has none — ReadTimeout and
+		// WriteTimeout are connection deadlines, not context cancellation. A
+		// database that blackholes packets would otherwise hold this goroutine
+		// until TCP gives up, minutes later, with no 503 ever written.
 		provisionCtx, cancel := context.WithTimeout(r.Context(), provisionTimeout)
 		err = h.ensureUser(provisionCtx, claims.Subject, claims.Email)
 		cancel()

@@ -12,7 +12,7 @@ about:
   resolves them to TMDB person and keyword IDs and caches the mapping for the
   life of the process. Genre names resolve against a frozen table — TMDB's genre
   list is reference data that changes about twice a decade.
-- **The correctness floors from TASKS.md T12.** ``watch_region`` is required on
+- **The correctness floors.** ``watch_region`` is required on
   every call whose answer depends on country — availability, and any browse that
   filters by service. Name search does not: ``/search/multi`` takes no region,
   and the availability step that follows it carries one. A ``vote_count.gte``
@@ -46,7 +46,7 @@ logger = logging.getLogger("holster.tmdb")
 
 BASE_URL = "https://api.themoviedb.org/3"
 IMAGE_BASE = "https://image.tmdb.org/t/p"
-# Sizes suit chat cards (TASKS.md T16). Other surfaces build their own from
+# Sizes suit chat cards. Other surfaces build their own from
 # IMAGE_BASE and a raw path.
 POSTER_SIZE = "w342"
 LOGO_SIZE = "w92"
@@ -59,20 +59,13 @@ LANGUAGE = "en-US"
 # tier rather than gating (see lookup_title).
 MIN_VOTE_COUNT = 200
 
-# The same hazard one tier up, and only on the one sort that is exposed to it.
-# 200 votes is enough to keep an obscure short out of a *filtered* list, and
-# not nearly enough to keep it off the top of a list ordered by rating: with
-# this floor at 200, "best TV drama" returns Teach You a Lesson (9.4 from 888
-# votes) and Perfect Crown (9.1 from 205) above Breaking Bad (8.9 from 18,579).
-# At 1000 the same query returns Breaking Bad, Chernobyl, Better Call Saul and
-# The Sopranos.
-#
-# Deliberately not applied to every sort. Raising the global floor would answer
-# "highest rated" better and every narrow request worse — Korean horror on a
-# six-service account is 15 titles at 200 and 3 at 1000 — so this is scoped to
-# the sort whose ordering the floor actually protects. 1000 rather than higher
-# because 3000 starts dropping genuine classics with modest vote counts (High
-# and Low, 1190).
+# The same hazard one tier up, on the one sort exposed to it: 200 votes keeps an
+# obscure short out of a *filtered* list but not off the top of one ordered by
+# rating, where 9.4-from-888-votes outranks Breaking Bad's 8.9 from 18,579.
+# Scoped to this sort rather than raised globally, which would answer every
+# narrow request worse — Korean horror on a six-service account is 15 titles at
+# 200 and 3 at 1000. Not raised further: at 3000 genuine classics with modest
+# vote counts start dropping out (High and Low, 1190).
 MIN_VOTE_COUNT_TOP_RATED = 1000
 
 # TMDB's fixed page size for every list endpoint. Callers read it to tell
@@ -85,14 +78,10 @@ MAX_RETRIES = 2
 MAX_RETRY_WAIT = 10.0
 
 MediaType = Literal["movie", "tv"]
-# "Most watched" and "best reviewed". TMDB's own `popularity.desc` used to be
-# the default here and is deliberately no longer offered at all: it is a
-# rolling trend metric, not a quality one, and it ranked War of the Worlds
-# (2025), rated 4.0, fourth among thrillers, above The Dark Knight. Removed
-# rather than demoted because there is no request it answers better — even
-# "what's new" reads better ordered by vote count, which returns titles people
-# recognise instead of whatever is spiking this week. A real "what's new" would
-# be a release-date window on top of vote_count.desc, not this.
+# "Most watched" and "best reviewed". TMDB's `popularity.desc` is deliberately
+# not offered: it is a rolling trend metric, not a quality one, and there is no
+# request it answers better — even "what's new" reads better by vote count. A
+# real "what's new" would be a release-date window on top of vote_count.desc.
 DiscoverSort = Literal["vote_count.desc", "vote_average.desc"]
 SearchKind = Literal["person", "keyword"]
 
@@ -197,8 +186,8 @@ class Provider(TypedDict):
 
 
 class RegionProvider(TypedDict):
-    """One entry in the region-wide provider list (TASKS.md T15's /connections
-    picker) — distinct from Provider because display_priority only makes sense
+    """One entry in the region-wide provider list behind the /connections
+    picker — distinct from Provider because display_priority only makes sense
     for "every provider in a region," not for a single title's flatrate/rent/buy
     split."""
 
@@ -210,7 +199,7 @@ class RegionProvider(TypedDict):
 
 class WatchAvailability(TypedDict):
     # flatrate is "included with the subscription"; rent/buy are paid on top and
-    # must never be shown as included (TASKS.md T12). link is the JustWatch-backed
+    # must never be shown as included. link is the JustWatch-backed
     # watch page for the region.
     link: str | None
     flatrate: list[Provider]
@@ -218,7 +207,7 @@ class WatchAvailability(TypedDict):
     buy: list[Provider]
 
 
-# Top-billed cast shown on a title card (TASKS.md T16) — "two or three," capped
+# Top-billed cast shown on a title card — "two or three," capped
 # here rather than left to the caller.
 CAST_LIMIT = 3
 
@@ -234,8 +223,7 @@ _REGION_RE = re.compile(r"^[A-Z]{2}$")
 def _validate_media_type(media_type: str) -> None:
     # media_type is typed as a Literal, but nothing enforces that at runtime and
     # it goes straight into the URL path — validate it here rather than trust
-    # the caller, matching TASKS.md T13's "validate every argument before it
-    # reaches a URL."
+    # the caller: every argument is validated before it reaches a URL.
     if media_type not in ("movie", "tv"):
         raise ValueError(f"media_type must be 'movie' or 'tv', got {media_type!r}")
 
@@ -679,7 +667,7 @@ class TMDBClient:
                 )
             ids_str = "|".join(str(int(p)) for p in watch_providers)
             params["with_watch_providers"] = ids_str
-            # Subscription means included, not rentable — TASKS.md T12.
+            # Subscription means included, not rentable.
             params["with_watch_monetization_types"] = "flatrate"
 
         # Each field is an independent TMDB round trip; run them concurrently.
@@ -728,7 +716,10 @@ class TMDBClient:
         self, *, media_type: MediaType, tmdb_id: int
     ) -> list[Title]:
         """ "More like this" for a known title. Does not filter by service — the
-        caller cross-references availability."""
+        caller cross-references availability.
+
+        Nothing calls this yet. Kept because "more like this" is in this
+        module's brief; delete it if that stops being true."""
         _validate_media_type(media_type)
         data = await self._get(
             f"/{media_type}/{int(tmdb_id)}/recommendations", {"language": LANGUAGE}
@@ -775,7 +766,7 @@ class TMDBClient:
         hits the network: title/year/vote_average/overview are live TMDB
         fields, not immutable metadata like runtime/cast, so caching them
         here would serve a stale rating as current -- the same class of bug
-        "re-check availability at read time" (TASKS.md T18.5) exists to
+        "re-check availability at read time" exists to
         prevent, just applied to a rating instead of a service list. The
         runtime/cast half is still written into title_details()'s own
         cache, so a later title_details() call for this id is a cache hit,
@@ -821,7 +812,7 @@ class TMDBClient:
         """Every provider available in one country, across movies and TV,
         merged by provider_id — a user thinks "I have Netflix," not "Netflix
         for movies," and the major platforms share one ID across media types.
-        Powers the /connections picker (TASKS.md T15); this call has no cache
+        Powers the /connections picker; this call has no cache
         of its own, the caller (streaming_providers, gateway-side) owns that.
         """
         _validate_region(watch_region)

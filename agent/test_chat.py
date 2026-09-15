@@ -26,6 +26,8 @@ from catalog_tool import (
 )
 from chat import (
     _RELAXED_LABELS,
+    MAX_HISTORY_TURNS,
+    MAX_SHOWN,
     ChatRequest,
     HistoryTurn,
     _nothing_found_message,
@@ -36,6 +38,8 @@ from chat import (
 from testutil import (
     ALL_JUDGED,
     CAPABILITY_QUESTION,
+    GATEWAY_MAX_HISTORY_EXCHANGES,
+    GATEWAY_MAX_SHOWN_REFS,
     MOVIE_A,
     NEEDS_CLARIFICATION,
     NO_CANDIDATES,
@@ -217,7 +221,7 @@ def test_successful_search_emits_intent_then_results_then_done() -> None:
     assert pick["blurb"] == "great fit"
     assert events[1]["relaxed"] == []
     assert events[1]["kind"] == "search"
-    # Enrichment (TASKS.md T16) reaches the wire event: genre_names is a pure
+    # Enrichment reaches the wire event: genre_names is a pure
     # local lookup from MOVIE_A's genre_ids ([80] -> Crime), no TMDB call
     # needed; the other three fields come back empty because this test's
     # FakeTMDB has no /movie/101* endpoints queued, so title_details()/
@@ -345,7 +349,7 @@ def test_history_is_folded_into_the_message_text() -> None:
 
 
 def test_cold_start_sends_interpret_the_bare_first_message() -> None:
-    """T21: a brand-new account has no verdicts and no history — both default
+    """A brand-new account has no verdicts and no history — both default
     to []. _with_history is a no-op on an empty list, so interpret() must see
     exactly what the user typed, with nothing folded in. Same minimal shape as
     test_history_is_folded_into_the_message_text above — an empty discover()
@@ -585,7 +589,7 @@ def test_intent_event_carries_the_title_for_the_gateways_line() -> None:
     assert events[0]["intent"]["title"] == "Heat"
 
 
-# --- the widening, said out loud (T30) --------------------------------------
+# --- the widening, said out loud --------------------------------------------
 
 
 def test_all_shown_message_is_not_the_all_judged_one() -> None:
@@ -712,3 +716,31 @@ def test_shown_reaches_search_and_keeps_a_title_off_the_screen() -> None:
     )
 
     assert [e["type"] for e in events] == ["intent", "message", "done"]
+
+
+def test_the_history_backstop_stays_clear_of_the_gateways_window() -> None:
+    """Pins MAX_HISTORY_TURNS against the gateway's maxHistoryExchanges.
+
+    A backstop sitting at the operating point stops being a backstop and
+    becomes a second, tighter window — the gateway would send five exchanges
+    and the agent would quietly keep fewer, with no error anywhere."""
+    gateway_window = GATEWAY_MAX_HISTORY_EXCHANGES * 2
+    assert gateway_window <= MAX_HISTORY_TURNS, (
+        f"MAX_HISTORY_TURNS {MAX_HISTORY_TURNS} is under the gateway's "
+        f"{gateway_window}-message window; history would be cut here with no "
+        f"error anywhere"
+    )
+
+
+def test_the_shown_backstop_stays_clear_of_the_gateways_window() -> None:
+    """Pins MAX_SHOWN against the gateway's maxShownRefs. If maxShownRefs ever
+    passes MAX_SHOWN, `shown` is truncated here and the gateway believes it is
+    suppressing more titles than the agent actually excludes — "show me more"
+    re-offers titles the user already saw, with no error anywhere.
+
+    Both sides hold hand-copied numbers, so this compares the copy in
+    testutil.py, not the gateway's live value."""
+    assert GATEWAY_MAX_SHOWN_REFS <= MAX_SHOWN, (
+        f"MAX_SHOWN {MAX_SHOWN} is under the gateway's {GATEWAY_MAX_SHOWN_REFS} "
+        f"refs; the oldest would be dropped silently"
+    )

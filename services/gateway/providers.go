@@ -22,17 +22,15 @@ import (
 // stay open — so this plain JSON call bounds itself instead, the same pattern
 // provisionTimeout uses for the upsertUser path.
 //
-// 15s, not the agent's own worst case: agent/tmdb.py's retry logic can wait up
-// to ~20s (two TMDB-instructed retry-after waits, one per concurrent movie/tv
-// call) before giving up. 15s covers a single such wait — the common transient
-// case — without making every /connections load that hits it block that long;
-// the rare tail where both calls independently hit a full retry-after still
-// times out here and correctly falls through to serving stale/empty, the
-// designed degrade, not a bug.
+// 15s, not the ~20s the agent can spend sleeping (agent/tmdb.py retries twice,
+// each wait capped at MAX_RETRY_WAIT; the movie and tv calls run concurrently,
+// so it's 20s not 40s): it covers one such wait without making every
+// /connections load block that long. The rarer double wait times out here and
+// falls through to serving stale or empty, which is the intended degrade.
 var providersRefreshTimeout = 15 * time.Second
 
-// providerCacheTTL is T15's "lazy cache, no scheduler" window (../../TASKS.md):
-// serve what's cached, refresh from the agent only when it is older than this.
+// providerCacheTTL is the lazy cache's window — no scheduler anywhere: serve
+// what is cached, refresh from the agent only when it is older than this.
 const providerCacheTTL = 24 * time.Hour
 
 // Provider is one entry of streaming_providers.providers — every service
@@ -42,12 +40,11 @@ const providerCacheTTL = 24 * time.Hour
 // tested there — if one of these two decoders' field names changes, check
 // the other, since both read the same jsonb column independently.
 //
-// LogoURL, not a raw logo path: the comment on streaming_providers in
-// 20260831230634_streaming.sql predates agent/tmdb.py's established Provider
-// convention of pre-building a full image URL via _image_url(). jsonb has no
-// enforced key schema, so following that already-established shape here is a
-// comment-level correction, not a migration change — the same way T9 itself
-// superseded a stale comment on init.sql without editing the applied file.
+// LogoURL holds a full image URL, not the raw logo_path that
+// 20260831230634_streaming.sql's comment describes: that comment is the stale
+// one — agent/tmdb.py pre-builds the URL via _image_url(). jsonb enforces no key
+// schema, so the two can disagree and only the comment is wrong: correct it
+// there, never by editing an applied migration or renaming the key here.
 type Provider struct {
 	ProviderID   int    `json:"provider_id"`
 	ProviderName string `json:"provider_name"`
@@ -100,15 +97,14 @@ func newAgentProviderCaller(client *http.Client, baseURL string) agentProviderCa
 
 // loadProviders reads the country's cached streaming_providers row, or the
 // agent's live list if there is none or it is older than providerCacheTTL —
-// T15's "lazy cache, no scheduler." A refresh failure degrades to whatever is
+// lazily, with no scheduler. A refresh failure degrades to whatever is
 // already cached (or an empty list if nothing is), the same shape
 // loadChatContext already uses for its own missing-row case.
 //
-// Refreshes are single-flighted per country. The benign-race note this
-// replaced rested on "low-traffic settings page", which stopped being true
-// when GET /guest/providers put this path in front of signed-out browsers:
-// on a cold cache, or the moment the TTL lapses, every concurrent caller
-// would otherwise run its own agent->TMDB fetch against a shared quota.
+// Refreshes are single-flighted per country: GET /guest/providers puts this
+// path in front of signed-out browsers, so on a cold cache or the moment the
+// TTL lapses, every concurrent caller would otherwise run its own
+// agent->TMDB fetch against a shared quota.
 // Followers wait on the leader's result instead of adding load — which is why
 // the flight runs on a context detached from the request that started it: with
 // one fetch shared by many callers, that fetch must not die with whichever of
@@ -217,8 +213,8 @@ func saveSubscription(db *pgxpool.Pool) func(ctx context.Context, userID string,
 	}
 }
 
-// providers is GET /api/providers — the picker's one round trip (TASKS.md
-// T15): the caller's region's catalog, each entry flagged with whether the
+// providers is GET /api/providers — the picker's one round trip: the
+// caller's region's catalog, each entry flagged with whether the
 // caller already subscribes to it.
 func (h *Handler) providers(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(ctxUserID).(string)
@@ -287,8 +283,8 @@ func (h *Handler) subscriptions(w http.ResponseWriter, r *http.Request) {
 }
 
 // setSubscription is PUT/DELETE /api/subscriptions/{providerID} — one
-// service, toggled immediately, no request body (TASKS.md T15: "toggles save
-// on flip"). PUT is the idempotent "make it subscribed" (on conflict do
+// service, toggled immediately, no request body — a toggle saves on flip.
+// PUT is the idempotent "make it subscribed" (on conflict do
 // nothing — ticking an already-ticked service is a no-op, not an error);
 // DELETE is "make it not."
 func (h *Handler) setSubscription(w http.ResponseWriter, r *http.Request) {

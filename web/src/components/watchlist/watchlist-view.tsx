@@ -27,8 +27,8 @@ import { fetchWatchlist } from "@/lib/watchlist"
 
 // A saved title whose base TMDB lookup failed or no longer resolves
 // (pick.unavailable — services/gateway/chat.go's agentPick.Unavailable).
-// title_verdicts is stored data (TASKS.md's cross-cutting "degrade rather
-// than fail" rule), so the row still has to appear with a way to clear it,
+// title_verdicts is stored data, which degrades rather than fails
+// (ARCHITECTURE.md's Failure rules), so the row still has to appear with a way to clear it,
 // not vanish — kept as its own small component rather than teaching
 // TitleCard (shared with chat) a degraded-data branch it otherwise has no
 // use for.
@@ -157,7 +157,7 @@ export function WatchlistView() {
         if (res.status === 409) throw new VerdictLockedError()
         if (!res.ok) throw new Error(`status ${res.status}`)
         // A judgment (e.g. "seen") doesn't clear want_to_watch server-side —
-        // T17's verdict is one row, one value — so the row leaves the
+        // a verdict is one row, one value — so the row leaves the
         // watchlist the same way a bookmark-clear does.
         setItems(
           (prev) =>

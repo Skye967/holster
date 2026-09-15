@@ -6,7 +6,7 @@ import { cookies } from "next/headers"
 import { readGuestProviders } from "@/lib/guest"
 
 // No session means guest, deliberately — it is not an auth failure to
-// recover from. Why: DECISIONS.md "Optional sign-in".
+// recover from. Why: ARCHITECTURE.md's "Sign-in is optional".
 //
 // The one place a server component decides who it's rendering for: an
 // account (userId, getToken) or a guest (guestProviders from the cookie —
