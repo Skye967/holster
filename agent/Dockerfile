@@ -11,9 +11,8 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Resolve against the lockfile only, so this layer caches until it changes.
-RUN --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    uv sync --frozen --no-dev
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
 FROM python:3.13-slim
 
