@@ -59,6 +59,8 @@ persists and new migration files are ignored. `docker compose down -v` to re-ini
 ```sh
 go test ./...                                    # unit tests, no database needed
 TEST_DATABASE_URL=postgresql://postgres:password@localhost:5432/holster go test ./...
+gofmt -l .                                       # lists unformatted files
+go vet ./...
 ```
 
 Database tests skip unless `TEST_DATABASE_URL` is set. It is deliberately not

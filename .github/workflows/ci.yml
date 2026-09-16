@@ -74,6 +74,24 @@ jobs:
           go-version-file: services/gateway/go.mod
           cache-dependency-path: services/gateway/go.sum
 
+      # gofmt does not fail on unformatted files, it lists them on stdout, so
+      # this tests the listing. A file it cannot parse does fail it, exiting 2
+      # before the test — that case reports the parse error and no listing.
+      - name: gofmt
+        working-directory: services/gateway
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files - run gofmt -w ."
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # go test runs a high-confidence subset of vet; this runs its default set.
+      - name: go vet
+        working-directory: services/gateway
+        run: go vet ./...
+
       # Service containers start before checkout, so the docker-compose.yml
       # bind-mount trick (supabase/migrations -> docker-entrypoint-initdb.d)
       # can't run here. Replay the migrations by hand instead.
@@ -101,6 +119,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.1.0
+      - name: ruff check
+        run: uv run ruff check .
+      - name: mypy
+        run: uv run mypy .
       - name: pytest
         run: uv run pytest
 
