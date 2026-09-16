@@ -13,12 +13,13 @@ from main import (
     CorrelationIdMiddleware,
     app,
     asgi_app,
+    get_compose_model,
     get_interpret_model,
     get_rank_model,
     get_tmdb_client,
     lifespan,
 )
-from testutil import MOVIE_A, FakeTMDB
+from testutil import MOVIE_A, FakeTMDB, ok_compose
 from tmdb import Title
 
 client = TestClient(asgi_app)
@@ -84,6 +85,7 @@ def test_chat_streams_ndjson_events() -> None:
     app.dependency_overrides[get_tmdb_client] = fake_tmdb.client
     app.dependency_overrides[get_interpret_model] = lambda: fake_interpret
     app.dependency_overrides[get_rank_model] = lambda: fake_rank
+    app.dependency_overrides[get_compose_model] = lambda: ok_compose
 
     resp = client.post(
         "/chat",
@@ -100,10 +102,11 @@ def test_chat_requires_a_message() -> None:
     # FastAPI resolves Depends() alongside body validation rather than only
     # after it succeeds, so the route's dependencies still need a value even
     # on a request this test expects to fail on the body — see main.py's
-    # get_tmdb_client/get_interpret_model/get_rank_model.
+    # get_tmdb_client/get_interpret_model/get_rank_model/get_compose_model.
     app.dependency_overrides[get_tmdb_client] = FakeTMDB().client
     app.dependency_overrides[get_interpret_model] = lambda: _must_not_be_called
     app.dependency_overrides[get_rank_model] = lambda: _must_not_be_called
+    app.dependency_overrides[get_compose_model] = lambda: _must_not_be_called
 
     resp = client.post("/chat", json={"watch_region": "US", "watch_providers": [8]})
 

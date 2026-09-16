@@ -653,7 +653,7 @@ func TestChatErrorReasonBecomesFriendlyText(t *testing.T) {
 	if strings.Contains(ev.Text, "tmdb_unavailable") {
 		t.Errorf("error text leaked the raw reason code: %q", ev.Text)
 	}
-	if ev.Text != "Can't reach the film database right now." {
+	if ev.Text != "Can't reach the film database right now — give it a minute and try again." {
 		t.Errorf("error text = %q", ev.Text)
 	}
 }
@@ -3098,5 +3098,129 @@ func TestAGuestsShownSetKeepsEveryTitleAcrossManyTurns(t *testing.T) {
 	}
 	if want := (agentTitleRef{TMDBID: 100, MediaType: "movie"}); last[0] != want {
 		t.Errorf("oldest ref = %+v, want the very first title shown %+v", last[0], want)
+	}
+}
+
+// The opener reaches the browser as its own type, ahead of the interpreting
+// line it introduces. Forwarding order is the whole point: rendered as a
+// "token" it would sit below the cards instead.
+func TestChatForwardsTheAgentsOpenerAheadOfTheInterpretingLine(t *testing.T) {
+	callAgent := fakeAgentEvents(
+		agentEvent{Type: "reply", Text: "Absolutely, give me a second."},
+		agentEvent{Type: "intent", Intent: json.RawMessage(`{"media_type":"movie"}`)},
+		agentEvent{Type: "results", Picks: []agentPick{
+			{TMDBID: 550, MediaType: "movie", Title: "Fight Club"},
+		}},
+		agentEvent{Type: "done"},
+	)
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8}}, nil
+	}
+	srv, token := newChatTestServer(t, loadCtx, callAgent, noopLoadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie", Conversation: testConversationID})
+
+	var got []outboundEvent
+	for range 4 {
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev)
+	}
+
+	want := []string{"reply", "interpreting", "results", "done"}
+	for i, wantType := range want {
+		if got[i].Type != wantType {
+			t.Errorf("event[%d].Type = %q, want %q", i, got[i].Type, wantType)
+		}
+	}
+	if got[0].Text != "Absolutely, give me a second." {
+		t.Errorf("reply text = %q", got[0].Text)
+	}
+}
+
+// The opener is ephemeral. Persisting it would feed "Absolutely, one sec" to
+// the next turn's interpret() forever, which is the hazard the agent's own
+// outcome copy is written to avoid.
+func TestChatDoesNotPersistTheOpener(t *testing.T) {
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8}}, nil
+	}
+	callAgent := fakeAgentEvents(
+		agentEvent{Type: "reply", Text: "Absolutely, give me a second."},
+		agentEvent{Type: "results", Kind: "search", Picks: []agentPick{
+			{TMDBID: 550, MediaType: "movie", Title: "Fight Club"},
+		}},
+		agentEvent{Type: "done"},
+	)
+
+	type saveCall struct{ userText, assistantText string }
+	saved := make(chan saveCall, 1)
+	saveMessages := func(_ context.Context, _ string, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error) {
+		saved <- saveCall{userText, assistantText}
+		return false, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie", Conversation: testConversationID})
+	for range 3 { // "reply", "results", then "done"
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case call := <-saved:
+		if call.assistantText != "Suggested: Fight Club" {
+			t.Errorf("assistantText = %q, want %q", call.assistantText, "Suggested: Fight Club")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("saveMessages was never called")
+	}
+}
+
+// An opener on a turn that then fails must not leave the failure unreported,
+// and must not be mistaken for the turn's answer.
+func TestChatAnOpenerDoesNotMakeAFailedTurnLookAnswered(t *testing.T) {
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US", Providers: []int{8}}, nil
+	}
+	callAgent := fakeAgentEvents(
+		agentEvent{Type: "reply", Text: "One sec while I look."},
+		agentEvent{Type: "error", Reason: "tmdb_unavailable"},
+	)
+
+	saved := make(chan struct{}, 1)
+	saveMessages := func(_ context.Context, _ string, _, _, _ string, _ []agentTitleRef) (bool, error) {
+		saved <- struct{}{}
+		return false, nil
+	}
+	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
+		noopLoadConversation, saveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	wsjson.Write(t.Context(), conn, inboundMessage{Type: "message", Turn: "t1", Text: "a heist movie", Conversation: testConversationID})
+
+	var got []outboundEvent
+	for range 2 {
+		var ev outboundEvent
+		if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev)
+	}
+
+	if got[0].Type != "reply" || got[1].Type != "error" {
+		t.Fatalf("types = %q/%q, want reply/error", got[0].Type, got[1].Type)
+	}
+	select {
+	case <-saved:
+		t.Error("a turn that only sent an opener before failing was persisted")
+	case <-time.After(200 * time.Millisecond):
 	}
 }

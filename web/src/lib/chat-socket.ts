@@ -56,10 +56,15 @@ export interface AgentPick {
 // isn't rendered inline in any turn's UI, and chat-session-provider.tsx
 // intercepts it — telling the sidebar to refetch — before it ever reaches a
 // ChatPanel (see that file and services/gateway/chat.go's finishTurn).
+// `reply` is the agent's model-written opener, sent ahead of `interpreting`
+// and rendered above it. Separate from `token` because a token renders below
+// the cards and a later `message` on the same turn replaces it; the gateway
+// also never stores this one, so a reloaded conversation shows no opener.
 // `note` is `relaxed` said in a sentence — the agent composes it (chat.py's
 // _relaxed_note) and it is what gets rendered; `relaxed` stays alongside as
 // the machine-readable form. Both are `omitempty`, so both are optional here.
 export type ChatEvent =
+  | { type: "reply"; turn: string; text: string }
   | { type: "interpreting"; turn: string; text: string }
   | {
       type: "results"

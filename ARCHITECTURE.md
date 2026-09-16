@@ -220,8 +220,8 @@ the rule it depends on and then cites this section, never the citation alone.
   empty screen and they mean opposite things: one says *change your question*, the
   other *not your fault, try later*.
 - **Never show a status code.** Each message says whether waiting will help: *"Can't
-  reach the film database right now"*, *"I'm having trouble thinking"*, *"Couldn't
-  save that — try again"*.
+  reach the film database right now — give it a minute and try again"*, *"I'm having
+  trouble thinking"*, *"Couldn't save that — try again"*.
 - **Optimistic UI needs a rollback path.** Toggles and bookmarks show success before
   the server confirms. If a save fails and nothing reverts, the interface is lying.
 - **A dropped stream keeps what arrived**, marks it incomplete, and offers a retry. It

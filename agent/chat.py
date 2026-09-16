@@ -25,6 +25,13 @@ Event shapes on the wire (one JSON object per line):
         -- note is the one-line explanation of a widened search, empty
            whenever nothing was relaxed; `relaxed` stays alongside it as the
            machine-readable form
+    {"type": "reply", "text": str}     -- the model's one-line opener,
+                                          emitted before "intent" on a turn
+                                          that runs a search or a lookup.
+                                          Ephemeral: it is written before any
+                                          result exists, so it is never stored
+                                          as the turn's assistant text (see
+                                          services/gateway/chat.go's runTurn)
     {"type": "message", "text": str}   -- a plain reply with no candidates
                                            (no subscriptions, capability
                                            question, clarifying question, a
@@ -34,7 +41,7 @@ Event shapes on the wire (one JSON object per line):
     {"type": "done"}
 
 This is the agent-internal protocol, not the browser-facing one. The gateway
-owns the public event vocabulary (interpreting/results/token/done/error) and
+owns the public event vocabulary (reply/interpreting/results/token/done/error) and
 templates it from these — see chat.go's outboundEvent for the vocabulary the
 browser actually sees. Nothing here assumes anything about WebSockets; this
 module has no transport opinion beyond "an async stream of dicts."
@@ -60,11 +67,14 @@ from pydantic import BaseModel, Field
 
 from catalog_tool import (
     CatalogToolError,
+    Composer,
     DiscoverIntent,
     Interpreter,
+    OutcomeCause,
     Ranker,
     TitleRef,
     TitleVerdict,
+    compose,
     search,
 )
 from tmdb import TMDBClient, TMDBUnavailable
@@ -94,6 +104,22 @@ MAX_HISTORY_TURNS = 20
 # not reach it.
 MAX_SHOWN = 2000
 
+# What the outcome composer gets before the turn answers from its template.
+# The SDK's own envelope is no bound worth resting on: timeout=15.0 (main.py)
+# is three times this cap on its own.
+#
+# It bounds what this call adds, not what the turn has already spent — an empty
+# turn arrives here having run page 1 and the whole ladder — so a turn already
+# near the gateway's 30s turnDeadline still passes it, and the dropped-stream
+# fallback is what the user sees.
+COMPOSE_TIMEOUT_SECONDS = 5.0
+
+# Hand-written, and the one turn that reaches no model at all. Composing it
+# would put the first message most new visitors ever see behind a call on a
+# 15-request-a-minute tier, to rephrase advice that is always the same; it
+# would also make a frame that services/gateway/chat.go meters neither by its
+# guest turn cap nor by its per-IP limiter — both gated on the frame carrying
+# providers — cost a model call.
 NO_PROVIDERS_MESSAGE = (
     "You haven't picked any streaming services yet. Head to Connections to "
     "set them up and I'll be able to find something for you."
@@ -183,7 +209,10 @@ def _relaxed_labels(relaxed: Sequence[str]) -> str:
 
 
 def _title_not_found_message(title: str) -> str:
-    """A named title nothing carried — TMDB returned no rows, or none of the
+    """The fallback when the outcome composer cannot write this one — see
+    _outcome_text.
+
+    A named title nothing carried — TMDB returned no rows, or none of the
     rows it did return actually bear the name. Distinct from
     _nothing_found_message because the advice differs: there is nothing to
     loosen, and "try loosening what you're looking for" reads as nonsense in
@@ -198,24 +227,28 @@ def _title_not_found_message(title: str) -> str:
 
 
 def _nothing_found_message(
-    relaxed: Sequence[str], all_judged: bool, all_shown: bool
+    cause: Literal["nothing_matched", "all_shown", "all_judged"],
+    relaxed: Sequence[str],
 ) -> str:
-    """Why nothing came back, in the caller's words. all_judged and all_shown
-    both take precedence over relaxed: when every title found was already
-    rated, or already put on screen this conversation, the relaxation story is
-    beside the point. They are separate cases because the advice differs and
-    because telling someone they rated titles they were only shown is false.
-    Otherwise the copy names no constraint, deliberately - the ladder may
-    already have dropped runtime or year to get this page, so "drop the
-    runtime" can be advice to redo what was already done; and this text
-    becomes assistant history feeding the next turn's interpret(), the same
-    hazard _capability_message documents below."""
-    if all_judged:
+    """The fallback when the outcome composer cannot write this one — see
+    _outcome_text.
+
+    Why nothing came back, in the caller's words. Keyed on the cause search()
+    already decided rather than on the flags behind it, so the sentence the
+    user reads and the duty the composer was given cannot describe the turn
+    differently.
+
+    On nothing_matched the copy names no constraint, deliberately: the ladder
+    may already have dropped runtime or year to get this page, so "drop the
+    runtime" can be advice to redo what was already done; and this text becomes
+    assistant history feeding the next turn's interpret(), the same hazard
+    _capability_message documents below."""
+    if cause == "all_judged":
         return (
             "I found things, but you've rated all of them already. Try "
             "asking for something different."
         )
-    if all_shown:
+    if cause == "all_shown":
         # "everything I found", not "everything there is": the read can stop at
         # the page ceiling, the clock, or a failed call, and every query is
         # filtered by a vote floor the user never stated (tmdb.py's
@@ -267,7 +300,12 @@ def _relaxed_note(relaxed: Sequence[str], exact_matches: int, total: int) -> str
 
 
 def _capability_message(provider_names: Sequence[str]) -> str:
-    """Capability-question answer: names the caller's own services (if
+    """The fallback for a capability turn whose model-written reply came back
+    blank or missing. Keeping it is what holds the guarantee services/gateway/
+    chat.go's runTurn relies on for "message": that its text is never empty,
+    and so can be stored as the turn's answer unguarded.
+
+    Names the caller's own services (if
     resolved — provider_names can be empty while the per-country name
     cache warms up) plus example phrasing, never a feature list. No concrete
     numbers in the example: this text becomes conversation history and feeds
@@ -279,6 +317,58 @@ def _capability_message(provider_names: Sequence[str]) -> str:
         '"something funny and short" or "a slow-burn thriller with '
         "[actor].\" Tell me what you're in the mood for."
     )
+
+
+async def _outcome_text(
+    message: str,
+    cause: OutcomeCause,
+    *,
+    model: Composer,
+    title: str,
+    relaxed: Sequence[str],
+) -> str:
+    """The model's own sentence for a turn that ended with nothing to show,
+    bounded by COMPOSE_TIMEOUT_SECONDS and degrading to the template behind it.
+
+    The detail the composer is given and the template it falls back to are
+    chosen here, from the one cause, so the sentence a user reads cannot
+    describe a different turn from the duty the model was set. Only
+    nothing_matched has a detail the prompt defines beyond the title: the other
+    two are about what the user has already seen or rated, where naming what
+    the ladder loosened would merge two answers.
+
+    Degrade, don't fail, the same split catalog_tool's _safe() makes: the turn
+    already has its answer and only the wording is at stake.
+
+    Warning, not exception: compose() flattens every model failure into
+    CatalogToolError, so a free-tier refusal and a schema fault arrive here
+    identically and this function has no signal to tell them apart. The
+    traceback is kept because a schema or wiring fault fails every call and
+    would otherwise show up only as prose that never got warmer. The SDK's own
+    timeout is in that arm too, compose() having wrapped it; the deadline this
+    function owns is the other one.
+
+    A blank result falls back too: ComposedReply.text is required of the model,
+    which still leaves "" satisfying the schema, and an empty "message" event
+    would persist an empty assistant turn.
+    """
+    if cause == "title_not_found":
+        fallback, detail = _title_not_found_message(title), title
+    else:
+        fallback = _nothing_found_message(cause, relaxed)
+        detail = _relaxed_labels(relaxed) if cause == "nothing_matched" else ""
+    try:
+        async with asyncio.timeout(COMPOSE_TIMEOUT_SECONDS):
+            composed = await compose(message, cause, detail, model=model)
+    except TimeoutError:
+        logger.info("outcome composer timed out, degraded", extra={"cause": cause})
+        return fallback
+    except CatalogToolError:
+        logger.warning(
+            "outcome composer failed, degraded", exc_info=True, extra={"cause": cause}
+        )
+        return fallback
+    return composed.text.strip() or fallback
 
 
 def _error_reason(exc: Exception) -> str:
@@ -310,9 +400,12 @@ async def stream_chat(
     client: TMDBClient,
     interpret_model: Interpreter,
     rank_model: Ranker,
+    compose_model: Composer,
 ) -> AsyncGenerator[dict[str, Any]]:
     # services/gateway's runTurn skips loading verdicts entirely for a caller
-    # with no ticked services, on the strength of this early return.
+    # with no ticked services, on the strength of this early return — and its
+    # guest throttle meters only frames that carry providers, on the strength
+    # of this turn reaching no model.
     if not req.watch_providers:
         yield {"type": "message", "text": NO_PROVIDERS_MESSAGE}
         yield {"type": "done"}
@@ -332,18 +425,30 @@ async def stream_chat(
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
     async def on_intent(intent: DiscoverIntent) -> None:
+        # Ahead of the intent event, because the opener is prose above the
+        # interpreting line and the gateway forwards in arrival order. Only a
+        # turn that searches or looks up reaches here at all: search() returns
+        # before on_intent for a capability or clarifying question, which is
+        # what keeps the opener off the two turns whose reply is the answer
+        # itself.
+        #
+        # Skipped when blank rather than sent empty — reply is required of the
+        # model, which still leaves "" satisfying the schema.
+        if intent.reply:
+            await queue.put({"type": "reply", "text": intent.reply})
         # is_capability_question/clarifying_question never reach here in
         # practice (search() returns early for both — see catalog_tool.py)
         # but excluded on principle: neither is a search parameter,
-        # meaningless in the gateway's template. `title` is not excluded with
-        # them — it is what the turn is searching for, and the gateway's
-        # interpreting line is templated off it.
+        # meaningless in the gateway's template. `reply` is excluded for the
+        # same reason and because it has just gone out as its own event.
+        # `title` is not excluded with them — it is what the turn is searching
+        # for, and the gateway's interpreting line is templated off it.
         await queue.put(
             {
                 "type": "intent",
                 "intent": intent.model_dump(
                     exclude_none=True,
-                    exclude={"is_capability_question", "clarifying_question"},
+                    exclude={"is_capability_question", "clarifying_question", "reply"},
                 ),
             }
         )
@@ -360,67 +465,100 @@ async def stream_chat(
                 on_intent=on_intent,
                 verdicts=req.verdicts,
                 shown=shown,
+                watch_provider_names=req.watch_provider_names,
             )
+            # Every empty-result branch below composes its sentence with a model
+            # call, and every one of them has a call to spare: rank()'s never
+            # happened. An empty pick list means an empty candidate list — rank()
+            # returns before calling the model on one (catalog_tool.rank), and
+            # search()'s top-up loop otherwise fills the list to `floor`, which
+            # min(RESULT_FLOOR, limit) and DiscoverIntent.limit's `ge=1` hold at
+            # one or more. A capability or clarifying turn never ran rank()
+            # either, and its reply came free with the intent.
+            #
+            # is_capability_question checked first, deliberately: the two fields
+            # are independent (nothing stops the model setting both), and a
+            # capability question is the more specific signal when it happens.
+            if result.intent is not None and result.intent.is_capability_question:
+                # The model's own answer, written with the caller's services
+                # in front of it (catalog_tool's _with_providers) — no second
+                # call, and no template unless it came back blank.
+                #
+                # Whatever it put in reply is the whole turn, so a search
+                # message mislabelled is_capability_question answers with its
+                # opener and nothing follows. Only a blank reply reaches the
+                # template; telling an opener from an answer needs a heuristic,
+                # and nothing stops the model setting both fields.
+                await queue.put(
+                    {
+                        "type": "message",
+                        "text": result.intent.reply
+                        or _capability_message(req.watch_provider_names),
+                    }
+                )
+            elif result.intent is not None and result.intent.clarifying_question:
+                await queue.put(
+                    {"type": "message", "text": result.intent.clarifying_question}
+                )
+            elif result.picks:
+                await queue.put(
+                    {
+                        "type": "results",
+                        "kind": result.kind,
+                        "relaxed": result.relaxed,
+                        "note": _relaxed_note(
+                            result.relaxed, result.exact_matches, len(result.picks)
+                        ),
+                        "picks": result.picks,
+                    }
+                )
+            elif result.cause is not None and result.intent is not None:
+                await queue.put(
+                    {
+                        "type": "message",
+                        "text": await _outcome_text(
+                            req.message,
+                            result.cause,
+                            model=compose_model,
+                            title=result.intent.title,
+                            relaxed=result.relaxed,
+                        ),
+                    }
+                )
+            else:
+                # Unreachable by construction — every search() return that
+                # pairs empty picks with no cause is caught above, and the
+                # no-providers one stream_chat answers without calling search()
+                # at all. Total anyway: a turn that emitted only "done" would
+                # leave the gateway nothing to persist and the user a blank
+                # answer.
+                await queue.put(
+                    {
+                        "type": "message",
+                        "text": _nothing_found_message("nothing_matched", []),
+                    }
+                )
+            await queue.put({"type": "done"})
         except Exception as exc:
             # Not `except BaseException` — a cancelled turn (asyncio.CancelledError)
             # must propagate to the caller's `finally`, not be reported as an error.
+            #
+            # Spans the whole body, not just search(): the outcome branch
+            # awaits a model call of its own, and an exception escaping it would
+            # otherwise end the turn with no event at all — the finally below
+            # still sentinels the queue, so the gateway would see a stream that
+            # stopped rather than an error frame.
             reason = _error_reason(exc)
             if reason == "internal":
                 logger.exception("chat pipeline failed")
             else:
                 logger.info("chat pipeline failed", extra={"reason": reason})
             await queue.put({"type": "error", "reason": reason})
+        finally:
+            # The sentinel is what ends stream_chat's drain loop, so it is owed
+            # on every exit including a BaseException the except above declines.
+            # Unbounded queue: this put cannot block or raise.
             await queue.put(None)
-            return
-
-        # is_capability_question checked first, deliberately: the two fields
-        # are independent (nothing stops the model setting both), and a
-        # capability question is the more specific signal when it happens.
-        if result.intent is not None and result.intent.is_capability_question:
-            await queue.put(
-                {
-                    "type": "message",
-                    "text": _capability_message(req.watch_provider_names),
-                }
-            )
-        elif result.intent is not None and result.intent.clarifying_question:
-            await queue.put(
-                {"type": "message", "text": result.intent.clarifying_question}
-            )
-        elif result.picks:
-            await queue.put(
-                {
-                    "type": "results",
-                    "kind": result.kind,
-                    "relaxed": result.relaxed,
-                    "note": _relaxed_note(
-                        result.relaxed, result.exact_matches, len(result.picks)
-                    ),
-                    "picks": result.picks,
-                }
-            )
-        elif result.kind == "lookup" and result.intent is not None:
-            # A name that resolved to nothing — never the relaxation copy,
-            # which has no constraint to talk about here. Keyed on the path
-            # search() actually took, the same signal the results event
-            # carries, so the two can never disagree about what a lookup is.
-            await queue.put(
-                {
-                    "type": "message",
-                    "text": _title_not_found_message(result.intent.title),
-                }
-            )
-        else:
-            await queue.put(
-                {
-                    "type": "message",
-                    "text": _nothing_found_message(
-                        result.relaxed, result.all_judged, result.all_shown
-                    ),
-                }
-            )
-        await queue.put({"type": "done"})
-        await queue.put(None)
 
     task = asyncio.ensure_future(run())
     try:
