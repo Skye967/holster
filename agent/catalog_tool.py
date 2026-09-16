@@ -283,21 +283,35 @@ RelaxedConstraint = Literal["keywords", "runtime", "year", "genres", "rating"]
 # "just one" request must not fire a rung hunting for five. It cannot win
 # upward: ten is the most a turn shows, which is why
 # DiscoverIntent.limit's own description says so.
-#
-# services/gateway sizes maxSeededMessages off the floor and maxShownRefs off the
-# ceiling (chat.go), so changing either here is a change there too.
 RESULT_FLOOR = 5
 RESULT_CEILING = 10
 
-# How deep to read the query as the user asked it before loosening any of it.
-# Four pages is 80 rows: services/gateway's maxShownRefs (40) plus a full
-# RESULT_CEILING turn, plus room for the verdicts that also exclude. Three was
-# not enough — 40 shown and 16 rated left the floor unmet, and the ladder then
-# dropped a year the user had actually typed. The loop stops the moment the
-# ceiling is met or TMDB runs out, so a fresh query still costs one page.
-# maxShownRefs must stay below what this reaches or an exhausted-looking query
-# isn't one.
-MAX_DISCOVER_PAGES = 4
+# A runaway ceiling on paging, not a policy on how deep to read: the loop stops
+# on its own the moment the ceiling is met or TMDB runs out. Depth has to scale
+# with what is excluded rather than sit at a constant — TMDB's discover has no
+# exclude-by-id parameter, so the shown set is filtered here, and a fixed depth
+# means a long conversation runs a query dry that still has pages.
+#
+# 500 rows is far past a guest's reach (services/gateway/chat.go's
+# defaultGuestTurnCap turns of at most RESULT_CEILING cards). An account's set
+# has no cap at all, so this is a ceiling on the read rather than a claim about
+# the set. What keeps a pathological query from spending the whole ladder
+# budget here is PAGING_BUDGET_SECONDS, not this number.
+MAX_DISCOVER_PAGES = 25
+
+# Pages after the first are fetched this many at a time, so a deep "show me
+# more" costs a few round trips rather than a dozen sequential ones. It buys
+# that with requests and with burst concurrency: up to this many minus one are
+# paid for past the page that met the stop condition, and simultaneous requests
+# per turn make a 429 likelier, whose backoff comes out of
+# PAGING_BUDGET_SECONDS. What it mostly does not cost is prompt — the stop
+# conditions are re-checked as each page is absorbed, so it hands rank() a
+# bigger candidate list only when a full page arrives behind a short one in the
+# same batch.
+#
+# At least 1. A zero-width batch awaits nothing, so the loop would spin without
+# ever yielding to its own deadline.
+DISCOVER_BATCH_PAGES = 3
 
 # Which path search() took. Set where the branch is actually taken, not
 # re-derived downstream from intent.title: the two agree today, but they are
@@ -879,6 +893,19 @@ MAX_TASTE_TITLES = 8
 # on that.
 LADDER_BUDGET_SECONDS = 12.0
 
+# How much of that budget paging may spend before the rungs get their turn.
+# Paging is many batched round trips where each rung is a single discover(),
+# which is what lets depth crowd width out of a shared clock.
+#
+# Half. It only binds on a slow TMDB — paging normally stops early, and
+# search() usually meets the floor on the first rung that fires — so when it
+# does bind, giving width a real chance is worth more than one more page of
+# depth.
+#
+# Derived, not set: at or above LADDER_BUDGET_SECONDS the inner deadline never
+# fires first and the rungs silently stop running.
+PAGING_BUDGET_SECONDS = LADDER_BUDGET_SECONDS / 2
+
 
 def _taste_line(title: Title) -> str:
     """One liked title, compact enough to be worth its tokens: name, year and
@@ -990,9 +1017,9 @@ async def search(
 
     ``on_intent``, if given, is awaited once interpret() resolves and before
     discover()/rank() run — the hook a caller needs to stream an "interpreting"
-    line within ~1-2s, well before the full pipeline (up to nine sequential
-    TMDB calls, plus rank()) finishes. Optional and additive, so every
-    existing caller and test is unaffected.
+    line within ~1-2s, well before the full pipeline (page 1, then batched
+    pages, then the rungs, plus rank()) finishes. Optional and additive, so
+    every existing caller and test is unaffected.
 
     ``verdicts`` is the caller's whole title_verdicts set, and this function
     is where each value's meaning for a recommendation lives —
@@ -1013,9 +1040,11 @@ async def search(
     (``min(RESULT_FLOOR, limit)``), soft constraints are dropped one rung at a
     time — in ``RelaxedConstraint``'s order — and the query retried until the
     floor is met or the ladder is exhausted, bounded by
-    ``LADDER_BUDGET_SECONDS``. ``CatalogResult.relaxed`` records what was
-    dropped. The user's services, region and exclusions are never in the
-    ladder, and neither are cast and crew: a named person is the request
+    ``LADDER_BUDGET_SECONDS`` — of which paging may spend only
+    ``PAGING_BUDGET_SECONDS``, so depth cannot leave the rungs no clock.
+    ``CatalogResult.relaxed`` records what was dropped. The user's services,
+    region and exclusions are never in the ladder, and neither are cast and
+    crew: a named person is the request
     itself, so padding two genuine matches with three unrelated films buys a
     count and loses the answer.
 
@@ -1172,7 +1201,12 @@ async def search(
         return sum(1 for c in candidates if key(c) not in excluded)
 
     # The loop's own clock, because asyncio.timeout_at below reads that one.
-    ladder_deadline = asyncio.get_running_loop().time() + LADDER_BUDGET_SECONDS
+    # Both deadlines are absolute from this one read and page 1 is awaited after
+    # it, so page 1's latency comes out of paging's share first and reaches the
+    # rungs' only once it passes PAGING_BUDGET_SECONDS.
+    now = asyncio.get_running_loop().time()
+    ladder_deadline = now + LADDER_BUDGET_SECONDS
+    paging_deadline = now + PAGING_BUDGET_SECONDS
 
     def thin() -> bool:
         """Below the floor. Every rung tests this, so the comparison lives in
@@ -1193,6 +1227,62 @@ async def search(
             rung_of[c["tmdb_id"]] = rung
             candidates.append(c)
 
+    async def page_the_query() -> None:
+        """Read the query as asked past page 1, toward ``limit``. A failed call
+        does not return: it propagates to the ladder's own handler, which keeps
+        the pages already absorbed."""
+        exhausted = False
+        page = 2
+        try:
+            async with asyncio.timeout_at(paging_deadline):
+                while (
+                    not exhausted and page <= MAX_DISCOVER_PAGES and surviving() < limit
+                ):
+                    batch = range(
+                        page, min(page + DISCOVER_BATCH_PAGES, MAX_DISCOVER_PAGES + 1)
+                    )
+                    tasks = [asyncio.create_task(discover(page=p)) for p in batch]
+                    # Awaited in page order, not as they complete, and absorbed
+                    # one at a time: `candidates` order is TMDB's own ranking,
+                    # which rank() reads and the exact-match top-up walks in
+                    # order, so completion order would leave holes in it.
+                    # Absorbing per page is also what keeps the pages that did
+                    # arrive when the clock runs out mid-batch — a gather,
+                    # tmdb.py's gather_all included, discards results its
+                    # children already returned when the deadline cancels it.
+                    #
+                    # Not a TaskGroup: a child TMDBError would surface as a
+                    # BaseExceptionGroup and stop matching the handler below,
+                    # turning a rescued widening into a failed turn.
+                    try:
+                        for task in tasks:
+                            page_rows = await task
+                            absorb(page_rows, 0)
+                            if len(page_rows) < PAGE_SIZE:
+                                exhausted = True
+                            # Checked per page: a met ceiling means the rest of
+                            # this batch is rows rank() would read through for
+                            # picks already found. They cost a request either
+                            # way — batching buys the round trip, not a bigger
+                            # candidate list.
+                            if surviving() >= limit:
+                                break
+                    finally:
+                        # Cancel and nothing else. cancel() clears the
+                        # never-retrieved flag whether or not the task has
+                        # already failed, so no sibling is left unobserved;
+                        # awaiting here would be a yield the deadline can land
+                        # in, replacing a propagating TMDBError with the
+                        # TimeoutError below and sending a TMDB fault on to the
+                        # rungs.
+                        for task in tasks:
+                            task.cancel()
+                    page += len(tasks)
+        except TimeoutError:
+            logger.warning(
+                "catalog paging budget spent, %d candidates in hand", len(candidates)
+            )
+
     # Paging before relaxing, and toward `limit` rather than `floor` — a thin
     # page usually means exclusion ate it, and the answer to that is the next
     # page of what was asked for, not a wider question.
@@ -1210,13 +1300,12 @@ async def search(
     # degraded TMDB (tmdb.py's retry envelope is longer than the turn).
     try:
         async with asyncio.timeout_at(ladder_deadline):
-            for page in range(2, MAX_DISCOVER_PAGES + 1):
-                # A page short of PAGE_SIZE was TMDB's last one, and a met
-                # floor leaves nothing to page toward.
-                if len(rows) < PAGE_SIZE or surviving() >= limit:
-                    break
-                rows = await discover(page=page)
-                absorb(rows, 0)
+            # A page short of PAGE_SIZE was TMDB's last one, so there is no page
+            # 2 to read. Past the last page TMDB answers 200 with an empty
+            # `results`, so an over-fetched page inside a batch reads as short
+            # rather than failing the batch it is in.
+            if len(rows) == PAGE_SIZE:
+                await page_the_query()
 
             # Adding a rung, in order: guard on the field's own falsy value
             # (`is not None` for an int, truthiness for a list) *and* on the
@@ -1303,6 +1392,10 @@ async def search(
         # Widening only. Page 1 is outside this block, so a query that found
         # nothing at all still fails the turn; what this rescues is the
         # answer already in hand when a *wider* call fails.
+        #
+        # Ends the ladder, where a spent paging clock above falls through to
+        # the rungs: a clock says nothing about whether the next call would
+        # succeed, and a TMDB fault is that same call.
         logger.warning(
             "catalog widening failed (%s), answering with %d candidates",
             exc,

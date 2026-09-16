@@ -1139,17 +1139,20 @@ func TestLoadConversationReturnsEmptyForANewCaller(t *testing.T) {
 	const id = "conv_empty_test"
 	newTestUser(t, pool, ctx, id)
 
-	history, err := load(ctx, id, uuid.NewString())
+	history, shown, err := load(ctx, id, uuid.NewString())
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	if history != nil {
 		t.Errorf("history = %#v, want nil", history)
 	}
+	if shown != nil {
+		t.Errorf("shown = %#v, want nil", shown)
+	}
 }
 
 // TestLoadConversationOrdersAndCapsHistory seeds more than loadConversation's
-// own cap (maxSeededMessages, not maxStoredHistoryMessages — that one
+// own cap (maxHistoryMessages, not maxStoredHistoryMessages — that one
 // bounds GET /api/chat/history/{conversationID} instead, see
 // TestLoadConversationTurns*) and confirms it returns only the most recent
 // ones, oldest-first — windowHistory and the agent both depend on
@@ -1172,7 +1175,7 @@ func TestLoadConversationOrdersAndCapsHistory(t *testing.T) {
 
 	// One more pair than the cap allows, tagged by index so ordering is
 	// verifiable — content isn't otherwise unique.
-	const pairs = maxSeededMessages/2 + 1
+	const pairs = maxHistoryMessages/2 + 1
 	for i := range pairs {
 		if _, err := pool.Exec(ctx, `
 			insert into messages (conversation_id, role, content) values
@@ -1182,12 +1185,12 @@ func TestLoadConversationOrdersAndCapsHistory(t *testing.T) {
 		}
 	}
 
-	history, err := load(ctx, id, convID)
+	history, _, err := load(ctx, id, convID)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if len(history) != maxSeededMessages {
-		t.Fatalf("history length = %d, want %d", len(history), maxSeededMessages)
+	if len(history) != maxHistoryMessages {
+		t.Fatalf("history length = %d, want %d", len(history), maxHistoryMessages)
 	}
 	// The oldest pair (q0/a0) must have been dropped by the cap, and what
 	// remains must still be oldest-first.
@@ -1200,12 +1203,14 @@ func TestLoadConversationOrdersAndCapsHistory(t *testing.T) {
 	}
 }
 
-// TestLoadConversationCarriesStoredTitleRefs proves the already-shown set
-// round-trips through the database, which is what makes a reconnect cost
-// an account nothing: the refs a previous connection persisted come back on
-// the next message's load, keyed on the conversation by the query itself. A
-// user row's null title_refs must read as nil, not an error.
-func TestLoadConversationCarriesStoredTitleRefs(t *testing.T) {
+// TestLoadConversationReadsEveryStoredTitleRef proves the already-shown set
+// round-trips through the database and is not bounded by the history beside
+// it: the refs come from their own query, so a conversation longer than
+// maxHistoryMessages still suppresses everything it ever showed. That is what
+// makes a reconnect cost an account nothing. Rows with a null title_refs — a
+// user row, and an assistant row that showed no cards — contribute nothing
+// rather than erroring.
+func TestLoadConversationReadsEveryStoredTitleRef(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	load := loadConversation(pool)
@@ -1219,33 +1224,36 @@ func TestLoadConversationCarriesStoredTitleRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	refs := []agentTitleRef{{TMDBID: 101, MediaType: "movie"}, {TMDBID: 205, MediaType: "tv"}}
-	refsJSON, err := json.Marshal(refs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `
-		insert into messages (conversation_id, role, content, title_refs) values
-			($1, 'user', 'a heist movie', null), ($1, 'assistant', 'Suggested: Heat', $2)`,
-		convID, refsJSON); err != nil {
-		t.Fatal(err)
+	// More turns than the history cap, so anything derived from the history
+	// window would lose the oldest refs.
+	pairs := maxHistoryMessages
+	var want []agentTitleRef
+	for i := range pairs {
+		ref := agentTitleRef{TMDBID: 100 + i, MediaType: "movie"}
+		refsJSON, err := json.Marshal([]agentTitleRef{ref})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `
+			insert into messages (conversation_id, role, content, title_refs) values
+				($1, 'user', 'a heist movie', null), ($1, 'assistant', 'Suggested', $2)`,
+			convID, refsJSON); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, ref)
 	}
 
-	history, err := load(ctx, id, convID)
+	history, shown, err := load(ctx, id, convID)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if len(history) != 2 {
-		t.Fatalf("history length = %d, want 2", len(history))
+	if len(history) != maxHistoryMessages {
+		t.Fatalf("history length = %d, want the cap %d", len(history), maxHistoryMessages)
 	}
-	if history[0].TitleRefs != nil {
-		t.Errorf("user row TitleRefs = %+v, want nil", history[0].TitleRefs)
-	}
-	if !slices.Equal(history[1].TitleRefs, refs) {
-		t.Errorf("assistant row TitleRefs = %+v, want %+v", history[1].TitleRefs, refs)
-	}
-	if !slices.Equal(shownFromHistory(history), refs) {
-		t.Errorf("shownFromHistory(...) = %+v, want %+v", shownFromHistory(history), refs)
+	// Every ref, oldest-first — including the ones whose messages the history
+	// window dropped.
+	if !slices.Equal(shown, want) {
+		t.Errorf("shown = %+v, want %+v", shown, want)
 	}
 }
 
@@ -1383,9 +1391,12 @@ func TestLoadConversationAndTurnsHideAForeignConversationAtTheAppLevel(t *testin
 		t.Fatal(err)
 	}
 
-	history, err := loadConversation(pool)(ctx, uB, convA)
+	history, shown, err := loadConversation(pool)(ctx, uB, convA)
 	if err != nil {
 		t.Fatalf("loadConversation: %v", err)
+	}
+	if shown != nil {
+		t.Errorf("loadConversation(uB, convA) shown = %#v, want nil (convA belongs to uA)", shown)
 	}
 	if history != nil {
 		t.Errorf("loadConversation(uB, convA) = %#v, want nil (convA belongs to uA)", history)

@@ -433,12 +433,6 @@ type outboundEvent struct {
 type historyTurn struct {
 	Role string `json:"role"`
 	Text string `json:"text"`
-	// The tmdb_id/media_type pairs this turn put on screen, from
-	// messages.title_refs — nil for a user row and for an assistant row that
-	// showed no cards. `json:"-"` deliberately: this rides along on the load
-	// so the already-shown set costs no second query, but the agent's history
-	// window is text only (see ChatRequest.history) and must stay that way.
-	TitleRefs []agentTitleRef `json:"-"`
 }
 
 // turnRecord is how a finished runTurn reports back to the connection's
@@ -474,8 +468,8 @@ type turnRecord struct {
 	// runTurn.
 	//
 	// Guests only. An account's set is read back from messages.title_refs
-	// instead (shownFromHistory), which cannot see this field -- see there for
-	// what that costs.
+	// instead (conversations.go's fetchShownRefs), which cannot see this
+	// field -- see there for what that costs.
 	countsAsShown bool
 }
 
@@ -484,25 +478,21 @@ type turnRecord struct {
 //
 // Five, not two, because the interpret prompt carries a follow-up's parameters
 // forward out of this history ("show me more" repeats the previous request —
-// agent/catalog_tool.py's _INTERPRET_SYSTEM_PROMPT), and maxShownRefs below
-// budgets for four such rounds. At two, the original request fell out of the
-// window on the third exchange and "show me more" became "show me anything".
+// agent/catalog_tool.py's _INTERPRET_SYSTEM_PROMPT). At two, the original
+// request fell out of the window on the third exchange and "show me more"
+// became "show me anything".
 const maxHistoryExchanges = 5
 
-// How much of a conversation loadConversation reads back. Deep enough for both
-// of its consumers, neither of which may be silently starved by the other:
-// windowHistory forwards maxHistoryExchanges*2 messages to the agent, and
-// shownFromHistory needs about maxShownRefs/RESULT_FLOOR assistant rows to
-// refill the shown set, doubled for the user rows interleaved with them.
+// The history window, in messages: what windowHistory forwards to the agent
+// and what loadConversation reads back, named once so the two cannot drift.
+// The load has no reason to read deeper — the already-shown set beside it is
+// its own query (conversations.go's fetchShownRefs), not a flattening of
+// these rows.
 //
-// Sized off the agent's *floor* rather than its ceiling: the floor is the
-// weaker target, so budgeting against it survives a run of thin turns that
-// budgeting against the ceiling would not. A budget rather than a guarantee
-// even so — a lookup turn carries one ref and a message turn none. A flat
-// literal rather than a formula on purpose: deriving it risks re-anchoring
-// on the ceiling instead of the floor, the distinction the line above exists
-// to avoid.
-const maxSeededMessages = 20
+// Which leaves the windowHistory call in the agent request with nothing to
+// trim: an account's history arrives capped by the load, and a guest's was
+// capped by the windowHistory call on the way in.
+const maxHistoryMessages = maxHistoryExchanges * 2
 
 // The backstop for a turn that never comes back. The agent bounds its own
 // widening (catalog_tool.py's LADDER_BUDGET_SECONDS), but not the first
@@ -522,54 +512,16 @@ const (
 	pingTimeout  = 10 * time.Second
 )
 
-// Four rounds of "show me 10 more" before the oldest picks become eligible
-// again, and bounded so a long thread cannot grow the request body without
-// limit. Same discipline as windowHistory below.
-//
-// Held under the 80 rows the agent can page through (MAX_DISCOVER_PAGES *
-// PAGE_SIZE), so the window alone can never consume everything one query
-// reaches — verdicts exclude on top of it, which is why the agent's copy for
-// that case says "everything I found" rather than "everything there is". See
-// TestShownWindowStaysShorterThanTheAgentsPagingReach.
-//
-// Also held under agent/chat.py's MAX_SHOWN, that side's backstop on the same
-// list: past it the agent truncates and silently excludes fewer titles than this
-// window claims to suppress.
-const maxShownRefs = 40
-
-func windowShown(refs []agentTitleRef) []agentTitleRef {
-	refs = dedupeShown(refs)
-	if len(refs) <= maxShownRefs {
-		return refs
-	}
-	return refs[len(refs)-maxShownRefs:]
-}
-
-// shownFromHistory flattens a loaded conversation's stored title_refs,
-// oldest-first, into the already-shown set for an account. Read fresh per
-// message rather than kept on the connection — see the load in
-// runChatConnection for why, and historyTurn.TitleRefs for what the column
-// cannot record.
-func shownFromHistory(history []historyTurn) []agentTitleRef {
-	var refs []agentTitleRef
-	for _, t := range history {
-		refs = append(refs, t.TitleRefs...)
-	}
-	return refs
-}
-
-// dedupeShown keeps one entry per title, at its most recent position, so the
-// cap above counts distinct titles rather than sightings. A title re-offered
-// after sliding out of the window is stored twice, and so is every repeat
-// lookup of the same one; without this the window remembers fewer titles than
-// maxShownRefs budgets for, and "show me more" starts repeating earlier than
-// the four rounds that constant is sized for. windowShown calls this itself,
-// so no caller can cap a list without it.
+// dedupeShown keeps one entry per title, at its most recent position. A title
+// is stored once per turn that showed it, so a repeat lookup of the same one
+// is several rows; the agent turns this list into a set either way, so what
+// this saves is request body rather than correctness.
 func dedupeShown(refs []agentTitleRef) []agentTitleRef {
 	seen := make(map[agentTitleRef]struct{}, len(refs))
 	out := make([]agentTitleRef, 0, len(refs))
 	// Newest first, so the surviving copy is the most recent sighting; the
-	// caller wants oldest-first, hence the reverse.
+	// caller wants oldest-first, hence the reverse. That end matters:
+	// agent/chat.py's MAX_SHOWN backstop cuts from the front.
 	for i := len(refs) - 1; i >= 0; i-- {
 		if _, dup := seen[refs[i]]; dup {
 			continue
@@ -582,11 +534,10 @@ func dedupeShown(refs []agentTitleRef) []agentTitleRef {
 }
 
 func windowHistory(history []historyTurn) []historyTurn {
-	n := maxHistoryExchanges * 2
-	if len(history) <= n {
+	if len(history) <= maxHistoryMessages {
 		return history
 	}
-	return history[len(history)-n:]
+	return history[len(history)-maxHistoryMessages:]
 }
 
 func (h *Handler) chatWS(w http.ResponseWriter, r *http.Request) {
@@ -699,6 +650,11 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 	// Keyed on guestConv below rather than a conversation of its own: the
 	// panel forgets a thread's cards and its text together, so one reset has
 	// to govern both or the two come to disagree about which thread is live.
+	//
+	// Uncapped, unlike guestHistory: re-offering a title is the bug this set
+	// exists to prevent, so nothing in it may age out. What bounds it is
+	// h.guestTurnCap — that many turns of at most ten cards each
+	// (agent/catalog_tool.py's RESULT_CEILING).
 	var shownRefs []agentTitleRef
 	// The one place a finished turn is handled, so the guest branch can't be
 	// missed at any of the three sites below: an account persists via
@@ -723,7 +679,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 		// Narrower than the history beside it: only a rendered recommendation
 		// was actually offered (see runTurn's "results" case).
 		if rec.countsAsShown && len(rec.titleRefs) > 0 {
-			shownRefs = windowShown(append(shownRefs, rec.titleRefs...))
+			shownRefs = dedupeShown(append(shownRefs, rec.titleRefs...))
 		}
 		guestHistory = windowHistory(append(guestHistory,
 			historyTurn{Role: "user", Text: rec.userText},
@@ -919,13 +875,14 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 					cancelCurrent()
 				}
 
+				var storedShown []agentTitleRef
 				if !guest {
 					// Loaded fresh on every message rather than cached: a
 					// read is cheap, and a cache here would need
 					// invalidation rules the database keeps outrunning.
 					// (guestHistory above has no database to diverge from.)
 					loadCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
-					history, err = h.loadConversation(loadCtx, userID, conversationID)
+					history, storedShown, err = h.loadConversation(loadCtx, userID, conversationID)
 					cancel()
 					if err != nil {
 						// Logged, not fatal to the turn: loadConversation's
@@ -934,11 +891,13 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 						// failure degrades to an empty history window
 						// instead of blocking the turn — the next message
 						// on this conversation simply retries the load.
-						// It costs the already-shown set too (that rides
-						// on this load), so the turn may re-offer a title;
-						// a repeat beats refusing to answer.
+						// One transaction carries the already-shown set
+						// too, so this costs that as well and the turn may
+						// re-offer a title; a repeat beats refusing to
+						// answer.
 						slog.ErrorContext(ctx, "conversation load failed", "error", dbError(err))
 						history = nil
+						storedShown = nil
 					}
 				}
 
@@ -957,7 +916,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 						shown = shownRefs
 					}
 				} else {
-					shown = windowShown(shownFromHistory(history))
+					shown = dedupeShown(storedShown)
 				}
 				go h.runTurn(turnCtx, ctx, conn, userID, msg.Turn, conversationID, msg.Text, providers, history, shown, deletionGen, done)
 			case "cancel":
@@ -1604,11 +1563,13 @@ type agentChatRequest struct {
 	// The caller's whole verdict set; agent/catalog_tool.py's search()
 	// decides what each value means.
 	Verdicts []Verdict `json:"verdicts,omitempty"`
-	// What has already been put on screen for this conversation, so
+	// Everything already put on screen for this conversation, so
 	// "show me 10 more" means ten different titles. An account's comes from
 	// messages.title_refs, read back on every message beside the history
-	// (shownFromHistory); a guest's, having no rows, accumulates on the
-	// connection. Windowed to maxShownRefs either way.
+	// (conversations.go's fetchShownRefs); a guest's, having no rows,
+	// accumulates on the connection. Sent whole rather than windowed: the
+	// agent pages deeper the more of it there is, and applies its own ceiling
+	// (agent/chat.py's MAX_SHOWN).
 	Shown []agentTitleRef `json:"shown,omitempty"`
 }
 

@@ -143,9 +143,10 @@ gateway     → web       answer
 The gateway assembles the context and performs the writes. The agent receives what it
 needs and returns text.
 
-Verdicts are the one piece not windowed the way history is: the agent needs every one
-to answer "has this user judged this title", so a cap would quietly expire that
-guarantee for the heaviest users.
+Verdicts and the already-shown set are the two pieces not windowed the way history is:
+the agent needs every verdict to answer "has this user judged this title", and every
+shown title to keep from re-offering one, so a cap on either quietly expires that
+guarantee — for the heaviest users, and for the longest conversations.
 
 ## Where taste comes from
 

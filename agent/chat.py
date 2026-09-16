@@ -6,7 +6,7 @@ onto the queue as they become available (intent as soon as interpret()
 resolves, the final result once discover()/rank() finish); this generator
 drains the queue and yields each event to its caller in order. That is what
 lets an "intent" event reach the caller in ~1-2s while the full pipeline
-(up to nine sequential TMDB calls, plus rank()) is still running.
+(a deep search is several TMDB round trips, plus rank()) is still running.
 
 Event shapes on the wire (one JSON object per line):
 
@@ -82,12 +82,17 @@ logger = logging.getLogger("holster.chat")
 # backstop and silently becomes a second, tighter window.
 MAX_HISTORY_TURNS = 20
 
-# The same backstop for `shown`, and sized the same way: the gateway sends at
-# most maxShownRefs (40), and this has to stay clear of that without reaching
-# catalog_tool's paging depth — at MAX_DISCOVER_PAGES * PAGE_SIZE (80) an
-# oversized set would exclude every row a query can read and report
-# "everything I found" for all of them.
-MAX_SHOWN = 60
+# The same shape as the backstop above, but not the same job: nothing upstream
+# bounds `shown` any more — the gateway sends a conversation's whole
+# already-shown set — and this runs long after the body was parsed, so it
+# guards no prompt and no request size. What earns its keep is the warning at
+# the slice below: the gateway believing it suppresses titles the search will
+# not exclude has no other symptom.
+#
+# That slice keeps the newest refs, so firing this drops the oldest — the
+# titles "never re-offer one" is most about. Sized so a real conversation does
+# not reach it.
+MAX_SHOWN = 2000
 
 NO_PROVIDERS_MESSAGE = (
     "You haven't picked any streaming services yet. Head to Connections to "
@@ -134,10 +139,10 @@ class ChatRequest(BaseModel):
     # message. Passed straight through; catalog_tool.search()
     # decides what each value means.
     verdicts: list[TitleVerdict] = Field(default_factory=list)
-    # What the gateway has already shown on this connection, so "show me 10
-    # more" means ten different titles. Bounded and windowed
-    # by the gateway, the same division of labour as `history` above; this
-    # agent holds nothing between turns.
+    # Everything the gateway has already shown in this conversation, so "show
+    # me 10 more" means ten different titles. Unwindowed, unlike `history`
+    # above: a title re-offered is a visible bug where an old turn falling out
+    # of the prompt is not. This agent holds nothing between turns.
     shown: list[TitleRef] = Field(default_factory=list)
 
 
@@ -211,9 +216,12 @@ def _nothing_found_message(
             "asking for something different."
         )
     if all_shown:
-        # "everything I found", not "everything there is": the search reads a
-        # bounded number of pages, so a fully-excluded result set means this
-        # search has nothing new, not that the catalog is out of rows.
+        # "everything I found", not "everything there is": the read can stop at
+        # the page ceiling, the clock, or a failed call, and every query is
+        # filtered by a vote floor the user never stated (tmdb.py's
+        # MIN_VOTE_COUNT), which only the rating sort's rung bends and only
+        # back to that same floor. What this search got to is the most it can
+        # claim.
         return (
             "I've already shown you everything I found for that. Try "
             "something different and I'll keep looking."
@@ -311,6 +319,16 @@ async def stream_chat(
         return
 
     message = _with_history(req.message, req.history[-MAX_HISTORY_TURNS:])
+    # Logged where the history backstop above is not: that one sits at twice a
+    # window the gateway enforces, so only a gateway bug reaches it, while this
+    # one has no window behind it at all — see MAX_SHOWN.
+    shown = req.shown[-MAX_SHOWN:]
+    if len(req.shown) > MAX_SHOWN:
+        logger.warning(
+            "shown set truncated to %d, dropping the %d oldest",
+            MAX_SHOWN,
+            len(req.shown) - MAX_SHOWN,
+        )
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
     async def on_intent(intent: DiscoverIntent) -> None:
@@ -341,7 +359,7 @@ async def stream_chat(
                 rank_model=rank_model,
                 on_intent=on_intent,
                 verdicts=req.verdicts,
-                shown=req.shown[-MAX_SHOWN:],
+                shown=shown,
             )
         except Exception as exc:
             # Not `except BaseException` — a cancelled turn (asyncio.CancelledError)

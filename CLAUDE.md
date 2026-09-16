@@ -62,7 +62,7 @@ against that thing as you write it. Two shapes account for nearly every false co
   a heading can be present and still not carry your point. Schema objects are
   cumulative, so read the latest migration that touches one, not the one that created it.
 
-**Name the coupling; don't describe the guard.** *"Mirrors `chat.go`'s `maxShownRefs`"*
+**Name the coupling; don't describe the guard.** *"Mirrors `chat.go`'s `maxHistoryExchanges`"*
 is a fact a reader can check. *"TestX catches an edit here"* is a claim about program
 behaviour that drifts the moment either side moves, and the test's own name already
 carries it. If you do name a guard, you have run it and watched it fail.

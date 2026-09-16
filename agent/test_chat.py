@@ -15,6 +15,7 @@ import httpx2
 import pytest
 from pydantic import ValidationError
 
+import chat
 import tmdb
 from catalog_tool import (
     DiscoverIntent,
@@ -27,7 +28,6 @@ from catalog_tool import (
 from chat import (
     _RELAXED_LABELS,
     MAX_HISTORY_TURNS,
-    MAX_SHOWN,
     ChatRequest,
     HistoryTurn,
     _nothing_found_message,
@@ -39,7 +39,6 @@ from testutil import (
     ALL_JUDGED,
     CAPABILITY_QUESTION,
     GATEWAY_MAX_HISTORY_EXCHANGES,
-    GATEWAY_MAX_SHOWN_REFS,
     MOVIE_A,
     NEEDS_CLARIFICATION,
     NO_CANDIDATES,
@@ -601,12 +600,16 @@ def test_all_shown_message_is_not_the_all_judged_one() -> None:
 
 
 def test_all_shown_message_does_not_claim_the_catalog_is_exhausted() -> None:
-    """search() reads MAX_DISCOVER_PAGES pages, and verdicts exclude on top of
-    the shown window, so a fully-excluded result set means this search found
-    nothing new — not that TMDB is out of rows. Claiming the latter is the
-    same class of false statement all_judged/all_shown were split to avoid."""
+    """No search earns "everything there is": the read can stop at the page
+    ceiling, the clock or a failed call, and every query carries a vote floor
+    the user never stated (tmdb.py's MIN_VOTE_COUNT). Claiming the catalog is
+    out is the same class of false statement all_judged and all_shown were
+    split apart to avoid."""
     shown = _nothing_found_message([], all_judged=False, all_shown=True)
     assert "everything I found" in shown
+    # Both readings of the catalog claim, not just the one this branch tried:
+    # "could find" reads as the catalog being out just as "there is" does.
+    assert "everything there is" not in shown
     assert "everything I could find" not in shown
 
 
@@ -718,6 +721,36 @@ def test_shown_reaches_search_and_keeps_a_title_off_the_screen() -> None:
     assert [e["type"] for e in events] == ["intent", "message", "done"]
 
 
+def test_an_oversized_shown_set_is_cut_to_the_newest_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing upstream bounds `shown` any more, so if this ever fires the
+    gateway is suppressing titles the search will not exclude. The oldest go,
+    which is the wrong end — hence the warning: it is the only symptom."""
+    monkeypatch.setattr(chat, "MAX_SHOWN", 2)
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # MOVIE_A is id 101
+    req = ChatRequest(
+        message="a heist movie",
+        watch_region="US",
+        watch_providers=[8],
+        # 101 is the oldest, so the cut makes it eligible again.
+        shown=[TitleRef(tmdb_id=i, media_type="movie") for i in (101, 900, 901)],
+    )
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        return RankResult(
+            picks=[RankedPick(tmdb_id=c["tmdb_id"], blurb="ok") for c in candidates]
+        )
+
+    with caplog.at_level("WARNING"):
+        events = asyncio.run(_collect(req, fake_tmdb.client(), ok_interpret, fake_rank))
+
+    assert [e["type"] for e in events] == ["intent", "results", "done"]
+    assert [p["tmdb_id"] for p in events[1]["picks"]] == [101]
+    assert "shown set truncated" in caplog.text
+
+
 def test_the_history_backstop_stays_clear_of_the_gateways_window() -> None:
     """Pins MAX_HISTORY_TURNS against the gateway's maxHistoryExchanges.
 
@@ -729,18 +762,4 @@ def test_the_history_backstop_stays_clear_of_the_gateways_window() -> None:
         f"MAX_HISTORY_TURNS {MAX_HISTORY_TURNS} is under the gateway's "
         f"{gateway_window}-message window; history would be cut here with no "
         f"error anywhere"
-    )
-
-
-def test_the_shown_backstop_stays_clear_of_the_gateways_window() -> None:
-    """Pins MAX_SHOWN against the gateway's maxShownRefs. If maxShownRefs ever
-    passes MAX_SHOWN, `shown` is truncated here and the gateway believes it is
-    suppressing more titles than the agent actually excludes — "show me more"
-    re-offers titles the user already saw, with no error anywhere.
-
-    Both sides hold hand-copied numbers, so this compares the copy in
-    testutil.py, not the gateway's live value."""
-    assert GATEWAY_MAX_SHOWN_REFS <= MAX_SHOWN, (
-        f"MAX_SHOWN {MAX_SHOWN} is under the gateway's {GATEWAY_MAX_SHOWN_REFS} "
-        f"refs; the oldest would be dropped silently"
     )

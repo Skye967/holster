@@ -23,20 +23,18 @@ const maxStoredHistoryMessages = 50
 // conversationTurn is the wire shape of GET /api/chat/history — one entry per
 // completed exchange. title_refs is deliberately not surfaced *to the browser*
 // here: nothing yet re-renders title cards from a reload, only the text (see
-// ARCHITECTURE.md's data model and its "One socket per session").
-// fetchRecentMessages does read the column — that is where an account's
-// already-shown set comes from (chat.go's shownFromHistory) — and this shape
-// simply drops it.
+// ARCHITECTURE.md's data model and its "One socket per session"). The column
+// is read by fetchShownRefs alone, for the agent rather than the browser.
 type conversationTurn struct {
 	UserText      string `json:"user_text"`
 	AssistantText string `json:"assistant_text"`
 }
 
 // fetchRecentMessages returns up to limit of one conversation's most recent
-// messages, oldest-first. Shared by loadConversation (which reads deeper than
-// windowHistory needs, because the shown set rides along — see there) and
+// messages, oldest-first. Shared by loadConversation (the WS-seed path) and
 // loadConversationTurns (the reload-render path) — same query and scan,
-// different caps.
+// different caps. Text only: the already-shown set is fetchShownRefs' job,
+// and it wants the whole conversation rather than a window of it.
 //
 // Joined through conversations on user_id explicitly, not left to
 // RLS's message_isolation policy alone: messages carries no user_id of its
@@ -48,7 +46,7 @@ func fetchRecentMessages(ctx context.Context, tx pgx.Tx, userID, conversationID 
 	// statement, so both get the exact same now() value, and two rows with a
 	// tied timestamp have no guaranteed order — the identity column does.
 	rows, err := tx.Query(ctx, `
-		select m.role, m.content, m.title_refs
+		select m.role, m.content
 		from messages m
 		join conversations c on c.id = m.conversation_id
 		where m.conversation_id = $1 and c.user_id = $2
@@ -62,20 +60,8 @@ func fetchRecentMessages(ctx context.Context, tx pgx.Tx, userID, conversationID 
 	var history []historyTurn
 	for rows.Next() {
 		var t historyTurn
-		// jsonb null for a user row and for an assistant row that showed no
-		// cards (see saveMessages), so nil is the ordinary case, not an error.
-		var refsJSON []byte
-		if err := rows.Scan(&t.Role, &t.Text, &refsJSON); err != nil {
+		if err := rows.Scan(&t.Role, &t.Text); err != nil {
 			return nil, err
-		}
-		if len(refsJSON) > 0 {
-			if err := json.Unmarshal(refsJSON, &t.TitleRefs); err != nil {
-				// Logged, not fatal: the text of this turn is still good
-				// history, and losing one turn's refs costs a repeated title,
-				// where failing the load costs the whole conversation.
-				slog.WarnContext(ctx, "message title_refs decode failed",
-					"conversation", conversationID, "error", err.Error())
-			}
 		}
 		history = append(history, t)
 	}
@@ -84,6 +70,63 @@ func fetchRecentMessages(ctx context.Context, tx pgx.Tx, userID, conversationID 
 	}
 	slices.Reverse(history)
 	return history, nil
+}
+
+// fetchShownRefs returns every title id this conversation has put on screen,
+// oldest-first — the whole of it, not a window, because a title re-offered is
+// a visible bug and a window ages titles back into eligibility. Nothing caps
+// this scan or the body it feeds but the conversation's own length;
+// agent/chat.py's MAX_SHOWN trims only what reaches the search, after the
+// whole set has crossed the wire.
+//
+// Rows with a null title_refs are filtered in SQL rather than skipped in Go:
+// a user row and an assistant row that showed no cards are most of a
+// conversation, and neither carries anything to decode.
+//
+// Joined through conversations on user_id for the same reason
+// fetchRecentMessages is — messages carries no user_id of its own.
+//
+// What the column cannot record: whether a turn was a recommendation or a
+// title lookup. A guest's set keeps that distinction on the connection
+// (chat.go's turnRecord.countsAsShown) and a lookup there feeds nothing, so
+// for an account, asking "is Heat on Netflix" bars Heat from every later
+// recommendation in that conversation, however long it runs. Accepted because
+// it is still one title against many and the fix is a column on messages, not
+// a heuristic on the stored text.
+func fetchShownRefs(ctx context.Context, tx pgx.Tx, userID, conversationID string) ([]agentTitleRef, error) {
+	rows, err := tx.Query(ctx, `
+		select m.title_refs
+		from messages m
+		join conversations c on c.id = m.conversation_id
+		where m.conversation_id = $1 and c.user_id = $2
+			and m.title_refs is not null
+		order by m.seq`,
+		conversationID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []agentTitleRef
+	for rows.Next() {
+		var refsJSON []byte
+		if err := rows.Scan(&refsJSON); err != nil {
+			return nil, err
+		}
+		var turnRefs []agentTitleRef
+		if err := json.Unmarshal(refsJSON, &turnRefs); err != nil {
+			// Logged, not fatal: losing one turn's refs costs a repeated
+			// title, where failing the load costs the window and every other
+			// turn's refs with it.
+			slog.WarnContext(ctx, "message title_refs decode failed",
+				"conversation", conversationID, "error", err.Error())
+			continue
+		}
+		refs = append(refs, turnRefs...)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return refs, nil
 }
 
 // pairTurns groups a flat, chronological role/text list into completed
@@ -167,25 +210,43 @@ func trimToGraphemeBoundary(runes []rune) []rune {
 	return runes
 }
 
-// loadConversation returns enough of conversationID's history to seed a
-// fresh WS connection's in-memory context, or nil for a
-// conversation with nothing saved yet — a brand-new "new chat" id and a
-// foreign id both resolve the same way, via fetchRecentMessages' explicit
-// join and RLS both independently filtering down to zero rows. Capped at
-// maxSeededMessages rather than
-// maxStoredHistoryMessages: this load has two consumers with different
-// appetites — windowHistory trims the text it forwards to the agent, and
-// shownFromHistory wants every stored title_ref it can get — so the cap is
-// the deeper of the two and each consumer windows its own half.
-func loadConversation(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID string) ([]historyTurn, error) {
-	return func(ctx context.Context, userID, conversationID string) ([]historyTurn, error) {
+// loadConversation returns what a fresh WS connection needs of
+// conversationID: the recent history to seed its context, and every title it
+// has already put on screen. Both are nil for a conversation with nothing
+// saved yet — a brand-new "new chat" id and a foreign id resolve the same
+// way, via each query's explicit join and RLS independently filtering down to
+// zero rows.
+//
+// Two reads with different appetites, in one transaction: the history is
+// capped at maxHistoryMessages (rather than maxStoredHistoryMessages — the
+// agent is sent a window, not a transcript), and the shown set is the whole
+// conversation.
+//
+// History first, for which way the read-committed gap falls: each statement
+// takes its own snapshot, so a turn committed between the two lands in the
+// refs, where it is suppressed, rather than in the window alone, where its
+// cards would be offered again.
+//
+// Either read failing loses both — withUser rolls the transaction back and
+// returns the error — so the caller answers with no history and may repeat a
+// title, the same trade the single query made before.
+func loadConversation(db *pgxpool.Pool) func(ctx context.Context, userID, conversationID string) ([]historyTurn, []agentTitleRef, error) {
+	return func(ctx context.Context, userID, conversationID string) ([]historyTurn, []agentTitleRef, error) {
 		var history []historyTurn
+		var shown []agentTitleRef
 		err := withUser(ctx, db, userID, func(tx pgx.Tx) error {
 			var err error
-			history, err = fetchRecentMessages(ctx, tx, userID, conversationID, maxSeededMessages)
+			history, err = fetchRecentMessages(ctx, tx, userID, conversationID, maxHistoryMessages)
+			if err != nil {
+				return err
+			}
+			shown, err = fetchShownRefs(ctx, tx, userID, conversationID)
 			return err
 		})
-		return history, err
+		if err != nil {
+			return nil, nil, err
+		}
+		return history, shown, nil
 	}
 }
 
