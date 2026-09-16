@@ -2,9 +2,8 @@
 
 Supabase (PostgreSQL). Schema reference for the tables below.
 
-Migrations live in `supabase/migrations/` at the repo root, not here — that is the
-only path the Supabase CLI discovers. Filenames are timestamp-prefixed and applied
-in that order.
+Migrations live in `supabase/migrations/` at the repo root, not here — that is where
+the Supabase CLI looks. Filenames are timestamp-prefixed and applied in that order.
 
 **Local stack:** the compose Postgres applies these automatically from the same
 directory, but only on first start with an empty data directory. To re-apply after
@@ -19,15 +18,33 @@ introduced is missing — the `db-init` service then fails on the absent roles a
 the gateway will not start. That is the intended loud failure for a stale schema;
 `down -v` is the fix.
 
-**Supabase (hosted):** it has no auto-apply, so push explicitly:
+**Supabase (hosted):** it has no auto-apply, so push explicitly. Run these from the
+repo root — the CLI resolves `supabase/` and `.env` against the working directory.
+From `db/`, `link` quietly creates a second `supabase/` tree there and the first push
+then reports success having applied nothing.
+
+One-time:
 
 ```
-supabase db push --db-url "$DATABASE_URL"
+supabase login
+supabase link --project-ref <project-ref>
 ```
 
-Do not run `supabase db push` against the local compose Postgres — the entrypoint
-already applied the files without recording them in `supabase_migrations`, so the
-push re-runs them and fails on the first `create table`.
+`<project-ref>` is the ref in the project's dashboard URL,
+`supabase.com/dashboard/project/<project-ref>`.
+
+Then set `SUPABASE_DB_PASSWORD` in `.env` — the `postgres` role's password, chosen
+when the project was created, not `gateway_app`'s or `agent_ro`'s below.
+
+```
+supabase db push
+```
+
+Never aim `--db-url` at the local compose Postgres: the entrypoint already applied
+these files without recording them in `supabase_migrations`, so the CLI treats every
+migration as pending. And never push as `gateway_app` — which is what
+`--db-url "$DATABASE_URL"` does. That role is created by the push itself, and never
+gets rights on `supabase_migrations`.
 
 An applied migration is never edited, comments included: the committed file is the
 record of what ran. A stale comment in one is corrected where it is read from, not by
@@ -43,8 +60,8 @@ password.
 - **Local:** compose's `db-init` service applies `db/local-roles.sql` once
   Postgres is healthy, granting both roles a login with the throwaway compose
   password. The gateway waits for it.
-- **Supabase:** grant the login and set a password once, in the SQL editor or
-  dashboard:
+- **Supabase:** after the push above, grant the login and set a password once, in
+  the SQL editor or dashboard:
   ```
   alter role gateway_app with login password '…';
   alter role agent_ro   with login password '…';
