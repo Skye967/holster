@@ -66,6 +66,10 @@ COPY --from=builder /app/public ./public
 # quiet way.
 RUN mkdir -p .next/cache && chown 65534:65534 .next/cache
 
+# standalone's server.js hardcodes a localhost bind unless HOSTNAME overrides
+# it, which is unreachable from outside the container.
+ENV HOSTNAME=0.0.0.0
+
 # nobody: the process listens on 3000 and writes nothing outside that cache.
 USER 65534:65534
 EXPOSE 3000
