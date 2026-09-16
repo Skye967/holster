@@ -142,8 +142,8 @@ func noopCallAgentTitles(context.Context, agentTitlesRequest) ([]agentPick, erro
 // conversations.go's own dependencies, for the same reason — chat_test.go
 // covers loadConversation/saveMessages for real, conversations_test.go
 // covers loadConversationTurns/loadConversationSummaries/deleteConversation.
-func noopLoadConversation(context.Context, string, string) ([]historyTurn, error) {
-	return nil, nil
+func noopLoadConversation(context.Context, string, string) ([]historyTurn, []agentTitleRef, error) {
+	return nil, nil, nil
 }
 func noopLoadConversationTurns(context.Context, string, string) ([]conversationTurn, bool, error) {
 	return nil, true, nil

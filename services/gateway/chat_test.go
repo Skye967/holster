@@ -82,15 +82,6 @@ func TestTicketExpires(t *testing.T) {
 
 // --- history windowing ---------------------------------------------------
 
-// sameTurns compares the role/text window, which is all the agent is sent —
-// historyTurn also carries TitleRefs (a slice, so the struct isn't
-// comparable), and that half is asserted by the shown-set tests instead.
-func sameTurns(a, b []historyTurn) bool {
-	return slices.EqualFunc(a, b, func(x, y historyTurn) bool {
-		return x.Role == y.Role && x.Text == y.Text
-	})
-}
-
 func TestWindowHistoryKeepsOnlyTheLastFewExchanges(t *testing.T) {
 	var history []historyTurn
 	for i := range maxHistoryExchanges + 3 {
@@ -103,7 +94,7 @@ func TestWindowHistoryKeepsOnlyTheLastFewExchanges(t *testing.T) {
 	if len(got) != maxHistoryExchanges*2 {
 		t.Fatalf("len(windowHistory(...)) = %d, want %d", len(got), maxHistoryExchanges*2)
 	}
-	if !sameTurns(got[:1], history[len(history)-maxHistoryExchanges*2:][:1]) {
+	if !slices.Equal(got[:1], history[len(history)-maxHistoryExchanges*2:][:1]) {
 		t.Error("windowHistory did not keep the most recent exchanges")
 	}
 }
@@ -474,7 +465,7 @@ func newChatTestServerWithConversations(
 	loadCtx func(context.Context, string) (chatContext, error),
 	callAgent agentCaller,
 	loadVerdicts func(context.Context, string) ([]Verdict, error),
-	loadConversation func(context.Context, string, string) ([]historyTurn, error),
+	loadConversation func(context.Context, string, string) ([]historyTurn, []agentTitleRef, error),
 	saveMessages func(context.Context, string, string, string, string, []agentTitleRef) (bool, error),
 	opts ...func(*Handler),
 ) (*httptest.Server, string) {
@@ -1056,14 +1047,14 @@ func TestChatTurnWithNoSubscriptionsSkipsVerdicts(t *testing.T) {
 // carries prior turns into the very first agent call, not just into what the
 // browser re-renders.
 func TestChatConnectionHydratesHistoryFromStoredConversation(t *testing.T) {
-	loadConversation := func(_ context.Context, _ string, conversationID string) ([]historyTurn, error) {
+	loadConversation := func(_ context.Context, _ string, conversationID string) ([]historyTurn, []agentTitleRef, error) {
 		if conversationID != testConversationID {
 			t.Errorf("loadConversation called with %q, want %q", conversationID, testConversationID)
 		}
 		return []historyTurn{
 			{Role: "user", Text: "a heist movie"},
 			{Role: "assistant", Text: "Suggested: Heat"},
-		}, nil
+		}, nil, nil
 	}
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US"}, nil
@@ -1087,7 +1078,7 @@ func TestChatConnectionHydratesHistoryFromStoredConversation(t *testing.T) {
 	}
 
 	want := []historyTurn{{Role: "user", Text: "a heist movie"}, {Role: "assistant", Text: "Suggested: Heat"}}
-	if !sameTurns(got.History, want) {
+	if !slices.Equal(got.History, want) {
 		t.Errorf("History sent to the agent = %+v, want the stored conversation %+v", got.History, want)
 	}
 }
@@ -1345,11 +1336,11 @@ func TestChatSwitchingConversationsDoesNotBleedHistoryOrPersistence(t *testing.T
 	const convY = "33333333-3333-3333-3333-333333333333"
 	ySeed := []historyTurn{{Role: "user", Text: "seed"}, {Role: "assistant", Text: "seed-reply"}}
 
-	loadConversation := func(_ context.Context, _ string, conversationID string) ([]historyTurn, error) {
+	loadConversation := func(_ context.Context, _ string, conversationID string) ([]historyTurn, []agentTitleRef, error) {
 		if conversationID == convY {
-			return append([]historyTurn(nil), ySeed...), nil
+			return append([]historyTurn(nil), ySeed...), nil, nil
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US"}, nil
@@ -1403,7 +1394,7 @@ func TestChatSwitchingConversationsDoesNotBleedHistoryOrPersistence(t *testing.T
 
 	select {
 	case req := <-gotYReq:
-		if !sameTurns(req.History, ySeed) {
+		if !slices.Equal(req.History, ySeed) {
 			t.Errorf("B's History = %+v, want conv Y's own seed %+v (not A's exchange)", req.History, ySeed)
 		}
 	case <-time.After(2 * time.Second):
@@ -1440,9 +1431,9 @@ func TestChatSwitchingConversationsDoesNotBleedHistoryOrPersistence(t *testing.T
 func TestChatMessageRejectsAMalformedConversationID(t *testing.T) {
 	for _, conv := range []string{"", "not-a-uuid", "11111111-1111-1111-1111-11111111111"} {
 		t.Run(conv, func(t *testing.T) {
-			loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
+			loadConversation := func(context.Context, string, string) ([]historyTurn, []agentTitleRef, error) {
 				t.Error("loadConversation must not be called for a malformed conversation id")
-				return nil, nil
+				return nil, nil, nil
 			}
 			callAgent := func(context.Context, agentChatRequest) (<-chan agentEvent, error) {
 				t.Error("the agent must not be called for a malformed conversation id")
@@ -1903,8 +1894,8 @@ func TestDeleteConversationTombstoneAppliesRegardlessOfIDCase(t *testing.T) {
 // as a normal nil result), not a hard requirement like verdicts, so a
 // transient read error here must not stop the user from getting an answer.
 func TestChatTurnDegradesToEmptyHistoryWhenConversationLoadFails(t *testing.T) {
-	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
-		return nil, errors.New("transient db error")
+	loadConversation := func(context.Context, string, string) ([]historyTurn, []agentTitleRef, error) {
+		return nil, nil, errors.New("transient db error")
 	}
 	var got agentChatRequest
 	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
@@ -1999,10 +1990,10 @@ func TestChatNewMessageToASinceDeletedConversationIsNotDropped(t *testing.T) {
 func TestChatDeleteDuringInFlightLoadStillSuppressesTheStragglingTurn(t *testing.T) {
 	loadStarted := make(chan struct{})
 	deleteDone := make(chan struct{})
-	loadConversation := func(context.Context, string, string) ([]historyTurn, error) {
+	loadConversation := func(context.Context, string, string) ([]historyTurn, []agentTitleRef, error) {
 		close(loadStarted)
 		<-deleteDone
-		return nil, nil
+		return nil, nil, nil
 	}
 	callAgent := func(ctx context.Context, req agentChatRequest) (<-chan agentEvent, error) {
 		ch := make(chan agentEvent, 2)
@@ -2273,9 +2264,9 @@ func newGuestTestServer(t *testing.T, callAgent agentCaller, loadGuestChatCtx fu
 		func(context.Context, string) ([]Verdict, error) { forbid("loadVerdicts"); return nil, nil },
 		noopSaveVerdict,
 		noopLoadWatchlistItems, noopCallAgentTitles,
-		func(context.Context, string, string) ([]historyTurn, error) {
+		func(context.Context, string, string) ([]historyTurn, []agentTitleRef, error) {
 			forbid("loadConversation")
-			return nil, nil
+			return nil, nil, nil
 		},
 		noopLoadConversationTurns,
 		func(context.Context, string, string, string, string, []agentTitleRef) (bool, error) {
@@ -2511,7 +2502,7 @@ func TestGuestHistoryIsPerConnection(t *testing.T) {
 		t.Errorf("first turn history = %+v, want empty", got[0].History)
 	}
 	want := []historyTurn{{Role: "user", Text: "one"}, {Role: "assistant", Text: "a reply"}}
-	if !sameTurns(got[1].History, want) {
+	if !slices.Equal(got[1].History, want) {
 		t.Errorf("second turn history = %+v, want %+v", got[1].History, want)
 	}
 	if len(got[2].History) != 0 {
@@ -2779,7 +2770,8 @@ func TestShownTitlesAreSentBackToTheAgentOnTheNextTurn(t *testing.T) {
 //
 // Guests, which is where countsAsShown is read. An account's set comes from
 // messages.title_refs, which does not record that distinction — see
-// shownFromHistory for why that is accepted rather than worked around.
+// conversations.go's fetchShownRefs for why that is accepted rather than
+// worked around.
 func TestALookupTurnDoesNotFeedTheShownSet(t *testing.T) {
 	lookup := picksEvent(603)
 	lookup.Kind = "lookup"
@@ -2867,49 +2859,29 @@ func TestAGuestsShownSetAndHistoryForgetTheSameThread(t *testing.T) {
 	}
 }
 
-// maxShownRefs is sized in titles, so the window has to hold distinct ones.
-func TestTheShownWindowCountsTitlesNotSightings(t *testing.T) {
-	var history []historyTurn
+// One entry per title, however many turns showed it — a repeat lookup of the
+// same title is a row per turn, and the newest sighting is the one to keep
+// because agent/chat.py's MAX_SHOWN backstop cuts from the front.
+func TestDedupeShownCountsTitlesNotSightings(t *testing.T) {
+	var refs []agentTitleRef
 	// The same title looked up over and over, then genuinely new ones.
 	for range 20 {
-		history = append(history, historyTurn{Role: "assistant", TitleRefs: []agentTitleRef{
-			{TMDBID: 1, MediaType: "movie"},
-		}})
+		refs = append(refs, agentTitleRef{TMDBID: 1, MediaType: "movie"})
 	}
 	for i := range 10 {
-		history = append(history, historyTurn{Role: "assistant", TitleRefs: []agentTitleRef{
-			{TMDBID: 100 + i, MediaType: "movie"},
-		}})
+		refs = append(refs, agentTitleRef{TMDBID: 100 + i, MediaType: "movie"})
 	}
 
-	refs := windowShown(shownFromHistory(history))
-	distinct := make(map[agentTitleRef]struct{}, len(refs))
-	for _, r := range refs {
-		distinct[r] = struct{}{}
+	got := dedupeShown(refs)
+	if len(got) != 11 {
+		t.Errorf("dedupeShown(...) kept %d entries, want 11", len(got))
 	}
-	if len(distinct) != len(refs) {
-		t.Errorf("window holds %d entries but only %d titles", len(refs), len(distinct))
+	if want := (agentTitleRef{TMDBID: 109, MediaType: "movie"}); got[len(got)-1] != want {
+		t.Errorf("newest ref = %+v, want %+v", got[len(got)-1], want)
 	}
-	// And the copy that survives is the most recent one, so a title shown a
-	// moment ago is not the one the window forgets first.
-	if want := (agentTitleRef{TMDBID: 109, MediaType: "movie"}); refs[len(refs)-1] != want {
-		t.Errorf("newest ref = %+v, want %+v", refs[len(refs)-1], want)
-	}
-}
-
-// The window has to stay shorter than how far the agent can page into a query,
-// or a "show me more" run past it reports all_shown — "that's everything I
-// could find" — about a query that simply had more pages. Guarding the two
-// constants against each other because they live in different services and
-// nothing else ties them together.
-func TestShownWindowStaysShorterThanTheAgentsPagingReach(t *testing.T) {
-	// agent/catalog_tool.py's MAX_DISCOVER_PAGES times tmdb.py's PAGE_SIZE.
-	const agentPagingReach = 4 * 20
-	// agent/catalog_tool.py's RESULT_CEILING: what paging works toward.
-	const agentResultCeiling = 10
-	if spare := agentPagingReach - maxShownRefs; spare < agentResultCeiling {
-		t.Fatalf("maxShownRefs = %d leaves only %d of %d rows unshown; want at least %d",
-			maxShownRefs, spare, agentPagingReach, agentResultCeiling)
+	// The repeated title survives at its most recent position, not its first.
+	if want := (agentTitleRef{TMDBID: 1, MediaType: "movie"}); got[0] != want {
+		t.Errorf("oldest ref = %+v, want %+v", got[0], want)
 	}
 }
 
@@ -2922,54 +2894,34 @@ func TestShownWindowStaysShorterThanTheAgentsPagingReach(t *testing.T) {
 func TestTheAgentDoesNotSilentlyRetruncateOurHistoryWindow(t *testing.T) {
 	// agent/chat.py's MAX_HISTORY_TURNS, counted in messages like this one.
 	const agentMaxHistoryTurns = 20
-	if maxHistoryExchanges*2 > agentMaxHistoryTurns {
+	if maxHistoryMessages > agentMaxHistoryTurns {
 		t.Errorf("windowHistory sends %d messages; the agent keeps only %d",
-			maxHistoryExchanges*2, agentMaxHistoryTurns)
+			maxHistoryMessages, agentMaxHistoryTurns)
 	}
 }
 
-// The load has two consumers with different appetites, and starving either is
-// silent: too shallow for windowHistory and the agent loses conversation, too
-// shallow for shownFromHistory and "show me more" starts repeating.
-func TestSeededMessagesCoversBothItsConsumers(t *testing.T) {
-	if maxSeededMessages < maxHistoryExchanges*2 {
-		t.Errorf("maxSeededMessages = %d, too shallow for windowHistory's %d",
-			maxSeededMessages, maxHistoryExchanges*2)
-	}
-	if maxSeededMessages > maxStoredHistoryMessages {
-		t.Errorf("maxSeededMessages = %d exceeds what is stored (%d)",
-			maxSeededMessages, maxStoredHistoryMessages)
-	}
-	// The other consumer. A budget, not a guarantee — a lookup row carries one
-	// ref and a message row none, so a chatty thread refills less than this.
-	// It still has to hold at the recommendation-only end, or "show me more"
-	// repeats a title the guest path would still be suppressing.
-	const agentResultFloor = 5
-	if refs := (maxSeededMessages / 2) * agentResultFloor; refs < maxShownRefs {
-		t.Errorf("maxSeededMessages = %d budgets only %d refs at the agent's floor of %d, short of maxShownRefs %d",
-			maxSeededMessages, refs, agentResultFloor, maxShownRefs)
+// A guest's shown set is bounded by the turn cap, and the agent has to be able
+// to page past it or a "show me more" late in a session finds nothing for a
+// query that still has rows. Guarding the numbers against each other because
+// they live in different services and nothing else ties them together.
+func TestAGuestsShownSetStaysInsideTheAgentsPagingReach(t *testing.T) {
+	// agent/catalog_tool.py's MAX_DISCOVER_PAGES times tmdb.py's PAGE_SIZE.
+	const agentPagingReach = 25 * 20
+	// agent/catalog_tool.py's RESULT_CEILING: the most one turn can show.
+	const agentResultCeiling = 10
+	shown := defaultGuestTurnCap * agentResultCeiling
+	if shown+agentResultCeiling > agentPagingReach {
+		t.Errorf("a guest can show %d titles, leaving no room in the agent's %d-row reach for another turn",
+			shown, agentPagingReach)
 	}
 }
 
-func TestShownFromHistoryFlattensStoredRefsOldestFirst(t *testing.T) {
-	history := []historyTurn{
-		{Role: "user", Text: "a heist"},
-		{Role: "assistant", Text: "Suggested: Heat", TitleRefs: []agentTitleRef{
-			{TMDBID: 101, MediaType: "movie"},
-		}},
-		{Role: "user", Text: "show me more"},
-		{Role: "assistant", Text: "Suggested: Ronin", TitleRefs: []agentTitleRef{
-			{TMDBID: 102, MediaType: "movie"},
-			{TMDBID: 103, MediaType: "movie"},
-		}},
-	}
-	want := []agentTitleRef{
-		{TMDBID: 101, MediaType: "movie"},
-		{TMDBID: 102, MediaType: "movie"},
-		{TMDBID: 103, MediaType: "movie"},
-	}
-	if got := shownFromHistory(history); !slices.Equal(got, want) {
-		t.Errorf("shownFromHistory(...) = %+v, want %+v", got, want)
+// A window deeper than what is stored is a number that never applies, and the
+// load would quietly return less than it claims to cap at.
+func TestTheHistoryWindowFitsInsideWhatIsStored(t *testing.T) {
+	if maxHistoryMessages > maxStoredHistoryMessages {
+		t.Errorf("maxHistoryMessages = %d exceeds what is stored (%d)",
+			maxHistoryMessages, maxStoredHistoryMessages)
 	}
 }
 
@@ -2980,15 +2932,15 @@ func TestShownFromHistoryFlattensStoredRefsOldestFirst(t *testing.T) {
 // an account nothing here, the same promise loadConversation already makes for
 // the history beside it.
 func TestAnAccountsShownSetSurvivesAReconnect(t *testing.T) {
-	loadConversation := func(_ context.Context, _ string, _ string) ([]historyTurn, error) {
+	loadConversation := func(_ context.Context, _ string, _ string) ([]historyTurn, []agentTitleRef, error) {
 		// What a previous connection persisted, as a fresh socket reads it.
 		return []historyTurn{
-			{Role: "user", Text: "a heist movie"},
-			{Role: "assistant", Text: "Suggested: Heat, Ronin", TitleRefs: []agentTitleRef{
+				{Role: "user", Text: "a heist movie"},
+				{Role: "assistant", Text: "Suggested: Heat, Ronin"},
+			}, []agentTitleRef{
 				{TMDBID: 101, MediaType: "movie"},
 				{TMDBID: 102, MediaType: "movie"},
-			}},
-		}, nil
+			}, nil
 	}
 	loadCtx := func(context.Context, string) (chatContext, error) {
 		return chatContext{Region: "US"}, nil
@@ -3020,19 +2972,53 @@ func TestAnAccountsShownSetSurvivesAReconnect(t *testing.T) {
 	}
 }
 
-// title_refs rides along on the history load, and the agent's history window
-// is text only — see ChatRequest.history in agent/chat.py.
-func TestStoredTitleRefsNeverReachTheAgentsHistory(t *testing.T) {
-	body, err := json.Marshal(agentChatRequest{History: []historyTurn{
-		{Role: "assistant", Text: "Suggested: Heat", TitleRefs: []agentTitleRef{
-			{TMDBID: 101, MediaType: "movie"},
-		}},
-	}})
-	if err != nil {
+// The set goes to the agent whole, however long the conversation: it is not a
+// window, and nothing here may quietly make it one. A long thread that drops
+// its oldest refs re-offers the titles the user has been looking at longest.
+// Duplicates do collapse — the same title shown on two turns is two rows.
+func TestAnAccountsShownSetIsSentWhole(t *testing.T) {
+	const stored = 250
+	refs := make([]agentTitleRef, 0, stored+1)
+	for i := range stored {
+		refs = append(refs, agentTitleRef{TMDBID: 100 + i, MediaType: "movie"})
+	}
+	// A title shown again on a later turn, as a repeat lookup stores it.
+	refs = append(refs, agentTitleRef{TMDBID: 100, MediaType: "movie"})
+
+	loadConversation := func(_ context.Context, _ string, _ string) ([]historyTurn, []agentTitleRef, error) {
+		return nil, refs, nil
+	}
+	loadCtx := func(context.Context, string) (chatContext, error) {
+		return chatContext{Region: "US"}, nil
+	}
+	callAgent, requests := captureAgentRequests()
+	srv, token := newChatTestServerWithConversations(t, loadCtx, callAgent, noopLoadVerdicts,
+		loadConversation, noopSaveMessages)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	wsjson.Write(t.Context(), conn, inboundMessage{
+		Type: "message", Turn: "t1", Text: "show me more", Conversation: testConversationID,
+	})
+	var ev outboundEvent
+	if err := wsjson.Read(t.Context(), conn, &ev); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(body), "101") {
-		t.Errorf("history carried title_refs to the agent: %s", body)
+
+	got := requests()
+	if len(got) != 1 {
+		t.Fatalf("agent called %d times, want 1", len(got))
+	}
+	if len(got[0].Shown) != stored {
+		t.Fatalf("Shown = %d refs, want all %d stored titles", len(got[0].Shown), stored)
+	}
+	// The very first title shown is still being suppressed, at the most recent
+	// position it appeared in.
+	first := agentTitleRef{TMDBID: 100, MediaType: "movie"}
+	if got[0].Shown[len(got[0].Shown)-1] != first {
+		t.Errorf("the re-shown title is at %+v, want it last", got[0].Shown[len(got[0].Shown)-1])
+	}
+	if slices.Contains(got[0].Shown[:len(got[0].Shown)-1], first) {
+		t.Error("the re-shown title is in the set twice")
 	}
 }
 
@@ -3083,16 +3069,34 @@ func TestATurnWithNoPicksLeavesTheShownSetIntact(t *testing.T) {
 	}
 }
 
-func TestShownSetIsBoundedAcrossManyTurns(t *testing.T) {
-	refs := make([]agentTitleRef, maxShownRefs+10)
-	for i := range refs {
-		refs[i] = agentTitleRef{TMDBID: i, MediaType: "movie"}
+// The set a guest accumulates has no cap: the first title of a long session is
+// suppressed as firmly as the last. defaultGuestTurnCap is what bounds it.
+func TestAGuestsShownSetKeepsEveryTitleAcrossManyTurns(t *testing.T) {
+	events := make([][]agentEvent, 0, defaultGuestTurnCap)
+	for i := range defaultGuestTurnCap {
+		events = append(events, []agentEvent{picksEvent(100 + i)})
 	}
-	got := windowShown(refs)
-	if len(got) != maxShownRefs {
-		t.Fatalf("len(windowShown(...)) = %d, want %d", len(got), maxShownRefs)
+	agent, requests := captureAgentRequestsPerCall(events...)
+	loadGuest := func(_ context.Context, providers []int) (chatContext, error) {
+		return chatContext{Region: guestRegion, Providers: providers}, nil
 	}
-	if got[len(got)-1].TMDBID != refs[len(refs)-1].TMDBID {
-		t.Error("windowShown did not keep the most recently shown titles")
+	srv := newGuestTestServer(t, agent, loadGuest)
+	conn := dialGuest(t, srv)
+
+	for i := range defaultGuestTurnCap {
+		sendAndDrain(t, conn, guestMessage(fmt.Sprintf("t%d", i), "show me more", []int{8}))
+	}
+
+	got := requests()
+	if len(got) != defaultGuestTurnCap {
+		t.Fatalf("agent called %d times, want %d", len(got), defaultGuestTurnCap)
+	}
+	// The last turn suppresses everything the ones before it showed.
+	last := got[len(got)-1].Shown
+	if len(last) != defaultGuestTurnCap-1 {
+		t.Fatalf("Shown on the last turn = %d refs, want %d", len(last), defaultGuestTurnCap-1)
+	}
+	if want := (agentTitleRef{TMDBID: 100, MediaType: "movie"}); last[0] != want {
+		t.Errorf("oldest ref = %+v, want the very first title shown %+v", last[0], want)
 	}
 }

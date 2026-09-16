@@ -166,7 +166,7 @@ type Handler struct {
 	// /api/chat/history/{conversationID}), the caller's conversation list and
 	// its delete, and the write that persists one completed turn — injected
 	// the same way as loadVerdicts/saveVerdict above.
-	loadConversation          func(ctx context.Context, userID, conversationID string) ([]historyTurn, error)
+	loadConversation          func(ctx context.Context, userID, conversationID string) ([]historyTurn, []agentTitleRef, error)
 	loadConversationTurns     func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error)
 	saveMessages              func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error)
 	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error)
@@ -195,7 +195,7 @@ func newHandler(kf jwt.Keyfunc, issuer, audience string, parties map[string]stru
 	saveVerdict func(ctx context.Context, userID string, tmdbID int, mediaType string, verdict *string, expectedVerdict string) error,
 	loadWatchlistItems func(ctx context.Context, userID string) ([]watchlistItem, error),
 	callAgentTitles agentTitlesCaller,
-	loadConversation func(ctx context.Context, userID, conversationID string) ([]historyTurn, error),
+	loadConversation func(ctx context.Context, userID, conversationID string) ([]historyTurn, []agentTitleRef, error),
 	loadConversationTurns func(ctx context.Context, userID, conversationID string) ([]conversationTurn, bool, error),
 	saveMessages func(ctx context.Context, userID, conversationID, userText, assistantText string, titleRefs []agentTitleRef) (bool, error),
 	loadConversationSummaries func(ctx context.Context, userID string) ([]conversationSummary, error),

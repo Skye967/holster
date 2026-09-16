@@ -19,6 +19,7 @@ import catalog_tool
 import tmdb
 from catalog_tool import (
     _UNAVAILABLE_PLACEHOLDER,
+    DISCOVER_BATCH_PAGES,
     MAX_DISCOVER_PAGES,
     MAX_TASTE_TITLES,
     MAX_TITLE_MATCHES,
@@ -48,8 +49,6 @@ from testutil import (
     ALL_JUDGED,
     CAPABILITY_QUESTION,
     DISCOVER_RAISED,
-    GATEWAY_MAX_SEEDED_MESSAGES,
-    GATEWAY_MAX_SHOWN_REFS,
     INTERPRET_RAISED,
     MOVIE_A,
     NEEDS_CLARIFICATION,
@@ -1068,8 +1067,10 @@ def test_search_reads_the_next_page_when_exclusion_leaves_too_few() -> None:
         _capture_rank(seen),
     )
 
-    assert fake_tmdb.count("/discover/movie") == 2
-    assert fake_tmdb.all_params_for("/discover/movie")[1]["page"] == "2"
+    # Page 1, then one batch. A set, not a list: the batch's pages are
+    # concurrent, so which reaches the transport first is not a contract.
+    pages = {c["page"] for c in fake_tmdb.all_params_for("/discover/movie")}
+    assert pages == {"1", *(str(p) for p in range(2, 2 + DISCOVER_BATCH_PAGES))}
     # The two survivors of page 1, then page 2 in order.
     assert [c["tmdb_id"] for c in seen[0]] == [119, 120, 201, 202, 203]
 
@@ -1114,7 +1115,8 @@ def test_search_stays_all_judged_when_the_next_page_is_also_excluded() -> None:
     )
 
     assert result.all_judged is True
-    assert fake_tmdb.count("/discover/movie") == 2
+    # Page 1 plus the batch after it; the rest of the batch comes back empty.
+    assert fake_tmdb.count("/discover/movie") == 1 + DISCOVER_BATCH_PAGES
 
 
 def test_search_rescues_an_all_excluded_page_from_the_next_one() -> None:
@@ -2347,7 +2349,10 @@ def test_relaxing_keeps_exact_matches_the_cut_would_otherwise_discard() -> None:
 
 def test_paging_reads_toward_the_ceiling_not_merely_the_floor() -> None:
     """ "Show me 10 more" has to mean ten. Stopping the paging loop at the floor
-    answered it with five while the next page sat one call away."""
+    answered it with five while the next page sat one call away.
+
+    Page 2 alone meets the ceiling, and the batch around it is still paid for —
+    what buying the round trip costs when a batch's first page is enough."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
     fake_tmdb.ok("/discover/movie", _page(*range(201, 221)))
@@ -2361,7 +2366,7 @@ def test_paging_reads_toward_the_ceiling_not_merely_the_floor() -> None:
     result = _search(fake_tmdb, interpret_model=fake_interpret, shown=shown)
 
     assert len(result.picks) == RESULT_CEILING
-    assert fake_tmdb.count("/discover/movie") == 2
+    assert fake_tmdb.count("/discover/movie") == 1 + DISCOVER_BATCH_PAGES
     # Reached by paging the query as asked, never by loosening it.
     assert result.relaxed == []
 
@@ -2622,9 +2627,9 @@ def test_the_rating_bar_bends_after_every_constraint_the_user_stated() -> None:
 def test_the_ladder_stops_widening_once_its_budget_is_spent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Paging plus rungs is up to nine sequential TMDB calls under the
-    gateway's 30s turnDeadline. Past the budget the ladder answers with what
-    it has, which accumulation makes a real answer."""
+    """Paging plus rungs is many sequential TMDB round trips at the ceiling,
+    under the gateway's 30s turnDeadline. Past the budget the ladder answers
+    with what it has, which accumulation makes a real answer."""
     monkeypatch.setattr(catalog_tool, "LADDER_BUDGET_SECONDS", -1.0)
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(101))
@@ -2641,12 +2646,11 @@ def test_the_ladder_stops_widening_once_its_budget_is_spent(
 
 
 def test_paging_stops_at_the_budget_too(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Three of the eight calls the budget bounds are pages, not rungs. A full
-    page whose rows are nearly all already shown is the case that keeps paging
-    going, so it is the one that can prove the deadline reaches it: without
-    that check this reads MAX_DISCOVER_PAGES pages before the rungs are even
-    considered, and a degraded TMDB spends the gateway's whole turnDeadline
-    here."""
+    """Most of what the budget bounds is pages, not rungs. A full page whose
+    rows are nearly all already shown is the case that keeps paging going, so
+    it is the one that can prove the deadline reaches it: without that check
+    this reads MAX_DISCOVER_PAGES pages before the rungs are even considered,
+    and a degraded TMDB spends the gateway's whole turnDeadline here."""
     monkeypatch.setattr(catalog_tool, "LADDER_BUDGET_SECONDS", -1.0)
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(*range(101, 101 + PAGE_SIZE)))
@@ -2660,6 +2664,82 @@ def test_paging_stops_at_the_budget_too(monkeypatch: pytest.MonkeyPatch) -> None
     assert fake_tmdb.count("/discover/movie") == 1
     # And the two rows it did find are still the answer.
     assert [p["tmdb_id"] for p in result.picks] == [119, 120]
+
+
+def test_a_deadline_mid_batch_keeps_the_pages_that_did_arrive() -> None:
+    """A batch cancelled at the deadline must not throw away pages that already
+    came back. asyncio.gather discards its children's results when the await is
+    cancelled, so the pages are absorbed one at a time as they are awaited —
+    what accumulated is the reply, and the ladder's own log says so."""
+
+    async def one_slow_page(request: httpx2.Request) -> httpx2.Response:
+        if "/discover/" not in request.url.path:
+            return httpx2.Response(200, json={"results": []})
+        page = int(request.url.params["page"])
+        if page == 1:
+            return httpx2.Response(200, json=_page(*range(101, 101 + PAGE_SIZE)))
+        if page == 2:
+            # Full, so it is not TMDB's last page — the loop has a reason to
+            # reach for page 3, and this read is genuinely cut short.
+            return httpx2.Response(200, json=_page(*range(201, 201 + PAGE_SIZE)))
+        # Outlasts any budget: the batch is cut while page 2 is already in hand.
+        await asyncio.sleep(30)
+        return httpx2.Response(200, json=_page(301))
+
+    async def go() -> CatalogResult:
+        return await search(
+            "something good",
+            client=tmdb.TMDBClient("t", transport=httpx2.MockTransport(one_slow_page)),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=ok_interpret,
+            rank_model=_rank_both,
+            # All of page 1 and most of page 2 on screen, so the loop still
+            # wants page 3 after page 2 is in hand.
+            shown=[
+                TitleRef(tmdb_id=i, media_type="movie")
+                for i in [*range(101, 101 + PAGE_SIZE), *range(201, 218)]
+            ],
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        # Pages 1 and 2 are both served inside this budget; the batch it cuts is
+        # the one after them, so the budget has to outlast two served pages.
+        mp.setattr(catalog_tool, "PAGING_BUDGET_SECONDS", 0.2)
+        mp.setattr(catalog_tool, "LADDER_BUDGET_SECONDS", 0.2)
+        result = asyncio.run(asyncio.wait_for(go(), timeout=10))
+
+    # Page 2's survivors reached the answer even though the batch was cut.
+    assert [p["tmdb_id"] for p in result.picks] == [218, 219, 220]
+
+
+def test_a_spent_paging_budget_still_leaves_the_rungs_their_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paging runs first and can be many batched round trips; without a
+    reserve a slow TMDB spends the clock the rungs need, and the user gets a
+    thin answer where one dropped constraint would have filled it."""
+    monkeypatch.setattr(catalog_tool, "PAGING_BUDGET_SECONDS", -1.0)
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.pages(
+        "/discover/movie",
+        _page(*range(101, 101 + PAGE_SIZE)),
+        _page(*range(201, 201 + PAGE_SIZE)),
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    result = _search(
+        fake_tmdb,
+        interpret_model=fake_interpret,
+        shown=[
+            TitleRef(tmdb_id=i, media_type="movie") for i in range(101, 101 + PAGE_SIZE)
+        ],
+    )
+
+    # Page 2 was never read, and the rung ran anyway.
+    assert result.relaxed == ["runtime"]
 
 
 def test_the_budget_cancels_a_discover_already_in_flight(
@@ -2700,16 +2780,16 @@ def test_the_budget_cancels_a_discover_already_in_flight(
 
     result = asyncio.run(asyncio.wait_for(go(), timeout=10))
 
-    assert calls == 2, "page 2 should have been attempted"
+    assert calls == 4, "the batch after page 1 should have been attempted"
     # Cancelled, so none of its rows reached the answer — and page 1's did.
     assert [p["tmdb_id"] for p in result.picks] == [119, 120]
 
 
 def test_a_deep_session_pages_further_rather_than_widening() -> None:
-    """The gateway's shown window is 40, and verdicts exclude on top of it, so
-    the pages read have to reach past both — otherwise a "show me 10 more"
-    several rounds in comes back thin and the ladder drops a year the user
-    actually typed while unshown rows sit one page away."""
+    """Shown titles and verdicts exclude on top of each other, so the pages read
+    have to reach past both — otherwise a "show me 10 more" several rounds in
+    comes back thin and the ladder drops a year the user actually typed while
+    unshown rows sit one page away."""
     fake_tmdb = FakeTMDB()
     for start in (101, 121, 141, 161):
         fake_tmdb.ok("/discover/movie", _page(*range(start, start + PAGE_SIZE)))
@@ -2814,33 +2894,6 @@ def test_nothing_is_reserved_when_the_query_was_never_widened() -> None:
     assert result.relaxed == []
     assert len(result.picks) == 6
     assert all(p["blurb"] == "ok" for p in result.picks)
-
-
-def test_the_shown_window_stays_shorter_than_this_paging_reach() -> None:
-    """Pins MAX_DISCOVER_PAGES and PAGE_SIZE against the gateway's maxShownRefs:
-    paging must reach far enough past the shown window to still have rows left,
-    or a "show me more" reports all_shown for a query that has pages."""
-    spare = MAX_DISCOVER_PAGES * PAGE_SIZE - GATEWAY_MAX_SHOWN_REFS
-    assert spare >= RESULT_CEILING, (
-        f"maxShownRefs leaves only {spare} unshown rows; "
-        f"a 'show me more' run past that reports all_shown for a query "
-        f"that still has pages"
-    )
-
-
-def test_the_seeded_message_budget_covers_the_shown_window() -> None:
-    """Pins RESULT_FLOOR against the gateway's maxSeededMessages and
-    maxShownRefs. The gateway refills `shown` from stored messages, which
-    interleave user and assistant rows, so half the budget carries refs —
-    RESULT_FLOOR each, the floor being the weaker target a thin turn still
-    tends toward. A turn can return fewer, so this is a budget, not a floor on
-    what arrives."""
-    refs = (GATEWAY_MAX_SEEDED_MESSAGES // 2) * RESULT_FLOOR
-    assert refs >= GATEWAY_MAX_SHOWN_REFS, (
-        f"maxSeededMessages budgets only {refs} refs at a floor of "
-        f"{RESULT_FLOOR}, short of maxShownRefs {GATEWAY_MAX_SHOWN_REFS}; "
-        f"a reconnect would forget titles the guest still has on screen"
-    )
 
 
 def test_a_named_person_is_never_a_rung() -> None:
@@ -3022,14 +3075,20 @@ def test_the_query_as_asked_is_read_before_anything_is_loosened() -> None:
     assert result.relaxed == []
     assert [p["tmdb_id"] for p in result.picks] == [201, 202, 203, 204, 205]
     calls = fake_tmdb.all_params_for("/discover/movie")
-    assert [c["page"] for c in calls] == ["1", "2"]
+    # A set, not a list: a batch's pages are concurrent, so arrival order is
+    # not a contract.
+    assert {c["page"] for c in calls} == {"1", "2", "3", "4"}
     # The constraints survived intact — nothing was traded for the second page.
     assert all("with_runtime.lte" in c for c in calls)
 
 
 def test_paging_stops_at_the_bound_even_when_the_floor_is_never_met() -> None:
+    """Every page full and every row already shown, so neither stop condition
+    ever fires and only the ceiling ends the loop. Full pages throughout is
+    what makes this the ceiling's test rather than the short-page one's: an
+    empty page past the fixtures would end it early and prove nothing."""
     fake_tmdb = FakeTMDB()
-    for start in range(1, 6):
+    for start in range(1, MAX_DISCOVER_PAGES + 1):
         fake_tmdb.ok(
             "/discover/movie", _page(*range(start * 100, start * 100 + PAGE_SIZE))
         )
@@ -3037,10 +3096,116 @@ def test_paging_stops_at_the_bound_even_when_the_floor_is_never_met() -> None:
     _search(
         fake_tmdb,
         rank_model=rank_must_not_run(NO_CANDIDATES),
-        shown=[TitleRef(tmdb_id=i, media_type="movie") for i in range(100, 600)],
+        shown=[
+            TitleRef(tmdb_id=i, media_type="movie")
+            for start in range(1, MAX_DISCOVER_PAGES + 1)
+            for i in range(start * 100, start * 100 + PAGE_SIZE)
+        ],
     )
 
     assert fake_tmdb.count("/discover/movie") == MAX_DISCOVER_PAGES
+
+
+def test_paging_outruns_what_the_conversation_has_already_shown() -> None:
+    """Depth scales with exclusion, so a rung fires only when TMDB is genuinely
+    out of unshown rows. With the first four pages entirely on screen, page 5 is
+    the answer and nothing may be widened to reach it — widening here drops a
+    runtime the user actually typed while unshown rows sit one page away."""
+    fake_tmdb = FakeTMDB()
+    # By page number: this asserts which page carried the answer, and a queue
+    # binds a payload to whichever concurrent request the loop ran first.
+    fake_tmdb.pages(
+        "/discover/movie",
+        *(_page(*range(start * 100, start * 100 + PAGE_SIZE)) for start in range(1, 7)),
+    )
+
+    async def fake_interpret(message: str) -> DiscoverIntent:
+        return make_intent(max_runtime_minutes=90)
+
+    result = _search(
+        fake_tmdb,
+        interpret_model=fake_interpret,
+        # The first four pages entirely — what a four-page read could reach.
+        shown=[
+            TitleRef(tmdb_id=i, media_type="movie")
+            for start in range(1, 5)
+            for i in range(start * 100, start * 100 + PAGE_SIZE)
+        ],
+    )
+
+    assert result.relaxed == []
+    assert [p["tmdb_id"] for p in result.picks] == list(range(500, 510))
+
+
+def test_a_short_page_anywhere_in_a_batch_ends_the_paging() -> None:
+    """TMDB's last page can land mid-batch, and the pages beside it are still
+    full. Testing only the batch's last page would let a second batch go out
+    for rows that do not exist."""
+    fake_tmdb = FakeTMDB()
+    # By page number, not by queue: the short page has to be page 3 for this to
+    # be a mid-batch test at all, and a queue binds it to whichever request ran
+    # first.
+    fake_tmdb.pages(
+        "/discover/movie",
+        _page(*range(100, 100 + PAGE_SIZE)),
+        _page(*range(200, 200 + PAGE_SIZE)),
+        _page(300, 301, 302),
+        _page(*range(400, 400 + PAGE_SIZE)),
+    )
+
+    result = _search(
+        fake_tmdb,
+        # Everything but the short page, so nothing meets the ceiling and only
+        # the short page can end the loop.
+        shown=[
+            TitleRef(tmdb_id=i, media_type="movie")
+            for start in (100, 200, 400)
+            for i in range(start, start + PAGE_SIZE)
+        ],
+    )
+
+    # Exactly one batch went out, so the batch after it was never asked for.
+    pages = {c["page"] for c in fake_tmdb.all_params_for("/discover/movie")}
+    assert pages == {"1", *(str(p) for p in range(2, 2 + DISCOVER_BATCH_PAGES))}
+    assert [p["tmdb_id"] for p in result.picks] == [300, 301, 302]
+
+
+def test_show_me_more_never_repeats_across_a_long_conversation() -> None:
+    """A hundred-row query answered ten at a time, each round's picks fed back
+    as the next round's `shown`: ten rounds reach every row with no repeat, and
+    the ninth's answer is on page 5.
+
+    Answers by page number rather than by queue order — a batch's pages are
+    concurrent, so which one the transport serves first is not a contract."""
+    pool = list(range(1000, 1100))
+
+    shown: list[TitleRef] = []
+    for round_number in range(1, 11):
+        fake_tmdb = FakeTMDB()
+        fake_tmdb.pages(
+            "/discover/movie",
+            *(
+                _page(*pool[start : start + PAGE_SIZE])
+                for start in range(0, len(pool), PAGE_SIZE)
+            ),
+        )
+        result = _search(fake_tmdb, shown=list(shown))
+        ids = [p["tmdb_id"] for p in result.picks]
+        already = {r.tmdb_id for r in shown}
+
+        assert len(ids) == RESULT_CEILING, f"round {round_number} came back short"
+        assert not already & set(ids), f"round {round_number} repeated a title"
+        # Never because paging ran out: the query as asked still had rows.
+        assert result.relaxed == [], f"round {round_number} widened"
+
+        shown += [TitleRef(tmdb_id=i, media_type="movie") for i in ids]
+        if round_number == 9:
+            # The round that separates this from a four-page read: every
+            # earlier answer sits inside the first eighty rows.
+            pages = {c["page"] for c in fake_tmdb.all_params_for("/discover/movie")}
+            assert "5" in pages, "round 9's answer is on page 5"
+
+    assert {r.tmdb_id for r in shown} == set(pool)
 
 
 def test_a_rung_reads_one_page_not_the_whole_ladder_again() -> None:

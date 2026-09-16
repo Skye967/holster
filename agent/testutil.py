@@ -15,10 +15,8 @@ import httpx2
 from catalog_tool import DiscoverIntent, Ranker, RankResult
 from tmdb import Title, TMDBClient
 
-# services/gateway's constants, hand-copied -- the two services share no code.
-# Nothing enforces the copy: update these by hand when chat.go changes.
-GATEWAY_MAX_SHOWN_REFS = 40
-GATEWAY_MAX_SEEDED_MESSAGES = 20
+# services/gateway's constant, hand-copied -- the two services share no code.
+# Nothing enforces the copy: update it by hand when chat.go changes.
 GATEWAY_MAX_HISTORY_EXCHANGES = 5
 
 # The reasons rank() must not be reached, shared so a typo at a call site is
@@ -97,21 +95,49 @@ class FakeTMDB:
     """Records every outgoing request and replays queued responses by path.
 
     A path with a queue pops one response per call (so a 429 then a 200 tests
-    a retry); a path with none gets an empty result set.
+    a retry); a path with none gets an empty result set. pages() answers by
+    page number instead, for callers that care which page carried what. The two
+    are mutually exclusive per path — registering both raises rather than
+    letting one silently win.
     """
 
     def __init__(self) -> None:
         self.requests: list[httpx2.Request] = []
         self._queues: dict[str, list[httpx2.Response]] = {}
+        self._pages: dict[str, list[dict[str, Any]]] = {}
 
     def queue(self, path: str, *responses: httpx2.Response) -> None:
+        if "/3" + path in self._pages:
+            raise AssertionError(f"{path} already answers by page; see pages()")
         self._queues.setdefault("/3" + path, []).extend(responses)
 
     def ok(self, path: str, payload: dict[str, Any]) -> None:
         self.queue(path, httpx2.Response(200, json=payload))
 
+    def pages(self, path: str, *payloads: dict[str, Any]) -> None:
+        """Answer this path from the request's own `page` param rather than
+        from arrival order — catalog_tool reads pages concurrently, so a queue
+        binds a payload to whichever request the event loop happened to run
+        first. Past the last payload the path answers empty, which is what TMDB
+        does past total_pages.
+
+        Every rung's discover() is page 1, so a rung is served the first payload
+        again and absorb() dedupes it away — a test that needs a rung to bring
+        new rows wants queue()."""
+        if "/3" + path in self._queues:
+            raise AssertionError(f"{path} already has a queue; see queue()")
+        if "/3" + path in self._pages:
+            raise AssertionError(f"{path} is already answering by page")
+        self._pages["/3" + path] = list(payloads)
+
     def _handler(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
+        if request.url.path in self._pages:
+            payloads = self._pages[request.url.path]
+            page = int(request.url.params.get("page", 1))
+            if page <= len(payloads):
+                return httpx2.Response(200, json=payloads[page - 1])
+            return httpx2.Response(200, json={"results": []})
         queue = self._queues.get(request.url.path)
         if queue:
             return queue.pop(0)

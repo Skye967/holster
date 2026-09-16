@@ -103,11 +103,16 @@ no title metadata, only a selected id and a blurb, so a manipulated overview can
 bad blurb at worst, never assert a fake title. `rank()` says nothing about how many
 picks a turn shows; `search()` owns the whole size band.
 A recommendation list aims for `RESULT_FLOOR`..`RESULT_CEILING` titles. Paging reads
-toward the ceiling, up to `MAX_DISCOVER_PAGES` — a thin page usually means exclusion ate
+toward the ceiling until TMDB has no next page — a thin page usually means exclusion ate
 it, and the answer to that is more of what the user asked for, never a looser question.
-Only once the query itself is out of rows does `search()` retry with soft constraints
-dropped in `RelaxedConstraint`'s order, recording what it dropped in
-`CatalogResult.relaxed` for the chat layer to explain. Never the user's services,
+Depth therefore scales with what is being excluded rather than sitting at a constant,
+which is what lets a long conversation keep asking for more. Pages after the first go
+out `DISCOVER_BATCH_PAGES` at a time, so a deep read costs a few round trips rather than
+a dozen; `MAX_DISCOVER_PAGES` is a runaway ceiling on that, not a policy.
+When paging cannot fill the floor — TMDB out of rows, the page ceiling, or the paging
+budget spent — `search()` retries with soft constraints dropped in
+`RelaxedConstraint`'s order, recording what it dropped in `CatalogResult.relaxed` for
+the chat layer to explain. Never the user's services,
 region, or exclusions, and never cast or crew: a named person is the request itself, so
 padding two genuine matches with three unrelated films buys a count and loses the
 answer. Genres bend only while a *resolved* cast or crew name still says what the search
@@ -132,11 +137,14 @@ requests made of the model, for the same reason `rank()` validates ids rather th
 asking for valid ones.
 
 The widening is bounded by `LADDER_BUDGET_SECONDS`, not run to exhaustion: paging
-plus rungs is up to nine sequential `discover()` calls under the gateway's 30s turn
-deadline. It is a deadline around the whole widening, so a call already in flight is
-cancelled rather than left to finish its own retries; page 1 sits outside it, being
-the answer rather than the widening. What accumulated is then the reply — which makes
-it a real answer rather than a truncated one.
+plus rungs is many sequential rounds of `discover()` calls at its ceiling, under
+the gateway's 30s turn deadline. Paging may spend only `PAGING_BUDGET_SECONDS` of that, so
+depth cannot leave the rungs without a clock on a slow TMDB — a spent paging budget
+falls through to them, where a TMDB fault ends the ladder, a fault being the same call
+a rung is about to make. It is a deadline around the whole widening, so a call already
+in flight is cancelled rather than left to finish its own retries; page 1 sits outside
+it, being the answer rather than the widening. What accumulated is then the reply —
+which makes it a real answer rather than a truncated one.
 LangChain is confined to `google_interpreter()`/`google_ranker()`; everything
 else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`.
 
@@ -174,13 +182,20 @@ a query run dry by re-asking is not one whose every result the user rated, and t
 case is `all_shown` instead. Like verdicts, it does not filter a named-title lookup —
 and, symmetrically, a lookup turn does not *feed* the set either, nor does a turn whose
 cards the gateway dropped as cancelled — for a guest. An account's set is read back from
-`messages.title_refs`, which records neither distinction, so there a looked-up title can
-be suppressed from a later recommendation; that is accepted, and the clean fix
-is a column rather than a heuristic on the stored text. The gateway keeps this window
-deliberately shorter than `MAX_DISCOVER_PAGES` pages of rows, so the window alone cannot
-outgrow what one query reaches past — verdicts exclude on top of it, though, so
-`all_shown` means this search found nothing new, not that TMDB ran out. The copy says
-exactly that.
+`messages.title_refs`, which records neither distinction, so there a looked-up title is
+barred from every later recommendation in that conversation, however long it runs.
+Accepted, and the clean fix is a column rather than a heuristic on the stored text.
+
+The gateway sends the whole set rather than a window of it — a title re-offered is a
+visible bug, so nothing in it ages out — and paging above is what keeps that
+affordable: the deeper the exclusion, the deeper the read. `MAX_SHOWN` here bounds
+nothing upstream; it is there so that if a set ever does arrive oversized, the turn
+says so rather than silently excluding less than the gateway believes it does.
+
+`all_shown` therefore means this search found nothing new, never that TMDB ran out: the
+read can stop at `MAX_DISCOVER_PAGES` or at the paging budget, and every query is
+filtered by `tmdb.py`'s `MIN_VOTE_COUNT` — a floor the user never stated, which only
+the rating rung bends and only back to that same floor. The copy says exactly that.
 
 `verdicts` in the request body is the caller's whole `title_verdicts` set, loaded by the
 gateway with the message. The gateway only reads the rows; what each verdict *means* for
