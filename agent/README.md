@@ -58,7 +58,7 @@ CLI above is the same thing with reload for local work.
 |---|---|---|---|
 | `TMDB_API_KEY` | yes | — | The v4 Read Access Token, sent as `Authorization: Bearer`. Read when the TMDB client is constructed. |
 | `GOOGLE_API_KEY` | yes | — | Read when the catalog tool's model is constructed. |
-| `GOOGLE_MODEL` | no | `gemini-3.5-flash-lite` | Powers both catalog_tool steps — interpreting a message and ranking candidates. |
+| `GOOGLE_MODEL` | no | `gemini-3.5-flash-lite` | Powers all three catalog_tool steps — interpret, rank, and the outcome sentence. |
 | `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
 
 Both keys are app-level: neither opens any user's account, so losing one costs a
@@ -153,7 +153,8 @@ else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`
 `chat.py`'s `stream_chat()` wraps `catalog_tool.search()` for `POST /chat`: a plain
 chunked HTTP response (`application/x-ndjson`), not a second WebSocket — the browser's
 socket belongs to the gateway alone (`../ARCHITECTURE.md`). Each line is one event:
-`intent` (as soon as `interpret()` resolves — well before the full pipeline finishes,
+`reply` (the model's one-line opener, ahead of `intent` on a turn that searches or looks
+up), `intent` (as soon as `interpret()` resolves — well before the full pipeline finishes,
 via `search()`'s `on_intent` hook), `results` or `message` (candidates, or a plain reply
 when there are none — no subscriptions, nothing survived the relaxation ladder, or
 everything found was already rated),
@@ -162,9 +163,10 @@ everything found was already rated),
 `error`, never both.
 
 This is the agent-internal protocol, not the browser-facing one — the gateway owns the
-public event vocabulary (`interpreting`/`results`/`token`/`done`/`error`) and templates
-it from these. Cancellation is plain `asyncio` cancellation: the gateway aborting its
-HTTP call closes the response body, which stops `stream_chat()` iterating, which cancels
+public event vocabulary (`reply`/`interpreting`/`results`/`token`/`done`/`error`) and
+templates it from these. Cancellation is plain `asyncio` cancellation: the gateway
+aborting its HTTP call closes the response body, which stops `stream_chat()` iterating,
+which cancels
 the background `search()` call — nothing bespoke on this side.
 
 `history` in the request body is the last few exchanges only, windowed by the gateway
@@ -196,6 +198,42 @@ says so rather than silently excluding less than the gateway believes it does.
 read can stop at `MAX_DISCOVER_PAGES` or at the paging budget, and every query is
 filtered by `tmdb.py`'s `MIN_VOTE_COUNT` — a floor the user never stated, which only
 the rating rung bends and only back to that same floor. The copy says exactly that.
+
+## Voice
+
+Every sentence the user reads is written by the model, bar the ones that cannot be.
+`_TONE` in `catalog_tool.py` is prepended to all three system prompts, so the opener, a
+blurb, a clarifying question and an outcome sentence come from one assistant rather than
+three. It says only how to sound — `rank()` is asked for a list of per-title blurbs, so a
+tone rule forbidding lists or counts would contradict the job on the same call.
+
+`_ANSWER_RULES` carries what a whole answer owes — name no film the user did not, give no
+count, never say the catalog has run out, always say what to try next — and goes only to
+the outcome prompt and to the capability case of the interpret prompt. Those two produce
+the text the gateway stores as the turn's assistant text, which is read back into the next
+turn's `interpret()`, where a named film reads as a title request and a number as a limit.
+
+**A turn makes at most two model calls.** The opener rides on `interpret()` as
+`DiscoverIntent.reply`, so it is free; a turn with results spends `interpret()` and
+`rank()`. A turn that ends with nothing to show spends `interpret()` and one `Composer`
+call instead, `rank()` having never reached the model — `chat.py` states why that spare
+call is always there. Calls are not requests: interpret and rank are built with one
+retry (`main.py`), so a results turn can cost three of the free tier's fifteen requests
+a minute. The composer is built with none — its answer already exists in the template
+beside it.
+
+The composer is fed the cause (`nothing_matched`, `all_shown`, `all_judged`,
+`title_not_found`), never asked to infer it: each owes the user a different sentence,
+and telling someone they rated titles they were only shown is false. `search()` decides
+the cause where it computes the facts behind it, so the sentence and the duty cannot
+disagree. A composer call that fails or outlives `COMPOSE_TIMEOUT_SECONDS` falls back to
+the template beside it rather than costing a turn the answer it already has.
+
+What stays hand-written: `chat.py`'s `NO_PROVIDERS_MESSAGE`, because that turn reaches
+no model at all and is the first message most new visitors see; `services/gateway/chat.go`'s
+error copy, guest cap and rate-limit line, because if the model is what failed it cannot
+write its own apology; and `_relaxed_note`, whose count is computed after `rank()` has cut
+the picks, so no call is in flight to write it.
 
 `verdicts` in the request body is the caller's whole `title_verdicts` set, loaded by the
 gateway with the message. The gateway only reads the rows; what each verdict *means* for

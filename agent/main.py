@@ -27,10 +27,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from catalog_tool import (
     DEFAULT_MODEL,
+    Composer,
     Interpreter,
     Ranker,
     TitlesRequest,
     enrich_watchlist,
+    google_composer,
     google_interpreter,
     google_ranker,
 )
@@ -151,19 +153,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # than the first /chat request.
     _require_env("GOOGLE_API_KEY")
     app.state.tmdb_client = TMDBClient(_require_env("TMDB_API_KEY"))
+    # `or`, not getenv's own default: docker-compose's ${GOOGLE_MODEL}
+    # substitutes an empty string when unset in .env, not an absent key, so
+    # getenv's default would never fire under compose.
+    model_name = os.getenv("GOOGLE_MODEL") or DEFAULT_MODEL
     # max_retries is total attempts here (2 = one retry), not
     # retries-beyond-initial. It helps with transient 5xx/network errors. It
     # does not help against a free-tier rate limit: the SDK's backoff is fixed
     # exponential and ignores the Retry-After the response carries, so the one
     # retry fires too soon to land.
-    # `or`, not getenv's own default: docker-compose's ${GOOGLE_MODEL}
-    # substitutes an empty string when unset in .env, not an absent key, so
-    # getenv's default would never fire under compose.
-    model = ChatGoogleGenerativeAI(
-        model=os.getenv("GOOGLE_MODEL") or DEFAULT_MODEL, timeout=15.0, max_retries=2
-    )
+    model = ChatGoogleGenerativeAI(model=model_name, timeout=15.0, max_retries=2)
     app.state.interpret_model = google_interpreter(model)
     app.state.rank_model = google_ranker(model)
+    # One attempt where the two above get a retry: this call's answer already
+    # exists in the template beside it (chat.py's _outcome_text), so a retry
+    # against a free-tier refusal spends a second request of the same minute to
+    # arrive at the sentence that was already there.
+    compose_llm = ChatGoogleGenerativeAI(model=model_name, timeout=15.0, max_retries=1)
+    app.state.compose_model = google_composer(compose_llm)
     try:
         yield
     finally:
@@ -175,10 +182,11 @@ asgi_app = CorrelationIdMiddleware(app)
 
 
 # Plain functions, not a class: request.app.state is the one instance-per-process
-# TMDBClient/model pair built in lifespan() above. Depends() (rather than reading
-# request.app.state directly in the route) is what lets tests swap in fakes via
-# app.dependency_overrides, the same seam TMDBClient's transport= and
-# catalog_tool's Interpreter/Ranker callables already use.
+# TMDBClient and the three model callables built in lifespan() above. Depends()
+# (rather than reading request.app.state directly in the route) is what lets
+# tests swap in fakes via app.dependency_overrides, the same seam TMDBClient's
+# transport= and catalog_tool's Interpreter/Ranker/Composer callables already
+# use.
 def get_tmdb_client(request: Request) -> TMDBClient:
     return cast(TMDBClient, request.app.state.tmdb_client)
 
@@ -189,6 +197,10 @@ def get_interpret_model(request: Request) -> Interpreter:
 
 def get_rank_model(request: Request) -> Ranker:
     return cast(Ranker, request.app.state.rank_model)
+
+
+def get_compose_model(request: Request) -> Composer:
+    return cast(Composer, request.app.state.compose_model)
 
 
 @app.get("/health")
@@ -202,6 +214,7 @@ async def chat(
     tmdb_client: TMDBClient = Depends(get_tmdb_client),
     interpret_model: Interpreter = Depends(get_interpret_model),
     rank_model: Ranker = Depends(get_rank_model),
+    compose_model: Composer = Depends(get_compose_model),
 ) -> StreamingResponse:
     """Streams chat.stream_chat()'s events as newline-delimited JSON. A plain
     chunked HTTP response, not a second WebSocket — the browser's socket is the
@@ -217,6 +230,7 @@ async def chat(
             client=tmdb_client,
             interpret_model=interpret_model,
             rank_model=rank_model,
+            compose_model=compose_model,
         ):
             yield json.dumps(event, default=str).encode() + b"\n"
 

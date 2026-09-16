@@ -162,7 +162,7 @@ const maxProviderID = 1_000_000
 const defaultGuestTurnCap = 20
 
 // No number in the copy, so it can't drift from the cap.
-const guestTurnCapText = "You've reached the guest limit for this session — sign in to keep chatting."
+const guestTurnCapText = "That's as far as I can go without an account — sign in and we can keep going."
 
 // guestRateLimiters is a per-IP token bucket shared by every guest socket
 // from that IP — deliberately not per-socket, since opening a
@@ -405,6 +405,14 @@ const maxMessageLength = 4000
 // outboundEvent is the gateway's curated, public vocabulary — never the
 // agent's internal event shape. See chat.go's translation in runTurn and
 // agent/chat.py's module docstring on why the two protocols differ.
+//
+// "reply" is the agent's model-written opener, forwarded as its own type
+// rather than as "token": a token renders below the cards, and a later
+// "message" on the same turn overwrites it, where this belongs above the
+// interpreting line it introduces. This event is never persisted — it is
+// written before any result exists, so feeding it back through history
+// would answer the next turn's interpret() with "Absolutely, one sec"
+// (see runTurn's case, and agent/chat.py).
 //
 // "conversation_created" is the one type not translated from an agent event
 // at all — see finishTurn — sent once persistence of a turn's first message
@@ -1019,7 +1027,7 @@ func (h *Handler) finishTurn(dbCtx, eventCtx context.Context, userID string, rec
 	}
 }
 
-// sendProgressEvent writes a progress event (interpreting/results/token),
+// sendProgressEvent writes a progress event (reply/interpreting/results/token),
 // gated on turnCtx: a stale one for a turn that's since been cancelled,
 // superseded, or timed out is correctly dropped. The counterpart to
 // sendTerminalEvent below — see that function's doc comment for why the two
@@ -1071,8 +1079,13 @@ func (h *Handler) writeEvent(ctx context.Context, conn *websocket.Conn, turn str
 	return true
 }
 
+// Hand-written, and staying that way: if the model is what failed it cannot
+// write its own apology, and if TMDB is down the message still has to say
+// "try later" reliably. ARCHITECTURE.md's Failure rules bind them: no status
+// code, and each says whether waiting will help, which is what keeps "nothing
+// matched" and "something broke" from reading alike.
 const (
-	genericErrorText     = "Something went wrong — try again."
+	genericErrorText     = "Something went wrong on my end — give that another try."
 	agentUnavailableText = "I'm having trouble thinking — try again in a moment."
 )
 
@@ -1084,7 +1097,7 @@ const (
 func friendlyError(reason string) string {
 	switch reason {
 	case "tmdb_unavailable":
-		return "Can't reach the film database right now."
+		return "Can't reach the film database right now — give it a minute and try again."
 	case "model_unavailable":
 		return agentUnavailableText
 	case "internal":
@@ -1278,6 +1291,15 @@ func (h *Handler) runTurn(
 			} else {
 				slog.WarnContext(turnCtx, "chat intent decode failed", "turn", turnID, "error", err.Error())
 			}
+		case "reply":
+			if turnCtx.Err() != nil {
+				continue
+			}
+			// Touches no rec field, unlike "results" and "message" below: the
+			// opener is not the turn's answer, so a results turn still stores
+			// "Suggested: ..." and an empty turn still stores its outcome
+			// sentence.
+			h.sendProgressEvent(turnCtx, conn, turnID, outboundEvent{Type: "reply", Text: ev.Text})
 		case "results":
 			if turnCtx.Err() != nil {
 				continue
@@ -1289,9 +1311,10 @@ func (h *Handler) runTurn(
 			// "message" below: zero picks is a real, reachable state
 			// (summarizePicks returns "" for it) that must not overwrite an
 			// ok=true left by an earlier event in this same stream. An empty
-			// ev.Text on "message" isn't reachable the same way — every
-			// message-type event agent/chat.py emits comes from a non-empty
-			// template — so no matching guard is needed there.
+			// ev.Text on "message" isn't reachable the same way — the agent
+			// composes that text but falls back to a non-empty template when
+			// the model returns nothing usable (agent/chat.py's _outcome_text
+			// and _capability_message) — so no matching guard is needed there.
 			if summary := summarizePicks(ev.Picks, ev.Kind == "lookup"); summary != "" {
 				rec.ok = true
 				rec.userText = text
@@ -1556,8 +1579,9 @@ type agentChatRequest struct {
 	WatchProviders []int  `json:"watch_providers,omitempty"`
 	// Same values as chatContext.ProviderNames, already resolved for
 	// interpretingLine below — reused here so a capability-question answer
-	// can name the caller's services without the agent
-	// needing its own TMDB lookup.
+	// can name the caller's services without the agent needing its own TMDB
+	// lookup. The agent folds them into the text it hands interpret(), which
+	// is what lets that answer cost no model call of its own.
 	WatchProviderNames []string      `json:"watch_provider_names,omitempty"`
 	History            []historyTurn `json:"history,omitempty"`
 	// The caller's whole verdict set; agent/catalog_tool.py's search()
@@ -1582,10 +1606,13 @@ type agentChatRequest struct {
 // back. Title is the one field here that changes which line gets built at
 // all rather than adding a clause to it — a named-title turn skips
 // discover() entirely on the agent side. Every other DiscoverIntent field is
-// here; an omitted field silently vanishes on decode (json.Unmarshal drops
-// unknown keys), so if you add a field to DiscoverIntent that should show up
-// in the interpreting line, it must be added here too — nothing else catches
-// the gap.
+// here, except the three the agent excludes at the source —
+// is_capability_question, clarifying_question and reply, none of which is a
+// search parameter, and the last of which arrives as its own event. An
+// omitted field silently vanishes on decode (json.Unmarshal drops unknown
+// keys), so if you add a field to DiscoverIntent that should show up in the
+// interpreting line, it must be added here too — nothing else catches the
+// gap.
 type agentIntent struct {
 	MediaType         string   `json:"media_type"`
 	Title             string   `json:"title"`

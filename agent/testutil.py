@@ -12,15 +12,24 @@ from typing import Any
 
 import httpx2
 
-from catalog_tool import DiscoverIntent, Ranker, RankResult
+from catalog_tool import (
+    CatalogToolError,
+    ComposedReply,
+    Composer,
+    DiscoverIntent,
+    Interpreter,
+    OutcomeCause,
+    Ranker,
+    RankResult,
+)
 from tmdb import Title, TMDBClient
 
 # services/gateway's constant, hand-copied -- the two services share no code.
 # Nothing enforces the copy: update it by hand when chat.go changes.
 GATEWAY_MAX_HISTORY_EXCHANGES = 5
 
-# The reasons rank() must not be reached, shared so a typo at a call site is
-# a NameError rather than a silently drifted string.
+# The reasons rank() or the outcome composer must not be reached, shared so a
+# typo at a call site is a NameError rather than a silently drifted string.
 DISCOVER_RAISED = "discover() raised"
 NO_CANDIDATES = "no candidates came back"
 ALL_JUDGED = "every candidate was judged"
@@ -167,6 +176,97 @@ def make_intent(**overrides: Any) -> DiscoverIntent:
 
 async def ok_interpret(message: str) -> DiscoverIntent:
     return make_intent()
+
+
+COMPOSED_TEXT = "A sentence the model wrote."
+
+
+class RecordingComposer:
+    """Records every outcome call instead of raising when it is unwanted.
+
+    Recorded rather than raising the way rank_must_not_run does, for the same
+    reason FakeTMDB records requests: compose() wraps anything a Composer
+    raises as CatalogToolError, which _outcome_text degrades from — so a double
+    that raised would answer from the template and assert nothing. A call this
+    turn should not have made is asserted on `calls` after it finishes.
+    """
+
+    def __init__(self, text: str = COMPOSED_TEXT) -> None:
+        self._text = text
+        self.calls: list[tuple[OutcomeCause, str]] = []
+
+    @property
+    def causes(self) -> list[OutcomeCause]:
+        return [cause for cause, _ in self.calls]
+
+    def __call__(self) -> Composer:
+        async def call(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
+            self.calls.append((cause, detail))
+            return ComposedReply(text=self._text)
+
+        return call
+
+
+class CountingModels:
+    """The three model seams, each counting its own calls.
+
+    The per-turn budget is the point: the free tier is 15 requests a minute,
+    so a turn that quietly grew a third call costs the whole app a third of
+    its throughput. Counting here makes "no turn makes more than two Gemini
+    calls" a thing a test reads off the fakes rather than a thing a reviewer
+    believes.
+    """
+
+    def __init__(
+        self,
+        *,
+        intent: DiscoverIntent | None = None,
+        picks: RankResult | None = None,
+        composed: str = COMPOSED_TEXT,
+    ) -> None:
+        self._intent = intent if intent is not None else make_intent()
+        self._picks = picks if picks is not None else RankResult()
+        self.interpret_calls = 0
+        self.rank_calls = 0
+        # Borrowed rather than reimplemented, so there is one place a test
+        # reads what the composer was handed.
+        self.composer = RecordingComposer(composed)
+
+    @property
+    def compose_calls(self) -> int:
+        return len(self.composer.calls)
+
+    @property
+    def total(self) -> int:
+        return self.interpret_calls + self.rank_calls + self.compose_calls
+
+    def interpret(self) -> Interpreter:
+        async def call(message: str) -> DiscoverIntent:
+            self.interpret_calls += 1
+            return self._intent.model_copy(deep=True)
+
+        return call
+
+    def rank(self) -> Ranker:
+        async def call(message: str, candidates: list[Title]) -> RankResult:
+            self.rank_calls += 1
+            return self._picks.model_copy(deep=True)
+
+        return call
+
+    def compose(self) -> Composer:
+        return self.composer()
+
+
+async def ok_compose(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
+    return ComposedReply(text=COMPOSED_TEXT)
+
+
+async def failing_compose(
+    message: str, cause: OutcomeCause, detail: str
+) -> ComposedReply:
+    """Drives chat.py back onto the templates that are now fallbacks."""
+    raise CatalogToolError("composer unavailable")
 
 
 def rank_must_not_run(reason: str) -> Ranker:

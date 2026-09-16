@@ -34,6 +34,9 @@ import {
 interface Turn {
   id: string
   userText: string
+  // The agent's one-line opener, above the interpreting line. Never
+  // rehydrated on reload — the gateway does not store it.
+  reply?: string
   interpreting?: string
   picks?: AgentPick[]
   // Why the search was widened, when it was — see the agent's _relaxed_note.
@@ -44,6 +47,8 @@ interface Turn {
 
 function applyEvent(turn: Turn, ev: ChatEvent): Turn {
   switch (ev.type) {
+    case "reply":
+      return { ...turn, reply: ev.text }
     case "interpreting":
       return { ...turn, interpreting: ev.text }
     case "results":
@@ -135,6 +140,7 @@ function TurnView({
   // is left out because it only ever arrives with `picks`; a Turn field that
   // can arrive alone belongs here, added alongside applyEvent.
   const pending =
+    !turn.reply &&
     !turn.interpreting &&
     !turn.picks &&
     turn.tokenText === undefined &&
@@ -145,6 +151,7 @@ function TurnView({
       <p className="ml-auto w-fit max-w-[85%] rounded-2xl bg-muted px-3 py-2 text-sm">
         {turn.userText}
       </p>
+      {turn.reply && <p className="text-sm">{turn.reply}</p>}
       {turn.interpreting && (
         <p className="text-xs text-muted-foreground italic">
           {turn.interpreting}
