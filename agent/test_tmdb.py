@@ -56,6 +56,117 @@ def test_discover_resolves_names_to_ids() -> None:
     assert params["watch_region"] == "US"
 
 
+def test_discover_rent_carries_no_provider_list() -> None:
+    """The ticked list is what the user subscribes to, which is not what "where
+    can I rent this" asks, so a rent query carries no provider list."""
+    fake = FakeTMDB()
+
+    run(
+        fake.client().discover(
+            media_type="movie", watch_region="US", monetization="rent"
+        )
+    )
+
+    params = fake.params_for("/discover/movie")
+    assert params["with_watch_monetization_types"] == "rent|buy"
+    assert "with_watch_providers" not in params
+    assert params["watch_region"] == "US"
+
+
+def test_discover_rent_rejects_a_provider_list() -> None:
+    """TMDB ANDs the two, so the pair asks which of the user's subscriptions
+    rents the title. A near-empty result would read downstream as "nothing
+    matched", so it raises like the empty-list caller bug beside it."""
+    with pytest.raises(ValueError, match="rent query"):
+        run(
+            FakeTMDB()
+            .client()
+            .discover(
+                media_type="movie",
+                watch_region="US",
+                watch_providers=[8],
+                monetization="rent",
+            )
+        )
+
+
+def test_discover_without_providers_filters_no_availability_at_all() -> None:
+    """A subscription query is filtered by the provider list it accompanies,
+    so without one it adds no availability filter — the same "omit for none"
+    convention discover()'s other optional filters follow. A flatrate default
+    here would silently drop every title the region streams nowhere."""
+    fake = FakeTMDB()
+
+    run(fake.client().discover(media_type="movie", watch_region="US"))
+
+    assert "with_watch_monetization_types" not in fake.params_for("/discover/movie")
+
+
+def test_watch_providers_survives_a_null_provider_list() -> None:
+    """A key present with a null value is absent, not malformed. `.get(k, [])`
+    would not see it that way: the default never fires for a null, and
+    iterating it raises inside this function's own guard, so a title TMDB
+    simply lists nowhere would read as "availability unknown" rather than as
+    not on the caller's services."""
+    fake = FakeTMDB()
+    fake.ok(
+        "/movie/1/watch/providers",
+        {"results": {"US": {"flatrate": None, "rent": None, "buy": None}}},
+    )
+
+    avail = run(
+        fake.client().watch_providers(media_type="movie", tmdb_id=1, watch_region="US")
+    )
+
+    assert avail["flatrate"] == []
+    assert avail["rent"] == []
+
+
+def test_watch_providers_rejects_a_region_row_of_the_wrong_shape() -> None:
+    """A malformed body must not collapse into "not on your services" — that
+    is a confirmed absence read off something unreadable. TMDBError degrades
+    through catalog_tool's _safe to "availability unknown" instead, and keeps
+    enrich_known_title's "never raises" contract, which the watchlist batch
+    depends on."""
+    fake = FakeTMDB()
+    fake.ok("/movie/1/watch/providers", {"results": {"US": ["unexpected"]}})
+
+    with pytest.raises(TMDBError):
+        run(
+            fake.client().watch_providers(
+                media_type="movie", tmdb_id=1, watch_region="US"
+            )
+        )
+
+
+def test_watch_providers_treats_a_missing_region_as_empty_not_malformed() -> None:
+    fake = FakeTMDB()
+    fake.ok("/movie/1/watch/providers", {"results": {"GB": {"flatrate": []}}})
+
+    avail = run(
+        fake.client().watch_providers(media_type="movie", tmdb_id=1, watch_region="US")
+    )
+
+    assert avail == {"link": None, "flatrate": [], "rent": [], "buy": []}
+
+
+def test_watch_providers_drops_a_link_that_is_not_https() -> None:
+    """The one URL this module hands out that it did not build itself; it
+    reaches the browser as an href, so anything unexpected degrades to None
+    and renders as plain text."""
+    fake = FakeTMDB()
+    fake.ok(
+        "/movie/1/watch/providers",
+        {"results": {"US": {"link": "javascript:alert(1)", "flatrate": []}}},
+    )
+
+    avail = run(
+        fake.client().watch_providers(media_type="movie", tmdb_id=1, watch_region="US")
+    )
+
+    assert avail["link"] is None
+
+
 def test_vote_count_floor_always_applied() -> None:
     fake = FakeTMDB()
     run(fake.client().discover(media_type="movie", watch_region="GB"))

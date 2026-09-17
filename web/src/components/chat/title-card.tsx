@@ -53,12 +53,26 @@ function formatRuntime(minutes: number | null): string | null {
 // available_on is null when the availability check itself failed, distinct
 // from an empty array (confirmed on none of the caller's services) — these
 // must read differently, never collapsed to the same "nothing here" state
-// (see AgentPick's own comment, and CLAUDE.md's availability invariant:
-// never show a service list including one the user doesn't have).
+// (see AgentPick's own comment). available_on has already been cut to the
+// user's own services by the agent; rent_on has not been, because those are
+// stores rather than subscriptions.
+//
+// One rule for every card, with no per-turn flag, which is what gives the
+// name-lookup and the watchlist their rent line for free. Included wins over
+// rentable and the two never share a line: a title the user already pays for
+// must not be offered to them for money again. Renting is offered only
+// alongside "Not on your services", so the card says the title isn't included
+// before it says what it would cost to watch. A rent search whose title has
+// no stores in this region therefore reads as the bare "Not on your
+// services" — accurate, and the price of having no per-turn flag.
 function Availability({
   availableOn,
+  rentOn,
+  watchLink,
 }: {
   availableOn: AgentProvider[] | null
+  rentOn: AgentProvider[] | null
+  watchLink: string | null
 }) {
   if (availableOn === null) {
     return (
@@ -67,12 +81,40 @@ function Availability({
       </p>
     )
   }
-  if (availableOn.length === 0) {
-    return <p className="text-xs text-muted-foreground">Not on your services</p>
+  if (availableOn.length > 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Streaming on {availableOn.map((p) => p.provider_name).join(", ")}
+      </p>
+    )
   }
+  const stores = (rentOn ?? []).map((p) => p.provider_name).join(", ")
   return (
     <p className="text-xs text-muted-foreground">
-      Streaming on {availableOn.map((p) => p.provider_name).join(", ")}
+      Not on your services
+      {stores && (
+        <>
+          {" · Rent or buy on "}
+          {/* No price anywhere: TMDB's watch-provider data says where a title
+              can be rented, never for how much, so any figure here would be
+              one we cannot stand behind. py-1 pads the 16px line box so the
+              link is not a hairline target; it is still an inline link in
+              running prose, not the thumb-sized target web/CLAUDE.md asks
+              for elsewhere. */}
+          {watchLink ? (
+            <a
+              href={watchLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-block py-1 text-primary underline underline-offset-4"
+            >
+              {stores}
+            </a>
+          ) : (
+            stores
+          )}
+        </>
+      )}
     </p>
   )
 }
@@ -252,7 +294,11 @@ export function TitleCard({
           </p>
         )}
         {pick.blurb && <p className="text-sm">{pick.blurb}</p>}
-        <Availability availableOn={pick.available_on} />
+        <Availability
+          availableOn={pick.available_on}
+          rentOn={pick.rent_on}
+          watchLink={pick.watch_link}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
       </CardContent>
     </Card>

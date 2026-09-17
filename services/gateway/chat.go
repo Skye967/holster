@@ -1396,8 +1396,17 @@ func interpretingLine(intent agentIntent, providerNames []string) string {
 	if len(intent.Genres) > 0 {
 		subject = strings.Join(intent.Genres, "/") + " " + kind
 	}
+	renting := intent.Monetization == "rent"
 
 	var clauses []string
+	// First, and a clause rather than part of the subject: glued to the noun
+	// it runs into the year clause below — "movies to rent from 1990-1999"
+	// reads as renting from the 1990s. "or buy" because the query is
+	// rent|buy and the cards say "Rent or buy on", so a user who said they
+	// would buy something is not told their request was read as renting.
+	if renting {
+		clauses = append(clauses, "to rent or buy")
+	}
 	switch {
 	case intent.ReleaseYearGte != nil && intent.ReleaseYearLte != nil:
 		clauses = append(clauses, fmt.Sprintf("from %d-%d", *intent.ReleaseYearGte, *intent.ReleaseYearLte))
@@ -1434,8 +1443,10 @@ func interpretingLine(intent agentIntent, providerNames []string) string {
 	// Requires streaming_providers to have a cached row for the caller's
 	// country, kept fresh by providers.go's lazy cache. Until then, or if the
 	// user's picks aren't in it yet, providerNames is empty and this clause is
-	// dropped — degrade the phrasing, never block on it.
-	if len(providerNames) > 0 {
+	// dropped — degrade the phrasing, never block on it. A rent search drops
+	// it too: those services were not the filter, so naming them would claim
+	// a search that did not run.
+	if len(providerNames) > 0 && !renting {
 		line += " on " + humanJoin(providerNames)
 	}
 	return line
@@ -1625,13 +1636,19 @@ type agentIntent struct {
 	MaxRuntimeMinutes *int     `json:"max_runtime_minutes"`
 	ReleaseYearGte    *int     `json:"release_year_gte"`
 	ReleaseYearLte    *int     `json:"release_year_lte"`
+	// "subscription" or "rent" — which of the two questions the turn asked.
+	// interpretingLine adds a clause for it and drops the provider suffix: a
+	// rent search carries no provider list, so naming the user's services
+	// would describe a filter that did not run.
+	Monetization string `json:"monetization"`
 }
 
 // agentPick mirrors one entry of chat.py's "results" event: a tmdb.Title
 // merged with per-title runtime/cast (tmdb.TitleDetails), resolved genre
-// names, availability filtered to the caller's own subscriptions, and
-// rank()'s blurb. Forwarded to the browser close to verbatim — the
-// title-card rendering is the browser's job, not this one's.
+// names, where the title can be watched — streaming filtered to the caller's
+// own subscriptions, rentals not — and rank()'s blurb. Forwarded to the
+// browser close to verbatim: the title-card rendering, including which of
+// the two availability lines a card shows, is the browser's job.
 type agentPick struct {
 	TMDBID         int      `json:"tmdb_id"`
 	MediaType      string   `json:"media_type"`
@@ -1652,7 +1669,19 @@ type agentPick struct {
 	// already round-trips null<->nil and []<->non-nil-empty correctly for a
 	// plain slice, so no extra type (e.g. a pointer) is needed here.
 	AvailableOn []agentProvider `json:"available_on"`
-	Blurb       string          `json:"blurb"`
+	// Where the title can be paid for per view — rent and buy merged, capped
+	// by the agent. nil (JSON null) on the same failed availability check that
+	// nils AvailableOn, and no `omitempty` for the same reason. Unlike
+	// AvailableOn this is not cut to the caller's subscriptions: it names
+	// stores they would pay per title at, not services they pay for monthly.
+	RentOn []agentProvider `json:"rent_on"`
+	// TMDB's own watch page for the title in this region, which is what the
+	// rent store names link to. nil on that same failed check, and also when
+	// TMDB gave no usable page. No `omitempty`: it would drop the key for a
+	// nil pointer, and web/src/lib/chat-socket.ts's AgentPick declares
+	// watch_link as a required `string | null`.
+	WatchLink *string `json:"watch_link"`
+	Blurb     string  `json:"blurb"`
 	// True only for a watchlist row whose TMDB lookup
 	// failed or the id no longer resolves — every other field on such a
 	// row is then a Go zero value, not real data. Absent (false) on every
@@ -1661,10 +1690,11 @@ type agentPick struct {
 }
 
 // agentProvider mirrors one entry of tmdb.py's Provider TypedDict, as used in
-// agentPick.AvailableOn — a minimal, independent decode, same pattern this
-// file already uses twice for overlapping TMDB provider shapes (providers.go's
-// Provider and this file's own cachedProvider each note the other in their
-// doc comments rather than sharing a type). Not providers.go's Provider: that
+// agentPick's AvailableOn and RentOn — a minimal, independent decode, same
+// pattern this file already uses twice for overlapping TMDB provider shapes
+// (providers.go's Provider and this file's own cachedProvider each note the
+// other in their doc comments rather than sharing a type). Not
+// providers.go's Provider: that
 // one also carries DisplayPriority with no `omitempty`, which has no meaning
 // for one title's availability and would leak a bogus "display_priority": 0
 // into every entry sent to the browser. Not cachedProvider either: that one

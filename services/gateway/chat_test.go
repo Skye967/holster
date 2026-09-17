@@ -141,6 +141,59 @@ func TestInterpretingLineReadsMultipleMoodsAsEitherNotBoth(t *testing.T) {
 	}
 }
 
+// A rent search is filtered by region, not by the user's services, so naming
+// them would describe a search that did not run.
+// The rent phrase is a clause, not part of the subject: run into the year
+// clause it reads as renting *from* the 1990s, so the comma is the assertion.
+func TestInterpretingLineSaysRentAndDropsTheProviderClause(t *testing.T) {
+	gte, lte := 1990, 1999
+	line := interpretingLine(agentIntent{
+		MediaType:      "movie",
+		Genres:         []string{"thriller"},
+		Keywords:       []string{"tense"},
+		ReleaseYearGte: &gte,
+		ReleaseYearLte: &lte,
+		Monetization:   "rent",
+	}, []string{"Netflix", "Hulu"})
+
+	if !strings.Contains(line, "thriller movies to rent or buy, from 1990-1999") {
+		t.Errorf("interpretingLine() = %q, want the rent phrase read as its own clause", line)
+	}
+	if !strings.Contains(line, "about tense") {
+		t.Errorf("interpretingLine() = %q, want the mood clause kept", line)
+	}
+	for _, unwanted := range []string{"Netflix", "Hulu"} {
+		if strings.Contains(line, unwanted) {
+			t.Errorf("interpretingLine() = %q, should not name %q", line, unwanted)
+		}
+	}
+}
+
+// The provider clause on a subscription turn is covered by
+// TestInterpretingLineComposesGenreYearRuntimeAndProviders; what is only
+// checked here is that an unset Monetization says nothing about paying.
+func TestInterpretingLineSaysNothingAboutRentingOnASubscriptionTurn(t *testing.T) {
+	line := interpretingLine(agentIntent{MediaType: "movie"}, []string{"Netflix"})
+
+	if strings.Contains(line, "rent") || strings.Contains(line, "buy") {
+		t.Errorf("interpretingLine() = %q, should not mention paying", line)
+	}
+}
+
+func TestAgentIntentDecodesTheMonetizationField(t *testing.T) {
+	// Same hazard TestAgentIntentDecodesTheTitleField pins: an unknown key
+	// vanishes silently on decode, so every rent turn would read as a
+	// subscription one and the line would name services that were not the
+	// filter.
+	var intent agentIntent
+	if err := json.Unmarshal([]byte(`{"media_type":"movie","monetization":"rent"}`), &intent); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if intent.Monetization != "rent" {
+		t.Errorf("agentIntent.Monetization = %q, want %q", intent.Monetization, "rent")
+	}
+}
+
 func TestSummarizePicksDistinguishesALookupFromASuggestion(t *testing.T) {
 	// This text is what a reload renders and what feeds the next turn's
 	// interpret(), so "Suggested" on a lookup would both misreport the turn
@@ -291,12 +344,15 @@ func TestParseProviderNamesResolvesOnlyWantedIDsInOrder(t *testing.T) {
 
 // --- agent HTTP streaming client ------------------------------------------
 
+const watchURL = "https://www.themoviedb.org/movie/949-heat/watch?locale=US"
+
 // assertPickEnrichment checks the enrichment fields (GenreNames,
-// RuntimeMinutes, AvailableOn) shared by TestNewAgentCallerStreamsEventsInOrder
-// (real JSON decode) and TestChatTurnStreamsInterpretingResultsAndDone
-// (gateway passthrough) — one helper so a future field change can't
-// silently diverge between what the two tests check. Cast isn't included:
-// only the first of those two tests asserts on it.
+// RuntimeMinutes, AvailableOn, RentOn, WatchLink) shared by
+// TestNewAgentCallerStreamsEventsInOrder (real JSON decode) and
+// TestChatTurnStreamsInterpretingResultsAndDone (gateway passthrough) — one
+// helper so a future field change can't silently diverge between what the two
+// tests check. Cast isn't included: only the first of those two tests asserts
+// on it.
 func assertPickEnrichment(t *testing.T, pick agentPick) {
 	t.Helper()
 	if len(pick.GenreNames) != 1 || pick.GenreNames[0] != "Crime" {
@@ -307,6 +363,12 @@ func assertPickEnrichment(t *testing.T, pick agentPick) {
 	}
 	if len(pick.AvailableOn) != 1 || pick.AvailableOn[0].ProviderName != "Netflix" {
 		t.Errorf("AvailableOn = %+v, want one entry named Netflix", pick.AvailableOn)
+	}
+	if len(pick.RentOn) != 1 || pick.RentOn[0].ProviderName != "Apple TV" {
+		t.Errorf("RentOn = %+v, want one entry named Apple TV", pick.RentOn)
+	}
+	if pick.WatchLink == nil || *pick.WatchLink != watchURL {
+		t.Errorf("WatchLink = %v, want %q", pick.WatchLink, watchURL)
 	}
 }
 
@@ -323,7 +385,7 @@ func TestNewAgentCallerStreamsEventsInOrder(t *testing.T) {
 		flusher := w.(http.Flusher)
 		for _, line := range []string{
 			`{"type":"intent","intent":{"media_type":"movie"}}`,
-			`{"type":"results","picks":[{"tmdb_id":1,"title":"Fake Heist","genre_names":["Crime"],"runtime_minutes":102,"cast":["Star"],"available_on":[{"provider_id":8,"provider_name":"Netflix"}],"blurb":"fits"}]}`,
+			`{"type":"results","picks":[{"tmdb_id":1,"title":"Fake Heist","genre_names":["Crime"],"runtime_minutes":102,"cast":["Star"],"available_on":[{"provider_id":8,"provider_name":"Netflix"}],"rent_on":[{"provider_id":2,"provider_name":"Apple TV"}],"watch_link":"https://www.themoviedb.org/movie/949-heat/watch?locale=US","blurb":"fits"}]}`,
 			`{"type":"done"}`,
 		} {
 			w.Write([]byte(line + "\n"))
@@ -416,10 +478,10 @@ func TestNewAgentCallerStopsOnContextCancel(t *testing.T) {
 // caller subscribes".
 func TestAgentPickAvailableOnDistinguishesNullFromEmpty(t *testing.T) {
 	var failed, confirmedEmpty agentPick
-	if err := json.Unmarshal([]byte(`{"available_on":null}`), &failed); err != nil {
+	if err := json.Unmarshal([]byte(`{"available_on":null,"rent_on":null}`), &failed); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal([]byte(`{"available_on":[]}`), &confirmedEmpty); err != nil {
+	if err := json.Unmarshal([]byte(`{"available_on":[],"rent_on":[]}`), &confirmedEmpty); err != nil {
 		t.Fatal(err)
 	}
 
@@ -427,10 +489,33 @@ func TestAgentPickAvailableOnDistinguishesNullFromEmpty(t *testing.T) {
 		t.Errorf("AvailableOn = %#v, want nil (the check itself failed)", failed.AvailableOn)
 	}
 	if confirmedEmpty.AvailableOn == nil {
-		t.Error("AvailableOn = nil, want a non-nil empty slice (TMDB confirmed nowhere)")
+		t.Error("AvailableOn = nil, want a non-nil empty slice (confirmed on none of the caller's services)")
 	}
 	if len(confirmedEmpty.AvailableOn) != 0 {
 		t.Errorf("AvailableOn = %#v, want empty", confirmedEmpty.AvailableOn)
+	}
+
+	// RentOn carries the same distinction for the same reason: "couldn't
+	// check" must not render as "nowhere to rent".
+	if failed.RentOn != nil {
+		t.Errorf("RentOn = %#v, want nil (the check itself failed)", failed.RentOn)
+	}
+	if confirmedEmpty.RentOn == nil {
+		t.Error("RentOn = nil, want a non-nil empty slice (TMDB names no rental store)")
+	}
+}
+
+// The browser's AgentPick declares watch_link as a required `string | null`,
+// so the key has to survive a nil round trip rather than being dropped.
+func TestAgentPickWatchLinkSurvivesANilRoundTrip(t *testing.T) {
+	out, err := json.Marshal(agentPick{})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	for _, want := range []string{`"watch_link":null`, `"rent_on":null`} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("json.Marshal() = %s, missing %s", out, want)
+		}
 	}
 }
 
@@ -546,6 +631,7 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 		return chatContext{Region: "US", Providers: []int{8}, ProviderNames: []string{"Netflix"}}, nil
 	}
 	runtimeMinutes := 102
+	watchLink := watchURL
 	callAgent := fakeAgentEvents(
 		agentEvent{Type: "intent", Intent: json.RawMessage(`{"media_type":"movie"}`)},
 		agentEvent{Type: "results", Picks: []agentPick{{
@@ -555,6 +641,8 @@ func TestChatTurnStreamsInterpretingResultsAndDone(t *testing.T) {
 			RuntimeMinutes: &runtimeMinutes,
 			Cast:           []string{"Star"},
 			AvailableOn:    []agentProvider{{ProviderID: 8, ProviderName: "Netflix"}},
+			RentOn:         []agentProvider{{ProviderID: 2, ProviderName: "Apple TV"}},
+			WatchLink:      &watchLink,
 			Blurb:          "fits",
 		}}},
 		agentEvent{Type: "done"},

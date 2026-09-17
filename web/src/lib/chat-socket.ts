@@ -39,6 +39,15 @@ export interface AgentPick {
   // empty array (confirmed available on none of the caller's services).
   // Must render differently: null means "unknown," not "not here."
   available_on: AgentProvider[] | null
+  // Where the title can be paid for per view, rent and buy merged and capped
+  // by the agent. null on the same failed check that nulls available_on.
+  // Unlike available_on it is not cut to the user's own services — these are
+  // stores, not subscriptions — so the card must never read it as "included".
+  rent_on: AgentProvider[] | null
+  // TMDB's watch page for the title, which the rent store names link to.
+  // null on that same failed check, and when the URL wasn't https (the agent
+  // drops it); the card falls back to plain text either way.
+  watch_link: string | null
   blurb: string
   // True only for a watchlist row whose TMDB lookup failed
   // or the id no longer resolves — every other field is then a zero value,
