@@ -134,7 +134,8 @@ on read when older than 24 hours, and served stale if TMDB is unreachable.
 web         → gateway   message
 gateway     → db        load subscriptions, country, every verdict
 gateway     → agent     message + that context
-agent       → tmdb      discover, filtered by subscriptions and region
+agent       → tmdb      discover, filtered by region, and by subscriptions
+                        unless the turn asked to rent
 agent       → gateway   answer
 gateway     → db        persist the exchange
 gateway     → web       answer

@@ -15,10 +15,17 @@ Event shapes on the wire (one JSON object per line):
         "note": str,
         "picks": [{...Title fields, "genre_names":
         [...], "runtime_minutes": int | None, "cast": [...], "available_on":
-        [...Provider fields] | None, "blurb": str}]}
-        -- available_on is None only when the availability check itself
-           failed, distinct from [] (confirmed available nowhere the caller
-           subscribes) — see catalog_tool.py's _safe_availability
+        [...Provider fields] | None, "rent_on": [...Provider fields] | None,
+        "watch_link": str | None, "blurb": str}]}
+        -- available_on and rent_on are None only when the availability check
+           itself failed — see catalog_tool.py's _safe_availability. Empty is
+           a different answer on each: available_on [] means the title streams
+           on none of the caller's own services, rent_on [] that TMDB names no
+           rental store in the region. rent_on is where the title can be paid
+           for per view and is not cut to the caller's services, see
+           catalog_tool.py's _merge_enrichment. watch_link is the region's
+           watch page, None on that same failure or when TMDB gave no usable
+           one
         -- kind is which path search() took, recorded where the branch is
            taken rather than inferred from intent fields afterwards; the
            gateway writes it into stored history (chat.go's summarizePicks)

@@ -17,7 +17,9 @@ about:
   filters by service. Name search does not: ``/search/multi`` takes no region,
   and the availability step that follows it carries one. A ``vote_count.gte``
   floor is always applied to ``discover`` and cannot be overridden; subscription
-  matching is ``flatrate`` only, kept separate from rent/buy.
+  matching is ``flatrate`` only, kept separate from the ``rent|buy`` a caller
+  has to ask for by name. The one URL that arrives whole rather than built
+  here — a title's watch page — is dropped unless it is https.
 - **"Nothing matched" vs "something broke."** No results is an empty list, never
   an exception. Only TMDB being unreachable or returning 429/5xx raises
   (``TMDBUnavailable``), which the caller turns into "try again later" — never a
@@ -83,6 +85,14 @@ MediaType = Literal["movie", "tv"]
 # request it answers better — even "what's new" reads better by vote count. A
 # real "what's new" would be a release-date window on top of vote_count.desc.
 DiscoverSort = Literal["vote_count.desc", "vote_average.desc"]
+# How a discover query is asked to treat availability. "subscription" pairs
+# with a provider list and filters to what those services include; on its own
+# it filters nothing, following the same "omit for none" convention as
+# discover()'s other optional filters. "rent" filters to what can be paid for
+# per title and takes no provider list. TMDB's free/ads types are not offered:
+# "free with ads" is its own claim about where a title can be watched, and
+# nothing here makes it yet.
+Monetization = Literal["subscription", "rent"]
 SearchKind = Literal["person", "keyword"]
 
 # From /genre/movie/list and /genre/tv/list, 2026-09. Frozen rather than fetched:
@@ -199,8 +209,10 @@ class RegionProvider(TypedDict):
 
 class WatchAvailability(TypedDict):
     # flatrate is "included with the subscription"; rent/buy are paid on top and
-    # must never be shown as included. link is the JustWatch-backed
-    # watch page for the region.
+    # must never be shown as included. link is TMDB's own watch page for the
+    # region, carrying the JustWatch-sourced store list — None when TMDB gave
+    # none, and also when the one it gave failed watch_providers' scheme check,
+    # since this one reaches a browser as an href.
     link: str | None
     flatrate: list[Provider]
     rent: list[Provider]
@@ -619,6 +631,7 @@ class TMDBClient:
         release_year_lte: int | None = None,
         sort_by: DiscoverSort = "vote_count.desc",
         min_vote_count: int | None = None,
+        monetization: Monetization = "subscription",
         page: int = 1,
     ) -> list[Title]:
         """The workhorse. TMDB applies every hard constraint here; the model's
@@ -631,6 +644,14 @@ class TMDBClient:
         filters: pass ``None`` (the default) to skip provider filtering
         entirely; an explicit empty list raises ``ValueError`` rather than
         being silently treated the same as ``None``.
+
+        ``monetization="rent"`` asks for what can be paid for per title rather
+        than what a subscription includes, and carries no provider list:
+        ``watch_providers`` is what the user subscribes to (``../CLAUDE.md``:
+        "Users tick what they subscribe to"), and which of their subscriptions
+        rents a title is a different question from where it can be rented.
+        Passing both raises rather than quietly emitting a query that means
+        neither.
         """
         _validate_media_type(media_type)
         _validate_region(watch_region)
@@ -660,14 +681,34 @@ class TMDBClient:
             if not watch_providers:
                 # Omit the parameter for "no filter" — an explicit empty list
                 # is a caller bug, not a request for every provider. Silently
-                # treating [] like None would undo "results only include
-                # services the user ticked" for a zero-subscription caller.
+                # treating [] like None would widen a zero-subscription
+                # caller's query to the whole region instead of refusing it.
                 raise ValueError(
                     "watch_providers must not be empty; omit it (None) for no filter"
                 )
+            if monetization == "rent":
+                # TMDB ANDs the two, so this asks which of the user's own
+                # subscriptions rents the title — a question neither the
+                # caller nor the user asked. Raised rather than resolved
+                # here for the same reason the empty list above is: a caller
+                # bug that returns almost no rows reads downstream as
+                # "nothing matched", which is a different claim.
+                raise ValueError(
+                    "watch_providers has no meaning on a rent query; omit it (None)"
+                )
             ids_str = "|".join(str(int(p)) for p in watch_providers)
             params["with_watch_providers"] = ids_str
-            # Subscription means included, not rentable.
+
+        if monetization == "rent":
+            # "rent|buy", not "rent": a new release is often buy-only for its
+            # first weeks, and a user who has said they will pay for it means
+            # both.
+            params["with_watch_monetization_types"] = "rent|buy"
+        elif watch_providers is not None:
+            # Subscription means included, not rentable. Paired with the
+            # provider list rather than set unconditionally: a query with
+            # neither asked for no availability filter at all, and adding one
+            # here would silently drop every title the region streams nowhere.
             params["with_watch_monetization_types"] = "flatrate"
 
         # Each field is an independent TMDB round trip; run them concurrently.
@@ -800,13 +841,38 @@ class TMDBClient:
         data = await self._get(
             f"/{media_type}/{int(tmdb_id)}/watch/providers", {}, allow_404=True
         )
-        region = (data.get("results") or {}).get(watch_region) or {}
-        return WatchAvailability(
-            link=region.get("link"),
-            flatrate=[_trim_provider(p) for p in region.get("flatrate", [])],
-            rent=[_trim_provider(p) for p in region.get("rent", [])],
-            buy=[_trim_provider(p) for p in region.get("buy", [])],
-        )
+        # Absent is not malformed: no results, no row for this region, or a
+        # null list all mean "nothing here" and yield empty arrays, which the
+        # card reads as "not on your services". A row that is present but the
+        # wrong shape is a different thing and must not collapse into that
+        # answer, so it raises through _unusable and reaches the card as
+        # "availability unknown" instead. Without this, the AttributeError
+        # would escape catalog_tool's _safe, which catches only TMDBError, and
+        # break enrich_known_title's "never raises" contract — taking the
+        # whole watchlist down rather than one row.
+        try:
+            region = (data.get("results") or {}).get(watch_region) or {}
+            link = region.get("link")
+            return WatchAvailability(
+                # Every other URL this module hands out is built here from
+                # IMAGE_BASE (see _image_url); this one arrives whole in a
+                # response body and ends up as an href. Scheme only, and
+                # case-insensitively, RFC 3986 schemes being case-insensitive:
+                # checking the host would be a policy about TMDB's own body
+                # rather than a check that this is a web address at all.
+                # Anything else degrades to None, which callers render as text.
+                link=link
+                if isinstance(link, str) and link.lower().startswith("https://")
+                else None,
+                # `or []`, not a get() default: a key present with a null value
+                # returns None and the default never fires. Same idiom as the
+                # results lookup above and as _trim_title/_trim_details.
+                flatrate=[_trim_provider(p) for p in region.get("flatrate") or []],
+                rent=[_trim_provider(p) for p in region.get("rent") or []],
+                buy=[_trim_provider(p) for p in region.get("buy") or []],
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            _unusable("watch-provider body", exc)
 
     async def watch_provider_list(self, *, watch_region: str) -> list[RegionProvider]:
         """Every provider available in one country, across movies and TV,

@@ -82,7 +82,9 @@ the rating sort, which is the only one a low floor actually misorders. (`search(
 last rung drops the rating sort for a query too narrow to fill under it, which lowers
 the floor as a consequence — the sort is the only thing it sets.) Multiple cast or
 crew names mean *all* of them; multiple mood keywords mean *any*, because TMDB's tag
-data is far too sparse to survive an AND. Subscription matches are `flatrate` only. No
+data is far too sparse to survive an AND. Subscription matches are `flatrate` only; a
+caller wanting rentals asks for them by name (`monetization="rent"`), which filters on
+`rent|buy` and carries no provider list — passing one raises. No
 results is an empty list; only TMDB being unreachable or 429/5xx
 raises `TMDBUnavailable`. It takes no URL, endpoint, or raw query from its caller —
 every path is built here from a validated media type or a literal — and reads no
@@ -95,9 +97,13 @@ or one, when the message names a title and `search()` looks it up instead. A loo
 answers with every title carrying that name — the film itself, and anything carrying
 it on, so "Star Wars" reaches the sequels too.
 `interpret()` turns a message into `DiscoverIntent` — `tmdb.discover()`'s creative
-parameters, with no `watch_region`/`watch_providers` field, so the model can never
-choose which streaming services results come from. `search()` calls `discover()` with
-those parameters plus the caller's real region and providers, and `rank()` has the
+parameters, with no `watch_region`/`watch_providers` field, so which services results
+come from is never the model's choice. What it can choose is whether the turn asks about
+subscriptions or about rentals (`monetization`). `search()` calls `discover()` with
+those parameters plus the caller's real region, and the caller's real providers unless
+the message asked to rent — a rent turn has no provider list to filter on, and what a
+card claims about streaming is cut to the caller's subscriptions either way, when
+availability is merged in. `rank()` has the
 model pick and explain the *real* candidates that came back — its output schema carries
 no title metadata, only a selected id and a blurb, so a manipulated overview can win a
 bad blurb at worst, never assert a fake title. `rank()` says nothing about how many

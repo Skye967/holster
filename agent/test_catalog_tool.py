@@ -707,6 +707,267 @@ def test_search_available_on_excludes_providers_the_user_does_not_have() -> None
     assert [p["provider_id"] for p in pick["available_on"]] == [8]
 
 
+async def _rent_interpret(_: str) -> DiscoverIntent:
+    return make_intent(monetization="rent")
+
+
+def test_search_rent_turn_queries_by_region_without_the_provider_list() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    fake_tmdb.ok("/movie/101/watch/providers", {"results": {"US": {}}})
+
+    run(
+        search(
+            "a thriller I can rent tonight",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8, 9],
+            interpret_model=_rent_interpret,
+            rank_model=_rank_first,
+        )
+    )
+
+    params = fake_tmdb.params_for("/discover/movie")
+    assert params["with_watch_monetization_types"] == "rent|buy"
+    assert "with_watch_providers" not in params
+    assert params["watch_region"] == "US"
+    # The floors a rent turn must not escape just by taking a different branch.
+    assert params["vote_count.gte"] == str(tmdb.MIN_VOTE_COUNT)
+
+
+def test_search_rent_turn_still_cuts_streaming_to_the_users_services() -> None:
+    """A rent query passes no provider list, so this filter is the whole of
+    what keeps "Streaming on" to services the caller has — where a
+    subscription turn also has discover()'s own filter behind it."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    fake_tmdb.ok(
+        "/movie/101/watch/providers",
+        {"results": {"US": {"flatrate": [NETFLIX], "rent": [APPLE_TV]}}},
+    )
+
+    result = run(
+        search(
+            "a thriller I can rent tonight",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[9],  # not 8 — Netflix is not theirs
+            interpret_model=_rent_interpret,
+            rank_model=_rank_first,
+        )
+    )
+
+    [pick] = result.picks
+    assert pick["available_on"] == []
+    assert [p["provider_id"] for p in pick["rent_on"]] == [2]
+
+
+def test_search_rent_turn_walks_the_same_ladder() -> None:
+    """Rent changes which query runs, not how a thin one is widened: the rungs
+    drop in the same order and every one of them stays a rent query."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/keyword", {"results": [{"id": 9748, "name": "heist"}]})
+    for _ in range(4):
+        fake_tmdb.ok("/discover/movie", {"results": []})
+
+    async def fake_interpret(_: str) -> DiscoverIntent:
+        return make_intent(
+            monetization="rent",
+            keywords=["heist"],
+            max_runtime_minutes=90,
+            release_year_gte=1990,
+        )
+
+    result = run(
+        search(
+            "a heist I can rent, under 90 minutes, from the 90s",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(NO_CANDIDATES),
+        )
+    )
+
+    assert result.relaxed == ["keywords", "runtime", "year"]
+    for params in fake_tmdb.all_params_for("/discover/movie"):
+        assert params["with_watch_monetization_types"] == "rent|buy"
+        assert "with_watch_providers" not in params
+
+
+def test_search_rent_turn_naming_a_title_still_takes_the_lookup_path() -> None:
+    """A message naming a title asks about that title. lookup_title() filters
+    by no provider already, so the rent answer is the card's own rent line —
+    no discover() query runs at all."""
+    fake_tmdb = FakeTMDB()
+    _queue_title_lookup(fake_tmdb, raw_named(1, "Heat", 8658))
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=1,
+        title="Heat",
+        flatrate=[],
+        rent=[APPLE_TV],
+        link=WATCH_LINK,
+    )
+
+    async def fake_interpret(_: str) -> DiscoverIntent:
+        return make_intent(title="Heat", monetization="rent")
+
+    result = run(
+        search(
+            "can I rent Heat?",
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            interpret_model=fake_interpret,
+            rank_model=rank_must_not_run(TITLE_LOOKUP),
+        )
+    )
+
+    assert result.kind == "lookup"
+    assert fake_tmdb.all_params_for("/discover/movie") == []
+    [pick] = result.picks
+    assert pick["available_on"] == []
+    assert [p["provider_name"] for p in pick["rent_on"]] == ["Apple TV"]
+    assert pick["watch_link"] == WATCH_LINK
+
+
+def test_rent_on_merges_rent_and_buy_without_repeating_a_store() -> None:
+    """A store offering both is one store to the reader, and a buy-only store
+    still counts — a new release is often buy-only for weeks."""
+    fake_tmdb = FakeTMDB()
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=101,
+        title="Heat",
+        flatrate=[],
+        rent=[APPLE_TV, AMAZON],
+        buy=[APPLE_TV],
+        link=WATCH_LINK,
+    )
+
+    pick = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+
+    assert [p["provider_id"] for p in pick["rent_on"]] == [2, 10]
+    assert pick["watch_link"] == WATCH_LINK
+
+
+def test_rent_on_drops_a_nameless_store_before_the_cap() -> None:
+    """The names are the card's link text, so a nameless store would spend a
+    slot and leave the link labelled with a bare separator."""
+    fake_tmdb = FakeTMDB()
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=101,
+        title="Heat",
+        flatrate=[],
+        rent=[
+            {"provider_id": 99, "provider_name": "", "logo_path": None},
+            # Whitespace is truthy in both languages, so it would take a slot
+            # and leave the card's link with nothing readable in it.
+            {"provider_id": 98, "provider_name": "   ", "logo_path": None},
+            APPLE_TV,
+            AMAZON,
+            {"provider_id": 3, "provider_name": "Google Play", "logo_path": None},
+        ],
+    )
+
+    pick = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+
+    assert [p["provider_name"] for p in pick["rent_on"]] == [
+        "Apple TV",
+        "Amazon Video",
+        "Google Play",
+    ]
+
+
+def test_rent_on_is_capped() -> None:
+    fake_tmdb = FakeTMDB()
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=101,
+        title="Heat",
+        flatrate=[],
+        rent=[
+            {"provider_id": i, "provider_name": f"Store {i}"}
+            for i in range(catalog_tool.RENT_STORE_LIMIT + 2)
+        ],
+    )
+
+    pick = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+
+    assert len(pick["rent_on"]) == catalog_tool.RENT_STORE_LIMIT
+
+
+def test_rent_on_is_not_filtered_to_the_users_subscriptions() -> None:
+    """The mirror of available_on's filter, deliberately absent: `wanted` is
+    what the user subscribes to, and a store is where they would pay per
+    title, so filtering would empty the line for every user."""
+    fake_tmdb = FakeTMDB()
+    _queue_enrichment(
+        fake_tmdb,
+        media_type="movie",
+        tmdb_id=101,
+        title="Heat",
+        flatrate=[],
+        rent=[APPLE_TV],
+    )
+
+    pick = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+
+    assert [p["provider_id"] for p in pick["rent_on"]] == [2]
+
+
+def test_rent_on_and_watch_link_are_none_when_the_check_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """None, not [] — "couldn't check" must never read as "nowhere to rent",
+    the same distinction available_on already draws."""
+    monkeypatch.setattr(tmdb, "_sleep", AsyncMock())
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok(
+        "/movie/101",
+        {"id": 101, "release_date": "2020-01-01", "runtime": 90, "credits": {}},
+    )
+    fake_tmdb.queue(
+        "/movie/101/watch/providers", *[httpx2.Response(503) for _ in range(3)]
+    )
+
+    pick = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+
+    assert pick["available_on"] is None
+    assert pick["rent_on"] is None
+    assert pick["watch_link"] is None
+
+
+def test_unavailable_placeholder_reports_availability_as_unknown_not_absent() -> None:
+    """A degraded row's availability is None, never [] — [] would render a
+    broken watchlist row as a confirmed "nowhere to rent" drawn from a lookup
+    that never happened."""
+    assert _UNAVAILABLE_PLACEHOLDER["available_on"] is None
+    assert _UNAVAILABLE_PLACEHOLDER["rent_on"] is None
+    assert _UNAVAILABLE_PLACEHOLDER["watch_link"] is None
+
+
+def test_unavailable_placeholder_carries_every_key_a_resolved_pick_has() -> None:
+    """enrich_known_title's contract: a degraded row and a resolved one have
+    the same key set, or services/gateway/chat.go's agentPick decodes missing
+    arrays as nil and re-marshals them as JSON null."""
+    fake_tmdb = FakeTMDB()
+    _queue_enrichment(
+        fake_tmdb, media_type="movie", tmdb_id=101, title="Heat", flatrate=[NETFLIX]
+    )
+
+    resolved = run(enrich_known_title(fake_tmdb.client(), "US", {8}, "movie", 101))
+    degraded = {"tmdb_id": 101, "media_type": "movie", **_UNAVAILABLE_PLACEHOLDER}
+
+    assert set(degraded) == set(resolved)
+
+
 def test_search_enrichment_only_runs_for_final_ranked_picks() -> None:
     """More candidates than RESULT_FLOOR, so the floor top-up cannot be what
     keeps the last one out: rank() picked one, the top-up filled to the floor,
@@ -1552,6 +1813,9 @@ def _queue_enrichment(
     tmdb_id: int,
     title: str,
     flatrate: list[dict[str, Any]],
+    rent: list[dict[str, Any]] | None = None,
+    buy: list[dict[str, Any]] | None = None,
+    link: str | None = None,
 ) -> None:
     fake_tmdb.ok(
         f"/{media_type}/{tmdb_id}",
@@ -1571,11 +1835,23 @@ def _queue_enrichment(
     )
     fake_tmdb.ok(
         f"/{media_type}/{tmdb_id}/watch/providers",
-        {"results": {"US": {"flatrate": flatrate}}},
+        {
+            "results": {
+                "US": {
+                    "flatrate": flatrate,
+                    "rent": rent or [],
+                    "buy": buy or [],
+                    "link": link,
+                }
+            }
+        },
     )
 
 
 NETFLIX = {"provider_id": 8, "provider_name": "Netflix", "logo_path": None}
+APPLE_TV = {"provider_id": 2, "provider_name": "Apple TV", "logo_path": None}
+AMAZON = {"provider_id": 10, "provider_name": "Amazon Video", "logo_path": None}
+WATCH_LINK = "https://www.themoviedb.org/movie/949-heat/watch?locale=US"
 
 
 def test_search_looks_a_named_title_up_instead_of_discovering() -> None:
