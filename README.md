@@ -16,7 +16,7 @@ the whole stack comes up from a single `docker compose up --build`.
 | Component | Stack | Status |
 |---|---|---|
 | `web/` | Next.js, TypeScript, Tailwind, shadcn/ui | Built — in `docker-compose.yml` |
-| `services/gateway/` | Go | Built — in `docker-compose.yml` |
+| `gateway/` | Go | Built — in `docker-compose.yml` |
 | `agent/` | Python, FastAPI, LangChain | Built — in `docker-compose.yml` |
 | `db/` | Supabase (PostgreSQL) | Schema + RLS in place |
 
@@ -38,7 +38,7 @@ connect, and nothing to leak.
 ```mermaid
 flowchart TD
     U([User]) --> W["web/<br/>Next.js + Clerk"]
-    W --> G["services/gateway/<br/>Go — the only exposed service"]
+    W --> G["gateway/<br/>Go — the only exposed service"]
     G --> AG["agent/<br/>Python + LangChain"]
     G --> DB[("Supabase<br/>PostgreSQL")]
     AG -->|"catalog query"| TMDB([TMDB])
@@ -144,8 +144,7 @@ host both callers share one URL.
 ```
 holster/
 ├── web/                  Next.js frontend
-├── services/
-│   └── gateway/          request handling, all database writes
+├── gateway/              request handling, all database writes
 ├── agent/                LangChain agent and catalog tools
 ├── db/                   Schema reference
 ├── supabase/migrations/  Supabase migrations

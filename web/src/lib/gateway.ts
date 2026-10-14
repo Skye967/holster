@@ -8,7 +8,7 @@ export class GatewaySessionExpiredError extends Error {}
 // Shared by every call site needing a bound on a gateway round trip that may
 // include gatewayFetch's own 401-retry (subscriptions.ts, chat-socket.ts).
 // Sized against the worst case: subscriptions.ts's /api/subscriptions call
-// can block on providersRefreshTimeout (15s, services/gateway/providers.go).
+// can block on providersRefreshTimeout (15s, gateway/providers.go).
 // chat-socket.ts's mintTicket has no such I/O — it just rides along at the
 // same bound.
 export const GATEWAY_CALL_TIMEOUT_MS = 10000

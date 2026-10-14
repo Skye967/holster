@@ -1,4 +1,4 @@
-# Two stages, mirroring services/gateway/Dockerfile: build the virtualenv with
+# Two stages, mirroring gateway/Dockerfile: build the virtualenv with
 # uv, then copy only the venv and source into a clean runtime image.
 FROM python:3.13-slim AS builder
 

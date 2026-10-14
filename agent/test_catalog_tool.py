@@ -955,7 +955,7 @@ def test_unavailable_placeholder_reports_availability_as_unknown_not_absent() ->
 
 def test_unavailable_placeholder_carries_every_key_a_resolved_pick_has() -> None:
     """enrich_known_title's contract: a degraded row and a resolved one have
-    the same key set, or services/gateway/chat.go's agentPick decodes missing
+    the same key set, or gateway/chat.go's agentPick decodes missing
     arrays as nil and re-marshals them as JSON null."""
     fake_tmdb = FakeTMDB()
     _queue_enrichment(

@@ -26,7 +26,7 @@ import {
 import { fetchWatchlist } from "@/lib/watchlist"
 
 // A saved title whose base TMDB lookup failed or no longer resolves
-// (pick.unavailable — services/gateway/chat.go's agentPick.Unavailable).
+// (pick.unavailable — gateway/chat.go's agentPick.Unavailable).
 // title_verdicts is stored data, which degrades rather than fails
 // (ARCHITECTURE.md's Failure rules), so the row still has to appear with a way to clear it,
 // not vanish — kept as its own small component rather than teaching

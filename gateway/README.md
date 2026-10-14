@@ -26,7 +26,7 @@ Under `docker compose up` the variables come from the repo-root `.env`. To run i
 directly, export them first:
 
 ```sh
-set -a; source ../../.env; set +a
+set -a; source ../.env; set +a
 DATABASE_URL=postgresql://gateway_app:password@localhost:5432/holster go run .
 ```
 

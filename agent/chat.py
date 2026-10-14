@@ -38,7 +38,7 @@ Event shapes on the wire (one JSON object per line):
                                           Ephemeral: it is written before any
                                           result exists, so it is never stored
                                           as the turn's assistant text (see
-                                          services/gateway/chat.go's runTurn)
+                                          gateway/chat.go's runTurn)
     {"type": "message", "text": str}   -- a plain reply with no candidates
                                            (no subscriptions, capability
                                            question, clarifying question, a
@@ -94,7 +94,7 @@ logger = logging.getLogger("holster.chat")
 # prompt, not an unbounded one.
 #
 # Counted in messages, not exchanges: HistoryTurn is one row. Deliberately well
-# clear of services/gateway's windowHistory (maxHistoryExchanges*2 = 10), which
+# clear of gateway's windowHistory (maxHistoryExchanges*2 = 10), which
 # is the real policy — a backstop sitting at the operating point stops being a
 # backstop and silently becomes a second, tighter window.
 MAX_HISTORY_TURNS = 20
@@ -124,7 +124,7 @@ COMPOSE_TIMEOUT_SECONDS = 5.0
 # Hand-written, and the one turn that reaches no model at all. Composing it
 # would put the first message most new visitors ever see behind a call on a
 # 15-request-a-minute tier, to rephrase advice that is always the same; it
-# would also make a frame that services/gateway/chat.go meters neither by its
+# would also make a frame that gateway/chat.go meters neither by its
 # guest turn cap nor by its per-IP limiter — both gated on the frame carrying
 # providers — cost a model call.
 NO_PROVIDERS_MESSAGE = (
@@ -198,7 +198,7 @@ def _with_history(message: str, history: list[HistoryTurn]) -> str:
 
 
 def _human_join(items: Sequence[str]) -> str:
-    """ "Netflix, Hulu and Max" — mirrors services/gateway/chat.go's
+    """ "Netflix, Hulu and Max" — mirrors gateway/chat.go's
     humanJoin so the same kind of list reads the same way wherever it
     reaches the user (the interpreting line, a capability answer, here)."""
     if not items:
@@ -308,8 +308,8 @@ def _relaxed_note(relaxed: Sequence[str], exact_matches: int, total: int) -> str
 
 def _capability_message(provider_names: Sequence[str]) -> str:
     """The fallback for a capability turn whose model-written reply came back
-    blank or missing. Keeping it is what holds the guarantee services/gateway/
-    chat.go's runTurn relies on for "message": that its text is never empty,
+    blank or missing. Keeping it is what holds the guarantee gateway/chat.go's
+    runTurn relies on for "message": that its text is never empty,
     and so can be stored as the turn's answer unguarded.
 
     Names the caller's own services (if
@@ -389,7 +389,7 @@ def _error_reason(exc: Exception) -> str:
     model, so this is a bug, not a "try later" case — hence "internal", not
     a TMDB-specific code.
 
-    Keep this set in sync by hand with ../services/gateway/chat.go's
+    Keep this set in sync by hand with gateway/chat.go's
     friendlyError(), which maps each of these three strings to user-facing
     copy — its own default case logs anything it doesn't recognize, so a
     drift here surfaces as a gateway log line, not silent degradation.
@@ -409,7 +409,7 @@ async def stream_chat(
     rank_model: Ranker,
     compose_model: Composer,
 ) -> AsyncGenerator[dict[str, Any]]:
-    # services/gateway's runTurn skips loading verdicts entirely for a caller
+    # gateway's runTurn skips loading verdicts entirely for a caller
     # with no ticked services, on the strength of this early return — and its
     # guest throttle meters only frames that carry providers, on the strength
     # of this turn reaching no model.

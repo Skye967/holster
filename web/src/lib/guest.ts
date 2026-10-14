@@ -6,11 +6,11 @@
 
 export const GUEST_PROVIDERS_COOKIE = "guest_providers"
 
-// Mirrors services/gateway/chat.go's maxGuestProviders — the gateway rejects
+// Mirrors gateway/chat.go's maxGuestProviders — the gateway rejects
 // a longer list as a malformed frame, so never let one reach the wire.
 export const MAX_GUEST_PROVIDERS = 50
 
-// Mirrors services/gateway/chat.go's maxProviderID. TMDB's ids are four
+// Mirrors gateway/chat.go's maxProviderID. TMDB's ids are four
 // digits; the ceiling only has to be low enough that Number.isInteger's
 // acceptance of 1e21 can't put a nonsense id in the cookie and, from there,
 // into setSubscription at sign-in.

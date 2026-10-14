@@ -342,7 +342,7 @@ RESULT_CEILING = 10
 # exclude-by-id parameter, so the shown set is filtered here, and a fixed depth
 # means a long conversation runs a query dry that still has pages.
 #
-# 500 rows is far past a guest's reach (services/gateway/chat.go's
+# 500 rows is far past a guest's reach (gateway/chat.go's
 # defaultGuestTurnCap turns of at most RESULT_CEILING cards). An account's set
 # has no cap at all, so this is a ceiling on the read rather than a claim about
 # the set. What keeps a pathological query from spending the whole ladder
@@ -366,7 +366,7 @@ DISCOVER_BATCH_PAGES = 3
 # Which path search() took. Set where the branch is actually taken, not
 # re-derived downstream from intent.title: the two agree today, but they are
 # not the same question, and stored history is where a wrong answer compounds
-# (services/gateway/chat.go's summarizePicks writes it, and the next turn's
+# (gateway/chat.go's summarizePicks writes it, and the next turn's
 # interpret() reads it back).
 CatalogKind = Literal["search", "lookup"]
 
@@ -377,7 +377,7 @@ CatalogKind = Literal["search", "lookup"]
 #
 # A caller with no ticked services is not here: that turn answers from
 # chat.py's NO_PROVIDERS_MESSAGE without reaching a model at all, which is what
-# services/gateway/chat.go's guest throttle assumes when it meters only frames
+# gateway/chat.go's guest throttle assumes when it meters only frames
 # carrying providers.
 OutcomeCause = Literal["nothing_matched", "all_shown", "all_judged", "title_not_found"]
 
@@ -751,7 +751,7 @@ async def enrich_known_title(
     still carries every key a resolved pick does (_UNAVAILABLE_PLACEHOLDER),
     enough for the caller to render a minimal row with a working remove
     action instead of losing the row silently. Same key set either way, on
-    purpose: services/gateway/chat.go's agentPick and web/src/lib/chat-socket.ts's
+    purpose: gateway/chat.go's agentPick and web/src/lib/chat-socket.ts's
     AgentPick declare genre_ids/genre_names/cast as plain (non-nullable)
     arrays — a sparse dict missing those keys would decode as Go nil slices
     and re-marshal as JSON null, breaking that contract for a case nothing
@@ -937,7 +937,7 @@ async def lookup_title(
     _enrich_pick, not enrich_known_title: the Title is already in hand from
     the search, so a failed details call costs runtime and cast, never the
     name. enrich_known_title's _UNAVAILABLE_PLACEHOLDER would blank the card
-    instead, and both services/gateway/chat.go's agentPick and
+    instead, and both gateway/chat.go's agentPick and
     web/src/lib/chat-socket.ts's AgentPick document `unavailable` as absent on
     every /chat pick.
 
@@ -977,7 +977,7 @@ class TitleRef(BaseModel):
 
 class TitleVerdict(BaseModel):
     """One title_verdicts row as /chat receives it — the
-    gateway's Verdict struct (services/gateway/verdicts.go), field for field.
+    gateway's Verdict struct (gateway/verdicts.go), field for field.
 
     verdict is a plain str, not a Literal, while media_type is a Literal:
     media_type reaches a URL path, but verdict reaches only search()'s two
@@ -1230,7 +1230,7 @@ async def search(
 
     ``intent.monetization`` also reaches the gateway, which says so in the
     interpreting line and drops its provider clause there
-    (services/gateway/chat.go's interpretingLine). It does not reach the
+    (gateway/chat.go's interpretingLine). It does not reach the
     lookup path: a message naming a title is answered below before any query
     runs, and that path filters by no provider anyway, so "can I rent Heat"
     is answered by the card's own rent line rather than a different search.
@@ -1354,7 +1354,7 @@ async def search(
     # After on_intent, not before: a lookup still costs a search plus per-title
     # details and availability, so it needs an interpreting line as much as a
     # discover() turn does. The gateway templates a different one off
-    # intent.title (services/gateway/chat.go's interpretingLine).
+    # intent.title (gateway/chat.go's interpretingLine).
     if intent.title:
         picks = await lookup_title(
             intent.title,

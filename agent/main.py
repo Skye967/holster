@@ -39,9 +39,8 @@ from catalog_tool import (
 from chat import ChatRequest, stream_chat
 from tmdb import RegionProvider, TMDBClient
 
-# Header the gateway mints at the edge and forwards inward — see
-# services/gateway and ARCHITECTURE.md. Lower-case per the ASGI/HTTP2 norm;
-# HTTP header names are case-insensitive so clients and the gateway still match.
+# Lower-case because the ASGI server lower-cases header names in scope, so the
+# byte-exact lookup in CorrelationIdMiddleware matches a sender's X-Correlation-ID.
 CORRELATION_ID_HEADER = "x-correlation-id"
 
 # Set per request by CorrelationIdMiddleware, read by JsonFormatter so every line
