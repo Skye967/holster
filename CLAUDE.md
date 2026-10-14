@@ -129,7 +129,7 @@ features: connection management, and one chat. Resist additions.
 | Path | Stack |
 |---|---|
 | `web/` | Next.js, TypeScript, Tailwind, shadcn/ui, Clerk |
-| `services/gateway/` | Go |
+| `gateway/` | Go |
 | `agent/` | Python, FastAPI, LangChain |
 | `db/` | Supabase (PostgreSQL) |
 

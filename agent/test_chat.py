@@ -99,7 +99,7 @@ def test_no_providers_short_circuits_with_a_message() -> None:
 
     assert [e["type"] for e in events] == ["message", "done"]
     assert "Connections" in events[0]["text"]
-    # No model call at all, which is the property services/gateway/chat.go's
+    # No model call at all, which is the property gateway/chat.go's
     # guest throttle rests on: it meters a frame by the turn cap and the
     # per-IP limiter only when that frame carries providers.
     assert composer.calls == []
@@ -131,8 +131,8 @@ def test_capability_question_short_circuits_with_a_message() -> None:
     # question (catalog_tool.py's search()), so there is nothing to
     # translate into an interpreting line.
     assert [e["type"] for e in events] == ["message", "done"]
-    # "Netflix and Hulu", not "Netflix, Hulu" — matches services/gateway/
-    # chat.go's humanJoin, used for the same provider list elsewhere in the
+    # "Netflix and Hulu", not "Netflix, Hulu" — matches gateway/chat.go's
+    # humanJoin, used for the same provider list elsewhere in the
     # same conversation (the interpreting line).
     assert "Netflix and Hulu" in events[0]["text"]
     assert fake_tmdb.requests == []
@@ -476,7 +476,7 @@ def test_early_disconnect_cancels_the_background_search() -> None:
 
 def test_chat_request_parses_the_gateways_verdict_json_verbatim() -> None:
     """The one place the Go->Python verdict contract is checked. The gateway
-    marshals its own Verdict struct (services/gateway/verdicts.go), which is
+    marshals its own Verdict struct (gateway/verdicts.go), which is
     also the GET /api/verdicts response body and is mirrored a third time in
     web/src/lib/verdicts.ts -- so a rename made to suit the browser would
     otherwise reach production as a 422 on every chat turn, with the Go and
@@ -506,7 +506,7 @@ def test_chat_request_defaults_verdicts_when_the_gateway_omits_them() -> None:
     sends no key at all. Validated from a body because that is the shape
     omitempty produces — the key absent rather than null.
     The key must be absent, not null; omitempty on the Go side is what
-    guarantees that, and services/gateway/verdicts_test.go pins it there."""
+    guarantees that, and gateway/verdicts_test.go pins it there."""
     req = ChatRequest.model_validate(
         {"message": "hi", "watch_region": "US", "watch_providers": [8]}
     )
@@ -640,7 +640,7 @@ def test_unresolvable_title_falls_back_to_a_template_quoting_the_name() -> None:
 
 
 def test_results_event_marks_a_lookup_so_history_says_what_happened() -> None:
-    """services/gateway/chat.go's summarizePicks reads this to choose between
+    """gateway/chat.go's summarizePicks reads this to choose between
     "Looked up:" and "Suggested:", and that text is what the next turn's
     interpret() sees. Drop the field and a lookup is stored, and read back,
     as a recommendation the assistant never made."""
@@ -665,7 +665,7 @@ def test_results_event_marks_a_lookup_so_history_says_what_happened() -> None:
 
 
 def test_intent_event_carries_the_title_for_the_gateways_line() -> None:
-    """services/gateway/chat.go's interpretingLine templates off this field —
+    """gateway/chat.go's interpretingLine templates off this field —
     excluded from the dump and the gateway silently says "Looking for movies"
     over a title lookup."""
     fake_tmdb = FakeTMDB()
@@ -885,7 +885,7 @@ def test_the_opener_arrives_before_the_interpreting_line() -> None:
 
 
 def test_the_opener_is_not_a_search_parameter() -> None:
-    """services/gateway's interpretingLine templates off the intent event, and
+    """gateway's interpretingLine templates off the intent event, and
     agentIntent decodes only search fields — an opener arriving in there would
     be silently dropped there and duplicated here."""
     fake_tmdb = FakeTMDB()

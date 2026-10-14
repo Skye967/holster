@@ -65,8 +65,9 @@ Both keys are app-level: neither opens any user's account, so losing one costs a
 rotation, not a user. See `CLAUDE.md`.
 
 Logs are structured JSON to stdout, nothing else — routing and retention belong to
-whatever runs the container. Each line carries the `X-Correlation-ID` the gateway
-minted, so a request can be followed across services.
+whatever runs the container. Lines logged while handling a request carry its
+correlation id — adopted from an inbound `X-Correlation-ID` when one arrives, minted
+here otherwise.
 
 ## TMDB client
 
@@ -236,7 +237,7 @@ disagree. A composer call that fails or outlives `COMPOSE_TIMEOUT_SECONDS` falls
 the template beside it rather than costing a turn the answer it already has.
 
 What stays hand-written: `chat.py`'s `NO_PROVIDERS_MESSAGE`, because that turn reaches
-no model at all and is the first message most new visitors see; `services/gateway/chat.go`'s
+no model at all and is the first message most new visitors see; `gateway/chat.go`'s
 error copy, guest cap and rate-limit line, because if the model is what failed it cannot
 write its own apology; and `_relaxed_note`, whose count is computed after `rank()` has cut
 the picks, so no call is in flight to write it.
@@ -262,7 +263,7 @@ a recommendation is decided here, in `search()`:
 That second one is order-sensitive. The gateway sends verdicts newest-first and the
 agent keeps the first few likes it sees, so the ordering is a contract rather than a
 detail — `TitleVerdict` carries no timestamp, so the agent cannot re-sort, or even
-notice if the order is lost. `services/gateway/verdicts.go` explains where that
+notice if the order is lost. `gateway/verdicts.go` explains where that
 ordering is itself only a proxy.
 
 **Cold start:** a brand-new account has `verdicts == []` and

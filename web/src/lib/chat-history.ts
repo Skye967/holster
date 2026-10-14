@@ -5,7 +5,7 @@ import {
   type GetToken,
 } from "@/lib/gateway"
 
-// Mirrors services/gateway/conversations.go's conversationTurn — field names
+// Mirrors gateway/conversations.go's conversationTurn — field names
 // must match its JSON tags exactly.
 export interface ConversationTurn {
   user_text: string

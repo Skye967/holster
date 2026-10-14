@@ -21,7 +21,7 @@ yarn-error.log*
 bin/
 vendor/
 # `go build` in the service directory drops a binary named after the module.
-/services/gateway/gateway
+/gateway/gateway
 
 # Python
 __pycache__/

@@ -24,7 +24,7 @@ from catalog_tool import (
 )
 from tmdb import Title, TMDBClient
 
-# services/gateway's constant, hand-copied -- the two services share no code.
+# gateway's constant, hand-copied -- the two services share no code.
 # Nothing enforces the copy: update it by hand when chat.go changes.
 GATEWAY_MAX_HISTORY_EXCHANGES = 5
 

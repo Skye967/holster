@@ -1,4 +1,4 @@
-# Two stages, mirroring agent/Dockerfile and services/gateway/Dockerfile: build
+# Two stages, mirroring agent/Dockerfile and gateway/Dockerfile: build
 # with bun (this repo's package manager, per ../CLAUDE.md), then copy only the
 # standalone output into a clean runtime image.
 #

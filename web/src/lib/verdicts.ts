@@ -5,7 +5,7 @@ import {
   type GetToken,
 } from "@/lib/gateway"
 
-// Mirrors services/gateway/verdicts.go's Verdict — field names must match its
+// Mirrors gateway/verdicts.go's Verdict — field names must match its
 // JSON tags exactly.
 export type Verdict =
   "liked" | "disliked" | "seen" | "not_interested" | "want_to_watch"
@@ -75,4 +75,3 @@ export async function fetchVerdicts(
   if (!res.ok) throw new Error(`status ${res.status}`)
   return res.json()
 }
-

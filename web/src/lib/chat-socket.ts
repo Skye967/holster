@@ -1,7 +1,7 @@
 // One WebSocket per chat session (ARCHITECTURE.md's "One socket per session"),
 // opened with a single-use ticket minted from POST /api/chat/ticket —
 // browsers can't set an Authorization header on a WS upgrade, so this is
-// the only way the connection gets authenticated (services/gateway/chat.go).
+// the only way the connection gets authenticated (gateway/chat.go).
 
 import { useAuth } from "@clerk/nextjs"
 import { useCallback, useEffect, useRef, useState } from "react"
@@ -20,7 +20,7 @@ export interface AgentProvider {
   logo_url: string | null
 }
 
-// Mirrors services/gateway/chat.go's agentPick — forwarded to the browser
+// Mirrors gateway/chat.go's agentPick — forwarded to the browser
 // close to verbatim, so field names must match its JSON tags exactly.
 export interface AgentPick {
   tmdb_id: number
@@ -57,14 +57,14 @@ export interface AgentPick {
 
 // The gateway's curated event vocabulary (outboundEvent in chat.go) — every
 // event carries `turn`, since sendEvent always sets it before writing.
-// relaxed is optional, not just possibly-empty: services/gateway/chat.go's
+// relaxed is optional, not just possibly-empty: gateway/chat.go's
 // outboundEvent tags it `json:"relaxed,omitempty"`, so the key is absent
 // from the wire entirely whenever nothing was relaxed (the common case) —
 // typing it as always-present string[] would be a lie the JSON.parse cast
 // below can't catch. conversation_created carries nothing beyond turn: it
 // isn't rendered inline in any turn's UI, and chat-session-provider.tsx
 // intercepts it — telling the sidebar to refetch — before it ever reaches a
-// ChatPanel (see that file and services/gateway/chat.go's finishTurn).
+// ChatPanel (see that file and gateway/chat.go's finishTurn).
 // `reply` is the agent's model-written opener, sent ahead of `interpreting`
 // and rendered above it. Separate from `token` because a token renders below
 // the cards and a later `message` on the same turn replaces it; the gateway
@@ -88,7 +88,7 @@ export type ChatEvent =
   | { type: "conversation_created"; turn: string }
 
 // A ticket opens an account socket; `guest=1` opens a guest one
-// (services/gateway/chat.go's "Guests"); the gateway refuses anything else.
+// (gateway/chat.go's "Guests"); the gateway refuses anything else.
 function wsURL(query: string): string {
   const base = process.env.NEXT_PUBLIC_GATEWAY_URL
   if (!base) throw new Error("NEXT_PUBLIC_GATEWAY_URL is not set")
@@ -113,7 +113,7 @@ type ConnectResult = { socket: WebSocket } | { error: string }
 
 const UNREACHABLE_TEXT = "Can't reach the server right now — try again"
 
-// Mirrors services/gateway/chat.go's maxMessageLength — checked here so an
+// Mirrors gateway/chat.go's maxMessageLength — checked here so an
 // over-long message never leaves the browser at all, rather than reaching
 // the gateway and being rejected round-trip. Counted in code points, not
 // UTF-16 length, so a multi-byte character is never split — same reasoning
@@ -207,7 +207,7 @@ async function connect(
 //
 // guestProviders is null for an account and the guest's ticked services
 // otherwise — sent on every message frame, since a guest has no rows for
-// the gateway to load (services/gateway/chat.go's inboundMessage).
+// the gateway to load (gateway/chat.go's inboundMessage).
 export function useChatSocket(
   onEvent: (ev: ChatEvent) => void,
   onDisconnect: (text: string) => void,

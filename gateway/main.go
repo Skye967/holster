@@ -372,7 +372,7 @@ type queryRower interface {
 // verifyRoleIsSafe fails if the connecting role would bypass row-level
 // security entirely — a superuser, a role with the bypassrls attribute, or
 // the owner of any app table all skip every policy in
-// ../../supabase/migrations, turning RLS into dead code rather than a
+// ../supabase/migrations, turning RLS into dead code rather than a
 // backstop. gateway_app is deliberately none of these
 // (20260831233121_rls_roles.sql); this catches a DATABASE_URL pointed at the
 // wrong role at startup, before it becomes a silent cross-user data leak.
