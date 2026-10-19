@@ -62,8 +62,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 
 from tmdb import (
@@ -1932,7 +1932,7 @@ def _format_candidates(candidates: list[Title]) -> str:
     return json.dumps(rows)
 
 
-def google_interpreter(model: ChatGoogleGenerativeAI) -> Interpreter:
+def google_interpreter(model: BaseChatModel) -> Interpreter:
     """Bind DiscoverIntent's schema to ``model``. Swap this function, not
     catalog_tool's internals, to change how interpret() is powered."""
     bound = model.with_structured_output(DiscoverIntent)
@@ -1964,7 +1964,7 @@ def _compose_content(message: str, cause: OutcomeCause, detail: str) -> str:
     return f"{message}\n\nReason: {cause}\nDetail: {quoted}"
 
 
-def google_composer(model: ChatGoogleGenerativeAI) -> Composer:
+def google_composer(model: BaseChatModel) -> Composer:
     """Bind ComposedReply's schema to ``model``. The cause and detail are
     folded into the human message here, the way google_ranker folds the
     candidate list in, so Composer stays one signature across every cause."""
@@ -1980,7 +1980,7 @@ def google_composer(model: ChatGoogleGenerativeAI) -> Composer:
     return call
 
 
-def google_ranker(model: ChatGoogleGenerativeAI) -> Ranker:
+def google_ranker(model: BaseChatModel) -> Ranker:
     bound = model.with_structured_output(RankResult)
 
     async def call(message: str, candidates: list[Title]) -> RankResult:

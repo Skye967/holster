@@ -22,7 +22,7 @@ from typing import Any, cast
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chat_models import init_chat_model
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from catalog_tool import (
@@ -46,6 +46,8 @@ CORRELATION_ID_HEADER = "x-correlation-id"
 # Set per request by CorrelationIdMiddleware, read by JsonFormatter so every line
 # emitted while handling a request carries the same id.
 _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=None)
+
+logger = logging.getLogger("holster.main")
 
 
 class JsonFormatter(logging.Formatter):
@@ -156,19 +158,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # substitutes an empty string when unset in .env, not an absent key, so
     # getenv's default would never fire under compose.
     model_name = os.getenv("GOOGLE_MODEL") or DEFAULT_MODEL
+    logger.info("agent model %s", model_name)
+    model_id = f"google_genai:{model_name}"
     # max_retries is total attempts here (2 = one retry), not
     # retries-beyond-initial. It helps with transient 5xx/network errors. It
     # does not help against a free-tier rate limit: the SDK's backoff is fixed
     # exponential and ignores the Retry-After the response carries, so the one
     # retry fires too soon to land.
-    model = ChatGoogleGenerativeAI(model=model_name, timeout=15.0, max_retries=2)
+    model = init_chat_model(model_id, timeout=15.0, max_retries=2)
     app.state.interpret_model = google_interpreter(model)
     app.state.rank_model = google_ranker(model)
     # One attempt where the two above get a retry: this call's answer already
     # exists in the template beside it (chat.py's _outcome_text), so a retry
     # against a free-tier refusal spends a second request of the same minute to
     # arrive at the sentence that was already there.
-    compose_llm = ChatGoogleGenerativeAI(model=model_name, timeout=15.0, max_retries=1)
+    compose_llm = init_chat_model(model_id, timeout=15.0, max_retries=1)
     app.state.compose_model = google_composer(compose_llm)
     try:
         yield
