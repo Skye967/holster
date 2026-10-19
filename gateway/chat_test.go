@@ -196,7 +196,7 @@ func TestAgentIntentDecodesTheMonetizationField(t *testing.T) {
 
 func TestSummarizePicksDistinguishesALookupFromASuggestion(t *testing.T) {
 	// This text is what a reload renders and what feeds the next turn's
-	// interpret(), so "Suggested" on a lookup would both misreport the turn
+	// interpret call, so "Suggested" on a lookup would both misreport the turn
 	// and be read back as a recommendation that never happened.
 	picks := []agentPick{{TMDBID: 1, Title: "Heat"}}
 
@@ -214,7 +214,7 @@ func TestSummarizePicksDistinguishesALookupFromASuggestion(t *testing.T) {
 func TestSummarizePicksDisambiguatesRepeatedTitles(t *testing.T) {
 	// Exact name matches carry the same title by definition, so a lookup on an
 	// ambiguous name repeats it once per card. This string is what a reload
-	// renders and what feeds the next turn's interpret(); "Dune, Dune" tells
+	// renders and what feeds the next turn's interpret call; "Dune, Dune" tells
 	// neither of them which two films were on screen.
 	y1, y2 := 2021, 1984
 	picks := []agentPick{
@@ -291,7 +291,7 @@ func TestInterpretingLineDoesNotEscapeQuotesInATitle(t *testing.T) {
 }
 
 func TestAgentIntentDecodesTheTitleField(t *testing.T) {
-	// agentIntent is hand-kept against the agent's DiscoverIntent dump and an
+	// agentIntent is hand-kept against the agent's intent event and an
 	// unknown key vanishes silently on decode, so the json tag is pinned here
 	// rather than left to interpretingLine's own test to notice.
 	var intent agentIntent
@@ -3230,7 +3230,7 @@ func TestChatForwardsTheAgentsOpenerAheadOfTheInterpretingLine(t *testing.T) {
 }
 
 // The opener is ephemeral. Persisting it would feed "Absolutely, one sec" to
-// the next turn's interpret() forever, which is the hazard the agent's own
+// the next turn's interpret call forever, which is the hazard the agent's own
 // outcome copy is written to avoid.
 func TestChatDoesNotPersistTheOpener(t *testing.T) {
 	loadCtx := func(context.Context, string) (chatContext, error) {

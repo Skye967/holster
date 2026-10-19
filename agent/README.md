@@ -79,7 +79,7 @@ the client resolves them to TMDB IDs and caches the mapping. Results are ordered
 TMDB's own `popularity` is deliberately not offered, being a rolling trend metric that
 ranked a 4.0-rated title above The Dark Knight. A `vote_count` floor is always applied
 to `discover` and no caller can set it: it is derived from the sort, and is higher for
-the rating sort, which is the only one a low floor actually misorders. (`search()`'s
+the rating sort, which is the only one a low floor actually misorders. (`find_candidates()`'
 last rung drops the rating sort for a query too narrow to fill under it, which lowers
 the floor as a consequence — the sort is the only thing it sets.) Multiple cast or
 crew names mean *all* of them; multiple mood keywords mean *any*, because TMDB's tag
@@ -93,22 +93,26 @@ environment — the token is passed to `TMDBClient(...)`.
 
 ## Catalog tool
 
-`catalog_tool.py` puts a model in front of `tmdb.py`: two calls, not an agent loop —
-or one, when the message names a title and `search()` looks it up instead. A lookup
-answers with every title carrying that name — the film itself, and anything carrying
-it on, so "Star Wars" reaches the sequels too.
-`interpret()` turns a message into `DiscoverIntent` — `tmdb.discover()`'s creative
+`catalog_tool.py` puts a model in front of `tmdb.py`: a LangChain agent
+(`create_agent`) bounded to two model calls by one middleware class, `TwoCallTurn`. The
+first call — the interpret call — is offered three declared tools and must pick exactly
+one: `search_catalog`, `look_up_title`, or `answer`, for a capability or clarifying
+reply. The tool runs; a search then gets the second call — the rank call — with no tools
+and `RankResult` as its only answer. A lookup or an answer ends the turn at one call. A
+lookup answers with every title carrying that name — the film itself, and anything
+carrying it on, so "Star Wars" reaches the sequels too.
+`search_catalog`'s arguments (`SearchArgs`) are `tmdb.discover()`'s creative
 parameters, with no `watch_region`/`watch_providers` field, so which services results
 come from is never the model's choice. What it can choose is whether the turn asks about
-subscriptions or about rentals (`monetization`). `search()` calls `discover()` with
+subscriptions or about rentals (`monetization`). The tool calls `discover()` with
 those parameters plus the caller's real region, and the caller's real providers unless
 the message asked to rent — a rent turn has no provider list to filter on, and what a
 card claims about streaming is cut to the caller's subscriptions either way, when
-availability is merged in. `rank()` has the
+availability is merged in. The rank call has the
 model pick and explain the *real* candidates that came back — its output schema carries
 no title metadata, only a selected id and a blurb, so a manipulated overview can win a
-bad blurb at worst, never assert a fake title. `rank()` says nothing about how many
-picks a turn shows; `search()` owns the whole size band.
+bad blurb at worst, never assert a fake title. The rank call says nothing about how
+many picks a turn shows; `finish_search()` owns the whole size band.
 A recommendation list aims for `RESULT_FLOOR`..`RESULT_CEILING` titles. Paging reads
 toward the ceiling until TMDB has no next page — a thin page usually means exclusion ate
 it, and the answer to that is more of what the user asked for, never a looser question.
@@ -117,8 +121,8 @@ which is what lets a long conversation keep asking for more. Pages after the fir
 out `DISCOVER_BATCH_PAGES` at a time, so a deep read costs a few round trips rather than
 a dozen; `MAX_DISCOVER_PAGES` is a runaway ceiling on that, not a policy.
 When paging cannot fill the floor — TMDB out of rows, the page ceiling, or the paging
-budget spent — `search()` retries with soft constraints dropped in
-`RelaxedConstraint`'s order, recording what it dropped in `CatalogResult.relaxed` for
+budget spent — `find_candidates()` retries with soft constraints dropped in
+`RelaxedConstraint`'s order, recording what it dropped in `Candidates.relaxed` for
 the chat layer to explain. Never the user's services,
 region, or exclusions, and never cast or crew: a named person is the request itself, so
 padding two genuine matches with three unrelated films buys a count and loses the
@@ -134,14 +138,14 @@ sort rather than answering short.
 
 Rungs **accumulate**: a wider query's rows are appended to the narrower query's, never
 substituted for them, so the titles that matched exactly survive being widened past.
-Surviving is not the same as being picked, though: `rank()`'s candidate list carries no
-rung marker, so it can name only widened titles. `search()` therefore guarantees every
+Surviving is not the same as being picked, though: the rank call's candidate list carries
+no rung marker, so it can name only widened titles. `finish_search()` therefore guarantees every
 exact match a place itself, tops the picks up to the floor, stable-sorts by the rung
 they came from, and only then cuts to the limit — in that order, because cutting in
-`rank()`'s own fit order could discard every exact match a widened query found. Both
+the model's own fit order could discard every exact match a widened query found. Both
 the guarantee and the floor carry no blurb, being properties of this code rather than
-requests made of the model, for the same reason `rank()` validates ids rather than
-asking for valid ones.
+requests made of the model, for the same reason `finish_search()` validates ids rather
+than asking for valid ones.
 
 The widening is bounded by `LADDER_BUDGET_SECONDS`, not run to exhaustion: paging
 plus rungs is many sequential rounds of `discover()` calls at its ceiling, under
@@ -153,30 +157,28 @@ in flight is cancelled rather than left to finish its own retries; page 1 sits o
 it, being the answer rather than the widening. What accumulated is then the reply —
 which makes it a real answer rather than a truncated one.
 That deterministic part — paging, the rungs, exclusion and the taste hint — is
-`find_candidates()`, which `search()` calls and which takes no model.
+`find_candidates()`, which `search_catalog` runs and which takes no model.
 
-Three agent tools are declared beside it, not yet given to any model:
-`search_catalog`, whose arguments (`SearchArgs`) are `DiscoverIntent`'s search fields
-and `reply`, under the same names, and whose body runs `find_candidates()`;
-`look_up_title(title, reply)`, which runs `lookup_title()`; and
-`answer(text, kind)`, for a capability or clarifying reply. The caller's region,
-services, verdicts and shown titles reach a tool through its run context
-(`TurnContext`), which LangChain leaves out of the schema the model is sent — so, as
-with `DiscoverIntent`, no argument lets the model choose them. A `limit` past its schema
-bound is clamped to it, so "show me 25" asks for 20, and a runtime ceiling under a minute
-reads as no ceiling.
+The caller's region, services, verdicts and shown titles reach a tool through its run
+context (`TurnContext`), which LangChain leaves out of the schema the model is sent — so
+no argument lets the model choose them. A `limit` past its schema bound is clamped to
+it, so "show me 25" asks for 20, and a runtime ceiling under a minute reads as no
+ceiling. An argument the clamp cannot fix ends the turn rather than going back to the
+model, which would be a third call. Each tool writes what it found onto the agent's
+state (`TurnState`) beside the text the model reads, and `chat.py` answers from that
+state.
 
-LangChain is confined to the `google_*()` model bindings and those tools; everything
-else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`.
+LangChain lives at the bottom of `catalog_tool.py` — the agent, its tools, `TwoCallTurn`
+and the composer's model binding; everything above it is plain TMDB and Python.
 
 ## Chat pipeline
 
-`chat.py`'s `stream_chat()` wraps `catalog_tool.search()` for `POST /chat`: a plain
+`chat.py`'s `stream_chat()` runs the catalog agent for `POST /chat`: a plain
 chunked HTTP response (`application/x-ndjson`), not a second WebSocket — the browser's
 socket belongs to the gateway alone (`../ARCHITECTURE.md`). Each line is one event:
 `reply` (the model's one-line opener, ahead of `intent` on a turn that searches or looks
-up), `intent` (as soon as `interpret()` resolves — well before the full pipeline finishes,
-via `search()`'s `on_intent` hook), `results` or `message` (candidates, or a plain reply
+up), `intent` (as soon as the tool starts — well before the full turn finishes, written
+by the tool through LangChain's stream writer), `results` or `message` (candidates, or a plain reply
 when there are none — no subscriptions, nothing survived the relaxation ladder, or
 everything found was already rated),
 `error` (one of a fixed, closed set of reason codes — never raw exception text), and
@@ -187,14 +189,14 @@ This is the agent-internal protocol, not the browser-facing one — the gateway 
 public event vocabulary (`reply`/`interpreting`/`results`/`token`/`done`/`error`) and
 templates it from these. Cancellation is plain `asyncio` cancellation: the gateway
 aborting its HTTP call closes the response body, which stops `stream_chat()` iterating,
-which cancels
-the background `search()` call — nothing bespoke on this side.
+which closes the agent's stream and cancels the step in flight — nothing bespoke on
+this side.
 
 `history` in the request body is the last few exchanges only, windowed by the gateway
 from a `messages` table that persists the full conversation — this
 agent still never reads that table itself, only the windowed slice handed to it per
-call. It is folded into the text handed to `interpret()`/`rank()` rather than changing
-`catalog_tool.py`'s `message: str` contract.
+call. It is folded into the one human message the agent is given, which both model
+calls' messages are built from.
 
 `shown` in the request body is what the gateway has already put on screen for this
 conversation — read back from `messages.title_refs` for an account, kept on the
@@ -225,27 +227,28 @@ the rating rung bends and only back to that same floor. The copy says exactly th
 Every sentence the user reads is written by the model, bar the ones that cannot be.
 `_TONE` in `catalog_tool.py` is prepended to all three system prompts, so the opener, a
 blurb, a clarifying question and an outcome sentence come from one assistant rather than
-three. It says only how to sound — `rank()` is asked for a list of per-title blurbs, so a
+three. It says only how to sound — the rank call is asked for a list of per-title blurbs, so a
 tone rule forbidding lists or counts would contradict the job on the same call.
 
 `_ANSWER_RULES` carries what a whole answer owes — name no film the user did not, give no
 count, never say the catalog has run out, always say what to try next — and goes only to
 the outcome prompt and to the capability case of the interpret prompt. Those two produce
 the text the gateway stores as the turn's assistant text, which is read back into the next
-turn's `interpret()`, where a named film reads as a title request and a number as a limit.
+turn's interpret call, where a named film reads as a title request and a number as a limit.
 
-**A turn makes at most two model calls.** The opener rides on `interpret()` as
-`DiscoverIntent.reply`, so it is free; a turn with results spends `interpret()` and
-`rank()`. A turn that ends with nothing to show spends `interpret()` and one `Composer`
-call instead, `rank()` having never reached the model — `chat.py` states why that spare
-call is always there. Calls are not requests: interpret and rank are built with one
+**A turn makes at most two model calls**, which `TwoCallTurn` enforces. The opener rides
+on the interpret call as the tool's `reply` argument, so it is free; a turn with results
+spends the interpret call and the rank call. A turn that ends with nothing to show
+spends the interpret call and one `Composer` call instead, the rank call never having
+been made — `chat.py` states why that spare call is always there. Calls are not
+requests: the agent's model is built with one
 retry (`main.py`), so a results turn can cost three of the free tier's fifteen requests
 a minute. The composer is built with none — its answer already exists in the template
 beside it.
 
 The composer is fed the cause (`nothing_matched`, `all_shown`, `all_judged`,
 `title_not_found`), never asked to infer it: each owes the user a different sentence,
-and telling someone they rated titles they were only shown is false. `search()` decides
+and telling someone they rated titles they were only shown is false. `finish_search()` decides
 the cause where it computes the facts behind it, so the sentence and the duty cannot
 disagree. A composer call that fails or outlives `COMPOSE_TIMEOUT_SECONDS` falls back to
 the template beside it rather than costing a turn the answer it already has.
@@ -253,22 +256,22 @@ the template beside it rather than costing a turn the answer it already has.
 What stays hand-written: `chat.py`'s `NO_PROVIDERS_MESSAGE`, because that turn reaches
 no model at all and is the first message most new visitors see; `gateway/chat.go`'s
 error copy, guest cap and rate-limit line, because if the model is what failed it cannot
-write its own apology; and `_relaxed_note`, whose count is computed after `rank()` has cut
+write its own apology; and `_relaxed_note`, whose count is computed after `finish_search()` has cut
 the picks, so no call is in flight to write it.
 
 `verdicts` in the request body is the caller's whole `title_verdicts` set, loaded by the
 gateway with the message. The gateway only reads the rows; what each verdict *means* for
-a recommendation is decided here, in `search()`:
+a recommendation is decided here, in `find_candidates()`:
 
-- **Every verdict but `want_to_watch` removes that title from the candidates `rank()`
-  sees** (on the discover path; a named-title lookup runs no `rank()` and applies no
+- **Every verdict but `want_to_watch` removes that title from the candidates the rank
+  call sees** (on the discover path; a named-title lookup makes no rank call and applies no
   verdict filter, because a factual question about a title is not a recommendation) —
   the four judgments are settled opinions, `want_to_watch` is an open
   intention. A set filter applied once, after paging and the relaxation ladder, never
   a prompt instruction, so it holds whatever the model does. An unrecognised verdict
   excludes too, which is the safe direction.
-- **`liked` titles of the search's own media type become a hint prepended to `rank()`'s
-  message**, and are never given to `interpret()` — that step sets hard TMDB filters,
+- **`liked` titles of the search's own media type become a hint prepended to the rank
+  call's message**, and are never given to the interpret call — that step sets hard TMDB filters,
   and a past like is a preference, not a constraint the user asked for. The hint is the
   first `MAX_TASTE_TITLES` likes, resolved to names via TMDB since the table stores only
   ids. Its effect is bounded: it reorders and re-selects within the one page
@@ -282,10 +285,10 @@ ordering is itself only a proxy.
 
 **Cold start:** a brand-new account has `verdicts == []` and
 `history == []`. Both are no-ops at that length — `_with_taste`/`_with_history` return
-the message unchanged — so `interpret()` and `rank()` see exactly what the caller typed,
-nothing folded in. There is no special-cased "new user" code path; the cold-start answer
-comes entirely from how well `interpret()`'s prompt extracts mood signal from a short,
-colloquial first message, which is why `DiscoverIntent.keywords`'s field description in
+the message unchanged — so neither model call gets taste or history folded in. There
+is no special-cased "new user" code path; the cold-start answer comes entirely from
+how well the interpret prompt extracts mood signal from a short, colloquial first
+message, which is why `SearchArgs.keywords`'s field description in
 `catalog_tool.py` explicitly tells the model to infer a mood-driven value rather than
 leaving it empty on a vague-sounding request. It's the one field `_INTERPRET_SYSTEM_PROMPT`
 names as an exception to its own "leave empty when unmentioned" rule — deliberately
@@ -303,7 +306,8 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy .
 ```
 
 The suite runs offline: `test_tmdb.py` against a mock transport, `test_catalog_tool.py`
-against that plus fake interpret/rank callables, and `test_agent_tools.py` against the
-tools' schemas and `testutil.ScriptedChatModel`, a chat model that answers each call with
-the next scripted message. Nothing here calls TMDB or the model —
+against that plus plain async functions in place of the two model calls, and
+`test_chat.py`, `test_main.py` and `test_agent_tools.py` against the real agent driven by
+`testutil.ScriptedChatModel`, a chat model that answers each call with the next scripted
+message and records what each call was sent. Nothing here calls TMDB or the model —
 prompt behaviour is checked by running the app, not by asserting on a model's output.

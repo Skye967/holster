@@ -56,8 +56,7 @@ def test_the_search_tool_keeps_the_names_the_gateway_reads() -> None:
 
 
 def test_a_looked_up_title_is_one_line_and_never_blank() -> None:
-    """search() takes the lookup path only on a non-blank title; a blank one
-    would reach TMDB as an empty query."""
+    """A blank title would reach TMDB as an empty query."""
     assert LookUpArgs(title="Heat\n").title == "Heat"
     with pytest.raises(ValidationError):
         LookUpArgs(title=" \u2028 ")

@@ -27,14 +27,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from catalog_tool import (
     DEFAULT_MODEL,
+    CatalogAgent,
     Composer,
-    Interpreter,
-    Ranker,
     TitlesRequest,
+    catalog_agent,
     enrich_watchlist,
     google_composer,
-    google_interpreter,
-    google_ranker,
 )
 from chat import ChatRequest, stream_chat
 from tmdb import RegionProvider, TMDBClient
@@ -166,9 +164,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # exponential and ignores the Retry-After the response carries, so the one
     # retry fires too soon to land.
     model = init_chat_model(model_id, timeout=15.0, max_retries=2)
-    app.state.interpret_model = google_interpreter(model)
-    app.state.rank_model = google_ranker(model)
-    # One attempt where the two above get a retry: this call's answer already
+    app.state.agent = catalog_agent(model)
+    # One attempt where the agent's two calls get a retry: this call's answer already
     # exists in the template beside it (chat.py's _outcome_text), so a retry
     # against a free-tier refusal spends a second request of the same minute to
     # arrive at the sentence that was already there.
@@ -185,21 +182,16 @@ asgi_app = CorrelationIdMiddleware(app)
 
 
 # Plain functions, not a class: request.app.state is the one instance-per-process
-# TMDBClient and the three model callables built in lifespan() above. Depends()
+# TMDBClient, the agent and the composer built in lifespan() above. Depends()
 # (rather than reading request.app.state directly in the route) is what lets
 # tests swap in fakes via app.dependency_overrides, the same seam TMDBClient's
-# transport= and catalog_tool's Interpreter/Ranker/Composer callables already
-# use.
+# transport= and catalog_tool's Composer callable already use.
 def get_tmdb_client(request: Request) -> TMDBClient:
     return cast(TMDBClient, request.app.state.tmdb_client)
 
 
-def get_interpret_model(request: Request) -> Interpreter:
-    return cast(Interpreter, request.app.state.interpret_model)
-
-
-def get_rank_model(request: Request) -> Ranker:
-    return cast(Ranker, request.app.state.rank_model)
+def get_agent(request: Request) -> CatalogAgent:
+    return cast(CatalogAgent, request.app.state.agent)
 
 
 def get_compose_model(request: Request) -> Composer:
@@ -215,8 +207,7 @@ async def health() -> dict[str, str]:
 async def chat(
     req: ChatRequest,
     tmdb_client: TMDBClient = Depends(get_tmdb_client),
-    interpret_model: Interpreter = Depends(get_interpret_model),
-    rank_model: Ranker = Depends(get_rank_model),
+    agent: CatalogAgent = Depends(get_agent),
     compose_model: Composer = Depends(get_compose_model),
 ) -> StreamingResponse:
     """Streams chat.stream_chat()'s events as newline-delimited JSON. A plain
@@ -231,8 +222,7 @@ async def chat(
         async for event in stream_chat(
             req,
             client=tmdb_client,
-            interpret_model=interpret_model,
-            rank_model=rank_model,
+            agent=agent,
             compose_model=compose_model,
         ):
             yield json.dumps(event, default=str).encode() + b"\n"

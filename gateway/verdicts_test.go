@@ -356,7 +356,7 @@ func TestVerdictJSONTagsAreTheCrossServiceContract(t *testing.T) {
 
 	// The values are as much of the contract as the field names. The agent
 	// decides what to exclude with a bare string compare against
-	// "want_to_watch" (agent/catalog_tool.py's search()), so renaming that
+	// "want_to_watch" (agent/catalog_tool.py's find_candidates()), so renaming that
 	// value here for the browser's sake would silently invert the meaning of
 	// every bookmarked title — they would start being excluded from
 	// recommendations instead of staying eligible — with the Go, Python and
