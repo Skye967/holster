@@ -236,7 +236,8 @@ the outcome prompt and to the capability case of the interpret prompt. Those two
 the text the gateway stores as the turn's assistant text, which is read back into the next
 turn's interpret call, where a named film reads as a title request and a number as a limit.
 
-**A turn makes at most two model calls**, which `TwoCallTurn` enforces. The opener rides
+**A turn makes at most two model calls** (`MODEL_CALLS_PER_TURN`, whose comment says
+why two and what raising it takes), which `TwoCallTurn` enforces. The opener rides
 on the interpret call as the tool's `reply` argument, so it is free; a turn with results
 spends the interpret call and the rank call. A turn that ends with nothing to show
 spends the interpret call and one `Composer` call instead, the rank call never having

@@ -2050,6 +2050,15 @@ async def answer(
 
 CATALOG_TOOLS = [search_catalog, look_up_title, answer]
 
+# Two because the step a third call would take — try again, looser — is what
+# find_candidates()'s ladder does without one, and a third would follow the
+# rank call's reading of the overviews (see TwoCallTurn). main.py gives the
+# agent's model a 15s timeout per attempt and one retry, so a single slow call
+# can already spend gateway/chat.go's 30s turnDeadline; and gateway/chat.go's
+# defaultGuestRateLimit is sized on a turn costing two calls of the free
+# tier's 15 requests a minute. Raising it takes a step the ladder cannot do, a
+# call that reads no third-party text, and room under turnDeadline and
+# defaultGuestRateLimit.
 MODEL_CALLS_PER_TURN = 2
 
 
@@ -2123,10 +2132,15 @@ class TwoCallTurn(AgentMiddleware[TurnState, TurnContext, RankResult]):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
-        # The tool node answers an argument the schema rejected, or a tool
-        # that does not exist, with an error message for the model to retry
-        # on. A retry is a third call, so the turn ends instead. Any other
-        # exception a tool raises propagates unchanged.
+        # The tool node answers an argument the schema rejected, or a tool that
+        # does not exist, with an error ToolMessage instead of raising. Without
+        # this check neither ends cleanly: look_up_title and answer are
+        # return_direct, so the graph ends on the error and chat.py's last
+        # branch answers _nothing_found_message("nothing_matched"); after
+        # search_catalog or an unknown tool, the agent's next model call takes
+        # the rank branch with no `found` set and fails as internal. Raising
+        # here ends both as a model failure. Any other exception a tool raises
+        # propagates unchanged.
         result = await handler(request)
         if isinstance(result, ToolMessage) and result.status == "error":
             raise CatalogToolError(f"tool call rejected: {request.tool_call['name']}")

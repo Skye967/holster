@@ -174,19 +174,23 @@ class ScriptedChatModel(GenericFakeChatModel):
     messages are recorded in `calls`, so a test counts a turn's model calls
     and reads what each one was sent.
 
-    bind_tools returns the model itself, so the script ignores which tools or
-    response format a call binds. The base class raises NotImplementedError
-    there, and create_agent binds on every call. Its streaming path drops
-    tool_calls, so a scripted tool call survives ainvoke but not a token
-    stream."""
+    bind_tools records its kwargs in `bound` and returns the model itself, so
+    the script ignores which tools or response format a call binds; the base
+    class raises NotImplementedError there. create_agent goes through
+    bind_tools for every call that has tools or a response format — both of
+    this agent's calls do — so `bound[i]` is call i's binding. The base
+    class's streaming path drops tool_calls, so a scripted tool call survives
+    ainvoke but not a token stream."""
 
     calls: list[list[BaseMessage]] = Field(default_factory=list)
+    bound: list[dict[str, Any]] = Field(default_factory=list)
 
     def bind_tools(
         self,
         tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, AIMessage]:
+        self.bound.append(kwargs)
         return self
 
     async def _agenerate(
