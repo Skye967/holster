@@ -8,9 +8,15 @@ FakeTMDB is the union of what those suites need; each uses a subset.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import httpx2
+from langchain_core.language_models import LanguageModelInput
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
 
 from catalog_tool import (
     CatalogToolError,
@@ -168,6 +174,25 @@ class FakeTMDB:
 
     def count(self, path: str) -> int:
         return sum(1 for r in self.requests if r.url.path == "/3" + path)
+
+
+class ScriptedChatModel(GenericFakeChatModel):
+    """A chat model that answers each call with the next scripted AIMessage:
+    a tool call for call one, or RankResult JSON as text with no tool calls
+    for call two, which is the reply ProviderStrategy parses.
+
+    bind_tools returns the model itself, so the script ignores which tools or
+    response format a call binds. The base class raises NotImplementedError
+    there, and create_agent binds on every call. Its streaming path drops
+    tool_calls, so a scripted tool call survives ainvoke but not a token
+    stream."""
+
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, AIMessage]:
+        return self
 
 
 def make_intent(**overrides: Any) -> DiscoverIntent:
