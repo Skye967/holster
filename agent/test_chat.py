@@ -2,8 +2,10 @@
 scripted chat model, and a fake TMDB transport. These exercise the event
 sequence, the per-turn model-call budget and cancellation that stream_chat()
 adds on top of the catalog step; that step's own behaviour (relaxation ladder,
-id-outside-candidates, etc.) is covered in test_catalog_tool.py and not
-re-tested here.
+year clamps, etc.) is covered in test_catalog_tool.py. The checks on what the
+model sends back — TwoCallTurn's guards, and _valid_picks dropping a ranked id
+that was never a candidate — are tested here too, through a whole turn, except
+the budget guard, which no turn can reach.
 """
 
 from __future__ import annotations
@@ -11,12 +13,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any, get_args
+from typing import Any, cast, get_args
 from unittest.mock import AsyncMock
 
 import httpx2
 import pytest
-from langchain_core.messages import AIMessage
+from langchain.agents.middleware import ModelRequest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import ValidationError
 
 import chat
@@ -24,11 +27,16 @@ import tmdb
 from catalog_tool import (
     _OUTCOME_SYSTEM_PROMPT,
     PROVIDERS_HEADER,
+    RESULT_FLOOR,
+    Candidates,
+    CatalogToolError,
     ComposedReply,
     OutcomeCause,
     RelaxedConstraint,
     TitleRef,
     TitleVerdict,
+    TurnState,
+    TwoCallTurn,
     catalog_agent,
 )
 from chat import (
@@ -1007,6 +1015,151 @@ def test_a_no_providers_turn_spends_nothing() -> None:
 
     assert [e["type"] for e in events] == ["message", "done"]
     assert (len(model.calls), len(composer.calls)) == (0, 0)
+
+
+def test_a_rank_call_that_asks_to_search_is_refused() -> None:
+    """A provider-native binding does not stop a reply carrying a tool call,
+    which would route to the tool node and search again. One intent event is
+    the tool having run once."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
+    model = scripted(search_call(), search_call())
+    composer = RecordingComposer()
+
+    events = asyncio.run(_collect(req, fake_tmdb.client(), model, composer()))
+
+    assert [e["type"] for e in events] == ["intent", "error"]
+    assert events[1]["reason"] == "model_unavailable"
+    assert (len(model.calls), len(composer.calls)) == (2, 0)
+
+
+def test_two_tool_calls_at_once_end_the_turn_after_one_call() -> None:
+    """Gemini can answer a message asking two things at once with two tool
+    calls. Running the first would answer half of it."""
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="something like Heat, and is Fargo on netflix?",
+        watch_region="US",
+        watch_providers=[8],
+    )
+    both = AIMessage(
+        content="",
+        tool_calls=search_call().tool_calls + lookup_call("Fargo").tool_calls,
+    )
+    model = scripted(both)
+    composer = RecordingComposer()
+
+    events = asyncio.run(_collect(req, fake_tmdb.client(), model, composer()))
+
+    assert [e["type"] for e in events] == ["error"]
+    assert events[0]["reason"] == "model_unavailable"
+    assert (len(model.calls), len(composer.calls)) == (1, 0)
+    assert fake_tmdb.requests == []
+
+
+def test_no_tool_call_ends_the_turn_after_one_call() -> None:
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
+    model = scripted(AIMessage(content="Sure, here are some heist films."))
+    composer = RecordingComposer()
+
+    events = asyncio.run(_collect(req, fake_tmdb.client(), model, composer()))
+
+    assert [e["type"] for e in events] == ["error"]
+    assert events[0]["reason"] == "model_unavailable"
+    assert (len(model.calls), len(composer.calls)) == (1, 0)
+
+
+def test_the_interpret_call_is_bound_without_a_response_format() -> None:
+    """Call one must answer with a tool call: bound with tool_choice "any"
+    and no response format, which would let it answer with a ranking
+    instead. The rank call's binding is asserted too, so the absence is one
+    this test could have seen."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
+    model = scripted(search_call(), rank_reply(101))
+
+    asyncio.run(_collect(req, fake_tmdb.client(), model))
+
+    assert "response_format" not in model.bound[0]
+    assert model.bound[0]["tool_choice"] == "any"
+    assert "response_format" in model.bound[1]
+    assert len(model.calls) == 2
+
+
+def test_a_ranked_id_outside_the_candidates_is_dropped_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The rank call reads overviews third parties write, so a ranking can
+    name a title that was never a candidate. It is dropped, not shown."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
+    model = scripted(search_call(), rank_reply(101, 999))
+    composer = RecordingComposer()
+
+    with caplog.at_level(logging.WARNING):
+        events = asyncio.run(_collect(req, fake_tmdb.client(), model, composer()))
+
+    assert [e["type"] for e in events] == ["intent", "results", "done"]
+    assert [p["tmdb_id"] for p in events[1]["picks"]] == [101]
+    assert "rank id outside candidates" in caplog.text
+    assert (len(model.calls), len(composer.calls)) == (2, 0)
+
+
+def test_an_argument_the_clamp_cannot_fix_ends_the_turn_after_one_call() -> None:
+    """The tool node answers a rejected argument with an error for the model
+    to retry on. That retry would be the rank call with no search behind it,
+    which fails as internal rather than model_unavailable."""
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
+    model = scripted(search_call(limit="lots"))
+    composer = RecordingComposer()
+
+    events = asyncio.run(_collect(req, fake_tmdb.client(), model, composer()))
+
+    assert [e["type"] for e in events] == ["error"]
+    assert events[0]["reason"] == "model_unavailable"
+    assert (len(model.calls), len(composer.calls)) == (1, 0)
+    assert fake_tmdb.requests == []
+
+
+def test_a_third_model_call_is_refused_before_it_is_made() -> None:
+    """The backstop behind the rank call's no-tool guard. A third call needs
+    call two to have asked for a tool, and that guard ends the turn first, so
+    this is called directly with a turn whose second call did. `found` is set
+    so that without the guard the call would go through to the handler."""
+    request = ModelRequest(
+        model=scripted(),
+        messages=[
+            HumanMessage("a heist movie"),
+            search_call(),
+            ToolMessage("[]", tool_call_id="call-search_catalog"),
+            search_call(),
+            ToolMessage("[]", tool_call_id="call-search_catalog"),
+        ],
+        state=TurnState(
+            messages=[],
+            found=Candidates(
+                candidates=[tmdb._trim_title(MOVIE_A, "movie")],
+                rung_of={101: 0},
+                relaxed=[],
+                limit=10,
+                floor=RESULT_FLOOR,
+                taste=[],
+                all_judged=False,
+                all_shown=False,
+            ),
+        ),
+        runtime=cast(Any, None),
+    )
+    handler = AsyncMock()
+
+    with pytest.raises(CatalogToolError, match="budget spent"):
+        asyncio.run(TwoCallTurn().awrap_model_call(request, handler))
+    handler.assert_not_called()
 
 
 def test_a_failed_turn_does_not_spend_a_call_apologising() -> None:
