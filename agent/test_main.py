@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from collections.abc import Iterator
 from typing import Any
 
@@ -58,8 +59,8 @@ def test_correlation_id_survives_server_error() -> None:
 
 # --- /chat -------------------------------------------------------------
 #
-# Real TMDBClient/model construction happens in lifespan(), which needs live
-# keys, and there is no live suite in this repo. These tests
+# Real TMDBClient/model construction happens in lifespan(), and the models it
+# builds call the live API, which no test in this repo reaches. These tests
 # never trigger it: they override the Depends() seams directly, the same way
 # TMDBClient's transport= and catalog_tool's Interpreter/Ranker do for
 # everything else in this codebase.
@@ -219,3 +220,14 @@ def test_lifespan_requires_tmdb_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TMDB_API_KEY", raising=False)
     with pytest.raises(SystemExit, match="TMDB_API_KEY"):
         asyncio.run(_run_lifespan(FastAPI(lifespan=lifespan)))
+
+
+def test_lifespan_logs_model(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "a")
+    monkeypatch.setenv("TMDB_API_KEY", "t")
+    monkeypatch.setenv("GOOGLE_MODEL", "gemini-other")
+    with caplog.at_level(logging.INFO, logger="holster.main"):
+        asyncio.run(_run_lifespan(FastAPI(lifespan=lifespan)))
+    assert "agent model gemini-other" in caplog.messages
