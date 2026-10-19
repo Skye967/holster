@@ -45,10 +45,12 @@ ticked list is what the user subscribes to and that is not what "where can I
 rent this" asks. What a card claims about streaming is cut to that list
 either way, by _merge_enrichment, whichever query produced the row.
 
-LangChain is confined to google_interpreter()/google_ranker() at the bottom of
-this file; everything else takes the plain Interpreter/Ranker callables — the
-same dependency-injection shape as TMDBClient's ``transport`` seam — so tests
-fake an async function, not a framework.
+LangChain is confined to the bottom of this file — the google_*() model
+bindings, and the three declared tools (search_catalog, look_up_title, answer),
+which no model is given yet. Everything else takes the plain
+Interpreter/Ranker/Composer callables — the same dependency-injection shape as
+TMDBClient's ``transport`` seam — so tests fake an async function, not a
+framework.
 """
 
 from __future__ import annotations
@@ -62,9 +64,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from tmdb import (
     MIN_VOTE_COUNT,
@@ -88,64 +91,26 @@ from tmdb import (
 
 logger = logging.getLogger("holster.catalog_tool")
 
+# SearchArgs.limit's outer bound, which a larger count is clamped to. Not
+# the most a turn shows; that is RESULT_CEILING.
+LIMIT_MAX = 20
 
-class DiscoverIntent(BaseModel):
-    """interpret()'s output — tmdb.discover()'s creative parameters, none of
-    its identity parameters, plus the fields that are not discover()
-    parameters at all: is_capability_question and clarifying_question,
-    search()'s signal to skip discover()/rank() entirely; title, its signal to
-    look one named title up instead; limit, which sizes the pick list; and
-    reply, what the assistant says while the search runs.
-    watch_region and watch_providers are deliberately absent: which services a
-    query filters on is never the model's to set. What it can set is
-    monetization — whether the turn asks about subscriptions or rentals —
-    which decides whether a provider filter applies at all, never which
-    providers."""
+
+class _IntentBase(BaseModel):
+    """The field SearchArgs and _Routing share, so DiscoverIntent can inherit
+    from both without declaring it twice."""
 
     media_type: MediaType = Field(description="'movie' for films, 'tv' for series.")
-    is_capability_question: bool = Field(
-        default=False,
-        description=(
-            "True only for an explicit question about the assistant itself — "
-            "'what can you do', 'how does this work', a bare 'help' with "
-            "nothing else attached. False for anything that is still a title "
-            "request, however vague — 'what movies do you have', 'surprise "
-            "me', and 'help me find something to watch' are all searches, "
-            "not this."
-        ),
-    )
-    clarifying_question: str = Field(
-        default="",
-        description=(
-            "One short, natural question fishing for what they want to watch "
-            "— a genre, a mood, a favorite film or show to riff on, who "
-            "they're watching with — the way a person would ask, not a form. "
-            "Set it only when there's no real signal to search on yet, "
-            "anywhere in the conversation: no genre, mood, actor, director, "
-            "decade, or title-to-compare-to. Leave it empty the instant any "
-            "of those appears, however small, and also for an explicit "
-            "blind request ('surprise me', 'just pick something') — that is "
-            "a real instruction, not vagueness. Never set it twice in a "
-            "row: if the assistant's last message was already a clarifying "
-            "question, treat whatever the user says next as enough to "
-            "search on, however thin."
-        ),
-    )
-    title: str = Field(
-        default="",
-        description=(
-            "The name of one specific film or show the user is asking about "
-            "by name — 'is The Matrix on Netflix', 'do you have Fargo'. "
-            "Copy it as they wrote it; never correct it, expand it, or "
-            "supply a year, and never put a title here that they did not "
-            "type. Read it only from the current message, never from earlier "
-            "turns of the conversation — a title asked about two turns ago "
-            "is not what they're asking now. Leave it empty when a title is "
-            "named only as a comparison ('something like Heat') — that is a "
-            "search for other titles, so let the mood and genre fields carry "
-            "it instead."
-        ),
-    )
+
+
+class SearchArgs(_IntentBase):
+    """search_catalog's arguments and find_candidates()' input —
+    tmdb.discover()'s creative parameters, none of its identity parameters,
+    plus limit, which sizes the pick list, and reply, what the assistant says
+    while the search runs. watch_region and watch_providers are deliberately
+    absent: which services a query filters on is never the model's to set. The
+    search tool reads them from TurnContext, which no tool schema shows."""
+
     keywords: list[str] = Field(
         default_factory=list,
         description=(
@@ -205,7 +170,7 @@ class DiscoverIntent(BaseModel):
     )
     max_runtime_minutes: int | None = Field(
         default=None,
-        gt=0,
+        ge=1,
         description="Set only when the user gives a time ceiling.",
     )
     release_year_gte: int | None = Field(
@@ -237,16 +202,16 @@ class DiscoverIntent(BaseModel):
             "for more of the same."
         ),
     )
-    # `le` is a permissive outer bound, not the real ceiling — RESULT_CEILING
-    # is, enforced by search(). langchain-google-genai strips minimum/maximum
-    # before Gemini sees the schema (enums it keeps, which is why the enums
-    # above need no matching clamp), so a bound here reaches the model only as
-    # the prose below; tightening it to 10 would turn an ordinary "show me 15"
-    # into a schema error that fails the whole turn (see interpret()).
+    # interpret()'s structured-output call shows Gemini these bounds; a tool's
+    # schema does not — langchain-google-genai drops each argument's minimum and
+    # maximum. On either path _clamp_limit pulls a number outside them back in
+    # before `le` can reject it, which on interpret() would fail the turn.
+    # RESULT_CEILING, enforced by find_candidates(), is the real ceiling; the
+    # prose below is what tells the model ten.
     limit: int = Field(
         default=10,
         ge=1,
-        le=20,
+        le=LIMIT_MAX,
         description=(
             "How many results the user wants back. Leave it at the default "
             "of 10 unless the message actually names a count: 'a couple' is "
@@ -255,11 +220,110 @@ class DiscoverIntent(BaseModel):
             "most a turn shows."
         ),
     )
-    # Defaulted, like every other free-text field here and for the reason
-    # `limit`'s own comment gives: a response this field is missing from still
-    # carries a usable search, and failing the turn over a one-line pleasantry
-    # trades a whole answer for a cosmetic one. _INTERPRET_SYSTEM_PROMPT asks
-    # for it instead, and chat.py treats "" as "no opener".
+    # Defaulted, like every other free-text field here: a response this field
+    # is missing from still carries a usable search, and failing the turn over
+    # a one-line pleasantry trades a whole answer for a cosmetic one.
+    # _INTERPRET_SYSTEM_PROMPT asks for it instead, and chat.py treats "" as
+    # "no opener".
+    reply: str = Field(
+        default="",
+        description=(
+            "The one-line opener that goes above the results — 'one sec while "
+            "I look' — written before any result exists, so it can promise "
+            "nothing about what will be found."
+        ),
+    )
+
+    # Before, not after: `ge`/`le` reject ahead of an after-validator. Only
+    # numbers are clamped; a numeric string is coerced after this runs, so
+    # "25" still fails `le`.
+    @field_validator("limit", mode="before")
+    @classmethod
+    def _clamp_limit(cls, value: Any) -> Any:
+        if isinstance(value, int | float):
+            return min(max(value, 1), LIMIT_MAX)
+        return value
+
+    # A ceiling under a minute is not one the user gave, so it reads as no
+    # ceiling rather than failing an interpret() turn on `ge=1` or, clamped up
+    # like limit, filtering the query on one minute.
+    @field_validator("max_runtime_minutes", mode="before")
+    @classmethod
+    def _clamp_runtime(cls, value: Any) -> Any:
+        if isinstance(value, int | float) and value < 1:
+            return None
+        return value
+
+
+class _Routing(_IntentBase):
+    """interpret()'s fields that choose a path rather than a query: answer a
+    question about the assistant, ask one back, or look one title up."""
+
+    is_capability_question: bool = Field(
+        default=False,
+        description=(
+            "True only for an explicit question about the assistant itself — "
+            "'what can you do', 'how does this work', a bare 'help' with "
+            "nothing else attached. False for anything that is still a title "
+            "request, however vague — 'what movies do you have', 'surprise "
+            "me', and 'help me find something to watch' are all searches, "
+            "not this."
+        ),
+    )
+    clarifying_question: str = Field(
+        default="",
+        description=(
+            "One short, natural question fishing for what they want to watch "
+            "— a genre, a mood, a favorite film or show to riff on, who "
+            "they're watching with — the way a person would ask, not a form. "
+            "Set it only when there's no real signal to search on yet, "
+            "anywhere in the conversation: no genre, mood, actor, director, "
+            "decade, or title-to-compare-to. Leave it empty the instant any "
+            "of those appears, however small, and also for an explicit "
+            "blind request ('surprise me', 'just pick something') — that is "
+            "a real instruction, not vagueness. Never set it twice in a "
+            "row: if the assistant's last message was already a clarifying "
+            "question, treat whatever the user says next as enough to "
+            "search on, however thin."
+        ),
+    )
+    title: str = Field(
+        default="",
+        description=(
+            "The name of one specific film or show the user is asking about "
+            "by name — 'is The Matrix on Netflix', 'do you have Fargo'. "
+            "Copy it as they wrote it; never correct it, expand it, or "
+            "supply a year, and never put a title here that they did not "
+            "type. Read it only from the current message, never from earlier "
+            "turns of the conversation — a title asked about two turns ago "
+            "is not what they're asking now. Leave it empty when a title is "
+            "named only as a comparison ('something like Heat') — that is a "
+            "search for other titles, so let the mood and genre fields carry "
+            "it instead."
+        ),
+    )
+
+
+# Bases in this order on purpose. Pydantic collects fields base-first along
+# the MRO (_IntentBase, _Routing, SearchArgs), so media_type leads, the routing
+# fields follow, and reply comes last — after the fields its description
+# names. Gemini generates a structured response in its schema's property
+# order, and model_dump() — the intent event — uses the same order.
+class DiscoverIntent(SearchArgs, _Routing):
+    """interpret()'s output — tmdb.discover()'s creative parameters, none of
+    its identity parameters, plus the fields that are not discover()
+    parameters at all: is_capability_question and clarifying_question,
+    search()'s signal to skip discover()/rank() entirely; title, its signal to
+    look one named title up instead; limit, which sizes the pick list; and
+    reply, what the assistant says while the search runs.
+    watch_region and watch_providers are deliberately absent: which services a
+    query filters on is never the model's to set. What it can set is
+    monetization — whether the turn asks about subscriptions or rentals —
+    which decides whether a provider filter applies at all, never which
+    providers."""
+
+    # Redeclared for the description alone, which names routing fields
+    # SearchArgs lacks.
     reply: str = Field(
         default="",
         description=(
@@ -1198,6 +1262,358 @@ def _with_target_count(message: str, *, limit: int, floor: int) -> str:
     return f"{message}\n\n{ask}."
 
 
+@dataclass
+class Candidates:
+    """find_candidates()' output: what rank() reads, plus what search() needs
+    to order, cut and explain the picks it returns."""
+
+    # Already filtered by verdicts and shown, in TMDB's own ranking order,
+    # rung 0 first.
+    candidates: list[Title]
+    # The rung each candidate (by tmdb_id) arrived on; 0 is the query as asked.
+    rung_of: dict[int, int]
+    relaxed: list[RelaxedConstraint]
+    limit: int
+    floor: int
+    # Liked titles of this search's media type, as rank() hint lines.
+    taste: list[str]
+    all_judged: bool
+    all_shown: bool
+
+
+async def find_candidates(
+    args: SearchArgs,
+    *,
+    client: TMDBClient,
+    watch_region: str,
+    watch_providers: list[int],
+    verdicts: list[TitleVerdict],
+    shown: list[TitleRef],
+) -> Candidates:
+    """The deterministic TMDB step of a search: page the query, widen it
+    below the floor, exclude what the user judged or was shown, and resolve
+    the taste hint. No model call. search() and the search_catalog tool both
+    run it; search()'s docstring is the contract for everything it does.
+
+    Raises tmdb.TMDBError/TMDBUnavailable from page 1 unwrapped; a failure
+    while widening keeps the rows already in hand instead."""
+    # The band a recommendation list aims for. limit is what paging works
+    # toward and what the pick list is cut to; floor is the weaker target that
+    # fires the ladder and tops the picks up. floor tracks limit rather than
+    # sitting at RESULT_FLOOR flat, so a user who asked for one pick never
+    # fires a rung hunting for five. The min() is the real ceiling;
+    # SearchArgs.limit's `le` is the looser bound a larger count is clamped to.
+    limit = min(args.limit, RESULT_CEILING)
+    floor = min(RESULT_FLOOR, limit)
+
+    # Mutable locals for the soft constraints, cleared one at a time below.
+    # The three ints are copied by value; `keywords`/`genres` alias their
+    # args fields — always rebind (`keywords = []`), never mutate in place,
+    # or the change leaks into the caller's `args`.
+    max_runtime_minutes = args.max_runtime_minutes
+    release_year_gte = args.release_year_gte
+    release_year_lte = args.release_year_lte
+    keywords = args.keywords
+    genres = args.genres
+    min_vote_count: int | None = None
+
+    # Never a rung: the ladder widens a subscription query but never converts
+    # it into a rent one, which would answer a question the user did not ask.
+    # Says nothing about the card, which offers rentals whenever it has stores
+    # to name and the title isn't on the caller's services (title-card.tsx).
+    renting = args.monetization == "rent"
+
+    async def discover(page: int = 1) -> list[Title]:
+        return await client.discover(
+            media_type=args.media_type,
+            watch_region=watch_region,
+            watch_providers=None if renting else watch_providers,
+            monetization=args.monetization,
+            cast=args.cast or None,
+            crew=args.crew or None,
+            keywords=keywords or None,
+            without_keywords=args.without_keywords or None,
+            genres=genres or None,
+            without_genres=args.without_genres or None,
+            max_runtime_minutes=max_runtime_minutes,
+            release_year_gte=release_year_gte,
+            release_year_lte=release_year_lte,
+            sort_by=args.sort_by,
+            min_vote_count=min_vote_count,
+            page=page,
+        )
+
+    # Keyed on both fields: movie 550 and tv 550 are unrelated titles.
+    def key(c: Title) -> tuple[str, int]:
+        return (c["media_type"], c["tmdb_id"])
+
+    # Two sets, not one. `judged` alone decides all_judged below, because a
+    # title the user was merely shown is not one they rated, and reporting it
+    # as rated is false in the exact case "show me more" makes common.
+    judged = {
+        (v.media_type, v.tmdb_id) for v in verdicts if v.verdict != "want_to_watch"
+    }
+    # want_to_watch is deliberately kept by `judged` and just as deliberately
+    # dropped here: saving a title means it stays eligible, not that it should
+    # be handed back on the next "show me 10 more".
+    excluded = judged | {(r.media_type, r.tmdb_id) for r in shown}
+
+    candidates: list[Title] = []
+    relaxed: list[RelaxedConstraint] = []
+    # Which rung each candidate arrived on, so picks can be ordered
+    # exactness-first below. Rung 0 is the query as asked, however many pages
+    # of it were read. Keyed on tmdb_id alone, unlike the exclusion sets:
+    # every candidate here came from discover(media_type=args.media_type),
+    # so the media type carries no information and a second key shape is a
+    # second thing to keep in step.
+    rung_of: dict[int, int] = {}
+
+    # Counts, never filters: the rows themselves stay whole through the ladder
+    # so absorb() can dedupe against them and the filter runs exactly once, on
+    # the union, below.
+    #
+    # Exclusion-aware on purpose: a "show me more" whose whole first page is
+    # already shown sits at zero survivors, and a blind count would never widen
+    # for it. A rung that buys nothing costs only a wasted call, since rungs
+    # accumulate rather than replace, and search()'s cause ladder settles which
+    # story the turn tells, so the user is never told the wrong one.
+    def surviving() -> int:
+        return sum(1 for c in candidates if key(c) not in excluded)
+
+    # The loop's own clock, because asyncio.timeout_at below reads that one.
+    # Both deadlines are absolute from this one read and page 1 is awaited after
+    # it, so page 1's latency comes out of paging's share first and reaches the
+    # rungs' only once it passes PAGING_BUDGET_SECONDS.
+    now = asyncio.get_running_loop().time()
+    ladder_deadline = now + LADDER_BUDGET_SECONDS
+    paging_deadline = now + PAGING_BUDGET_SECONDS
+
+    def thin() -> bool:
+        """Below the floor. Every rung tests this, so the comparison lives in
+        one place; the budget is the timeout_at block below. Call it after the
+        rung's own cheap field guard — this walks the candidate list, and a
+        rung with nothing to drop can't fire anyway."""
+        return surviving() < floor
+
+    def absorb(more: list[Title], rung: int) -> None:
+        """Append a wider query's rows to the narrower query's, deduped —
+        never substitute, or the matches the user actually asked for are lost
+        in the act of being given more. ``rung`` is recorded per title so the
+        sort in search() can put the exact matches back in front.
+        """
+        for c in more:
+            if c["tmdb_id"] in rung_of:
+                continue
+            rung_of[c["tmdb_id"]] = rung
+            candidates.append(c)
+
+    async def page_the_query() -> None:
+        """Read the query as asked past page 1, toward ``limit``. A failed call
+        does not return: it propagates to the ladder's own handler, which keeps
+        the pages already absorbed."""
+        exhausted = False
+        page = 2
+        try:
+            async with asyncio.timeout_at(paging_deadline):
+                while (
+                    not exhausted and page <= MAX_DISCOVER_PAGES and surviving() < limit
+                ):
+                    batch = range(
+                        page, min(page + DISCOVER_BATCH_PAGES, MAX_DISCOVER_PAGES + 1)
+                    )
+                    tasks = [asyncio.create_task(discover(page=p)) for p in batch]
+                    # Awaited in page order, not as they complete, and absorbed
+                    # one at a time: `candidates` order is TMDB's own ranking,
+                    # which rank() reads and the exact-match top-up walks in
+                    # order, so completion order would leave holes in it.
+                    # Absorbing per page is also what keeps the pages that did
+                    # arrive when the clock runs out mid-batch — a gather,
+                    # tmdb.py's gather_all included, discards results its
+                    # children already returned when the deadline cancels it.
+                    #
+                    # Not a TaskGroup: a child TMDBError would surface as a
+                    # BaseExceptionGroup and stop matching the handler below,
+                    # turning a rescued widening into a failed turn.
+                    try:
+                        for task in tasks:
+                            page_rows = await task
+                            absorb(page_rows, 0)
+                            if len(page_rows) < PAGE_SIZE:
+                                exhausted = True
+                            # Checked per page: a met ceiling means the rest of
+                            # this batch is rows rank() would read through for
+                            # picks already found. They cost a request either
+                            # way — batching buys the round trip, not a bigger
+                            # candidate list.
+                            if surviving() >= limit:
+                                break
+                    finally:
+                        # Cancel and nothing else. cancel() clears the
+                        # never-retrieved flag whether or not the task has
+                        # already failed, so no sibling is left unobserved;
+                        # awaiting here would be a yield the deadline can land
+                        # in, replacing a propagating TMDBError with the
+                        # TimeoutError below and sending a TMDB fault on to the
+                        # rungs.
+                        for task in tasks:
+                            task.cancel()
+                    page += len(tasks)
+        except TimeoutError:
+            logger.warning(
+                "catalog paging budget spent, %d candidates in hand", len(candidates)
+            )
+
+    # Paging before relaxing, and toward `limit` rather than `floor` — a thin
+    # page usually means exclusion ate it, and the answer to that is the next
+    # page of what was asked for, not a wider question.
+    #
+    # Page 1 is read whatever the budget has left: it is the answer, not the
+    # widening, so only what follows it is bounded.
+    rows = await discover(page=1)
+    absorb(rows, 0)
+
+    # Everything that widens the answer, under one deadline: an in-flight
+    # discover() is cancelled rather than left to finish its own retries.
+    # timeout_at, not timeout, because page 1 above spent part of the same
+    # budget — so a slow page 1 leaves less room to widen, which is the point.
+    # It bounds the widening only; page 1 can still outlast turnDeadline on a
+    # degraded TMDB (tmdb.py's retry envelope is longer than the turn).
+    try:
+        async with asyncio.timeout_at(ladder_deadline):
+            # A page short of PAGE_SIZE was TMDB's last one, so there is no page
+            # 2 to read. Past the last page TMDB answers 200 with an empty
+            # `results`, so an over-fetched page inside a batch reads as short
+            # rather than failing the batch it is in.
+            if len(rows) == PAGE_SIZE:
+                await page_the_query()
+
+            # Adding a rung, in order: guard on the field's own falsy value
+            # (`is not None` for an int, truthiness for a list) *and* on the
+            # constraint having actually reached TMDB — clearing one that was
+            # already dropped re-sends an identical query and claims a drop
+            # that never happened. Put that cheap guard before thin(), which
+            # walks the candidate list. Number the rung `len(relaxed) + 1`, not
+            # a literal, so reordering can't duplicate one; rung 0 is the query
+            # as asked. absorb() the rows, never assign them. Each rung is
+            # guarded on its own constraint having actually reached TMDB, so a
+            # drop that would re-send an identical query never fires.
+            keywords_applied = any(client.is_keyword_resolved(k) for k in keywords)
+            if keywords_applied and thin():
+                keywords = []
+                absorb(await discover(), len(relaxed) + 1)
+                relaxed.append("keywords")
+
+            if max_runtime_minutes is not None and thin():
+                max_runtime_minutes = None
+                absorb(await discover(), len(relaxed) + 1)
+                relaxed.append("runtime")
+
+            year_is_set = release_year_gte is not None or release_year_lte is not None
+            if year_is_set and thin():
+                release_year_gte = release_year_lte = None
+                absorb(await discover(), len(relaxed) + 1)
+                relaxed.append("year")
+
+            # Genre bends only while an actor or director still says what this search
+            # is about. "A horror movie" widened to "any movie" answers a different
+            # question; "a horror movie with Hanks" widened to "Hanks films" is the
+            # same question asked less narrowly. Keywords above need no such guard
+            # because the interpret prompt *infers* them from tone, so dropping one
+            # discards a guess; the prompt only asks the model to set genres when
+            # the message names one explicitly (SearchArgs.genres), so relaxing
+            # one discards a stated fact, not a guess.
+            #
+            # Resolved, not merely named: _resolve_name drops a person TMDB can't find,
+            # so a typo'd name would widen "a horror movie with <typo>" to "any movie"
+            # — what this guard exists to prevent. Same check the keywords rung makes.
+            subject_remains = any(
+                client.is_person_resolved(n) for n in [*args.cast, *args.crew]
+            )
+            # And the genre has to have reached TMDB at all, for the same reason the
+            # keywords rung checks: the movie and TV vocabularies differ, so a TV
+            # search for "horror" (a movie-only genre) has the constraint dropped by
+            # _genres_into before the request goes out. Clearing it then re-sends an
+            # identical query and tells the user their genre was widened when it was
+            # never applied.
+            genres_applied = any(is_genre_resolved(args.media_type, g) for g in genres)
+            if genres_applied and subject_remains and thin():
+                genres = []
+                absorb(await discover(), len(relaxed) + 1)
+                relaxed.append("genres")
+
+            # Last, and the only rung that drops something the user did not
+            # state. Ordering by rating carries a 1000-vote floor (tmdb.py's
+            # MIN_VOTE_COUNT_TOP_RATED) to stop small-sample inflation, and on a
+            # narrow request that floor is most of the result set: Korean horror
+            # on a six-service account is 15 titles at 200 votes and 3 at 1000.
+            # Lowering the bar restores the other twelve.
+            #
+            # The bar, not the sort. Dropping to vote_count.desc would also
+            # restore them, but rank() is never given a rating (see
+            # _format_candidates), so nothing downstream could put a
+            # most-watched page back into rating order — "the best Korean
+            # horror" would quietly stop being about ratings at all.
+            #
+            # Last on purpose. These rows are exactly the small-sample ratings
+            # the floor exists to suppress, so the rung sort keeps them behind
+            # the confidently-rated ones.
+            if args.sort_by == "vote_average.desc" and thin():
+                min_vote_count = MIN_VOTE_COUNT
+                absorb(await discover(), len(relaxed) + 1)
+                relaxed.append("rating")
+    except TimeoutError:
+        logger.warning(
+            "catalog ladder budget spent, answering with %d candidates",
+            len(candidates),
+        )
+    except TMDBError as exc:
+        # Widening only. Page 1 is outside this block, so a query that found
+        # nothing at all still fails the turn; what this rescues is the
+        # answer already in hand when a *wider* call fails.
+        #
+        # Ends the ladder, where a spent paging clock above falls through to
+        # the rungs: a clock says nothing about whether the next call would
+        # succeed, and a TMDB fault is that same call.
+        logger.warning(
+            "catalog widening failed (%s), answering with %d candidates",
+            exc,
+            len(candidates),
+        )
+
+    # One exclusion pass, at the end, over everything every page and rung
+    # brought back.
+    before_exclusion = len(candidates)
+    not_judged = [c for c in candidates if key(c) not in judged]
+    candidates = [c for c in candidates if key(c) not in excluded]
+    all_judged = bool(before_exclusion) and not not_judged
+    # Survived the verdict filter, removed by the already-shown one: the
+    # query still has answers, the user has just seen them all.
+    all_shown = bool(not_judged) and not candidates
+
+    # This search's media type only — liked TV shows are no hint for "find me
+    # a movie", and each costs a round trip. Guarded on candidates because
+    # rank() short-circuits on an empty list anyway.
+    taste: list[str] = []
+    if candidates:
+        liked = [
+            v
+            for v in verdicts
+            if v.verdict == "liked" and v.media_type == args.media_type
+        ][:MAX_TASTE_TITLES]
+        taste = await _resolve_taste(client, liked)
+
+    return Candidates(
+        candidates=candidates,
+        rung_of=rung_of,
+        relaxed=relaxed,
+        limit=limit,
+        floor=floor,
+        taste=taste,
+        all_judged=all_judged,
+        all_shown=all_shown,
+    )
+
+
 async def search(
     message: str,
     *,
@@ -1324,7 +1740,7 @@ async def search(
     intent = await interpret(
         _with_providers(message, watch_provider_names or []), model=interpret_model
     )
-    # Normalised here, the one place the model's raw output is consumed.
+    # Normalised here, before search() reads any of it.
     # Blank must read as absent: a whitespace-only clarifying_question or title
     # short-circuits below as a real question or a real lookup, a blank title
     # reaches search_titles() as an empty query, and a blank reply must read as
@@ -1373,312 +1789,17 @@ async def search(
             cause=None if picks else "title_not_found",
         )
 
-    # The band a recommendation list aims for. limit is what paging works
-    # toward and what the pick list is cut to; floor is the weaker target that
-    # fires the ladder and tops the picks up. floor tracks limit rather than
-    # sitting at RESULT_FLOOR flat, so a user who asked for one pick never
-    # fires a rung hunting for five. The min() is the real ceiling: see
-    # DiscoverIntent.limit for why its own `le` can't be it.
-    limit = min(intent.limit, RESULT_CEILING)
-    floor = min(RESULT_FLOOR, limit)
-
-    # Mutable locals for the soft constraints, cleared one at a time below.
-    # The three ints are copied by value; `keywords`/`genres` alias their
-    # intent fields — always rebind (`keywords = []`), never mutate in place,
-    # or the change leaks into the CatalogResult.intent this function returns.
-    max_runtime_minutes = intent.max_runtime_minutes
-    release_year_gte = intent.release_year_gte
-    release_year_lte = intent.release_year_lte
-    keywords = intent.keywords
-    genres = intent.genres
-    min_vote_count: int | None = None
-
-    # Never a rung: the ladder widens a subscription query but never converts
-    # it into a rent one, which would answer a question the user did not ask.
-    # Says nothing about the card, which offers rentals whenever it has stores
-    # to name and the title isn't on the caller's services (title-card.tsx).
-    renting = intent.monetization == "rent"
-
-    async def discover(page: int = 1) -> list[Title]:
-        return await client.discover(
-            media_type=intent.media_type,
-            watch_region=watch_region,
-            watch_providers=None if renting else watch_providers,
-            monetization=intent.monetization,
-            cast=intent.cast or None,
-            crew=intent.crew or None,
-            keywords=keywords or None,
-            without_keywords=intent.without_keywords or None,
-            genres=genres or None,
-            without_genres=intent.without_genres or None,
-            max_runtime_minutes=max_runtime_minutes,
-            release_year_gte=release_year_gte,
-            release_year_lte=release_year_lte,
-            sort_by=intent.sort_by,
-            min_vote_count=min_vote_count,
-            page=page,
-        )
-
-    # Keyed on both fields: movie 550 and tv 550 are unrelated titles.
-    def key(c: Title) -> tuple[str, int]:
-        return (c["media_type"], c["tmdb_id"])
-
-    # Two sets, not one. `judged` alone decides all_judged below, because a
-    # title the user was merely shown is not one they rated, and reporting it
-    # as rated is false in the exact case "show me more" makes common.
-    judged = {
-        (v.media_type, v.tmdb_id) for v in verdicts if v.verdict != "want_to_watch"
-    }
-    # want_to_watch is deliberately kept by `judged` and just as deliberately
-    # dropped here: saving a title means it stays eligible, not that it should
-    # be handed back on the next "show me 10 more".
-    excluded = judged | {(r.media_type, r.tmdb_id) for r in shown}
-
-    candidates: list[Title] = []
-    relaxed: list[RelaxedConstraint] = []
-    # Which rung each candidate arrived on, so picks can be ordered
-    # exactness-first below. Rung 0 is the query as asked, however many pages
-    # of it were read. Keyed on tmdb_id alone, unlike the exclusion sets:
-    # every candidate here came from discover(media_type=intent.media_type),
-    # so the media type carries no information and a second key shape is a
-    # second thing to keep in step.
-    rung_of: dict[int, int] = {}
-
-    # Counts, never filters: the rows themselves stay whole through the ladder
-    # so absorb() can dedupe against them and the filter runs exactly once, on
-    # the union, below.
-    #
-    # Exclusion-aware on purpose: a "show me more" whose whole first page is
-    # already shown sits at zero survivors, and a blind count would never widen
-    # for it. A rung that buys nothing costs only a wasted call, since rungs
-    # accumulate rather than replace, and the cause ladder below settles which
-    # story the turn tells, so the user is never told the wrong one.
-    def surviving() -> int:
-        return sum(1 for c in candidates if key(c) not in excluded)
-
-    # The loop's own clock, because asyncio.timeout_at below reads that one.
-    # Both deadlines are absolute from this one read and page 1 is awaited after
-    # it, so page 1's latency comes out of paging's share first and reaches the
-    # rungs' only once it passes PAGING_BUDGET_SECONDS.
-    now = asyncio.get_running_loop().time()
-    ladder_deadline = now + LADDER_BUDGET_SECONDS
-    paging_deadline = now + PAGING_BUDGET_SECONDS
-
-    def thin() -> bool:
-        """Below the floor. Every rung tests this, so the comparison lives in
-        one place; the budget is the timeout_at block below. Call it after the
-        rung's own cheap field guard — this walks the candidate list, and a
-        rung with nothing to drop can't fire anyway."""
-        return surviving() < floor
-
-    def absorb(more: list[Title], rung: int) -> None:
-        """Append a wider query's rows to the narrower query's, deduped —
-        never substitute, or the matches the user actually asked for are lost
-        in the act of being given more. ``rung`` is recorded per title so the
-        sort at the end can put the exact matches back in front.
-        """
-        for c in more:
-            if c["tmdb_id"] in rung_of:
-                continue
-            rung_of[c["tmdb_id"]] = rung
-            candidates.append(c)
-
-    async def page_the_query() -> None:
-        """Read the query as asked past page 1, toward ``limit``. A failed call
-        does not return: it propagates to the ladder's own handler, which keeps
-        the pages already absorbed."""
-        exhausted = False
-        page = 2
-        try:
-            async with asyncio.timeout_at(paging_deadline):
-                while (
-                    not exhausted and page <= MAX_DISCOVER_PAGES and surviving() < limit
-                ):
-                    batch = range(
-                        page, min(page + DISCOVER_BATCH_PAGES, MAX_DISCOVER_PAGES + 1)
-                    )
-                    tasks = [asyncio.create_task(discover(page=p)) for p in batch]
-                    # Awaited in page order, not as they complete, and absorbed
-                    # one at a time: `candidates` order is TMDB's own ranking,
-                    # which rank() reads and the exact-match top-up walks in
-                    # order, so completion order would leave holes in it.
-                    # Absorbing per page is also what keeps the pages that did
-                    # arrive when the clock runs out mid-batch — a gather,
-                    # tmdb.py's gather_all included, discards results its
-                    # children already returned when the deadline cancels it.
-                    #
-                    # Not a TaskGroup: a child TMDBError would surface as a
-                    # BaseExceptionGroup and stop matching the handler below,
-                    # turning a rescued widening into a failed turn.
-                    try:
-                        for task in tasks:
-                            page_rows = await task
-                            absorb(page_rows, 0)
-                            if len(page_rows) < PAGE_SIZE:
-                                exhausted = True
-                            # Checked per page: a met ceiling means the rest of
-                            # this batch is rows rank() would read through for
-                            # picks already found. They cost a request either
-                            # way — batching buys the round trip, not a bigger
-                            # candidate list.
-                            if surviving() >= limit:
-                                break
-                    finally:
-                        # Cancel and nothing else. cancel() clears the
-                        # never-retrieved flag whether or not the task has
-                        # already failed, so no sibling is left unobserved;
-                        # awaiting here would be a yield the deadline can land
-                        # in, replacing a propagating TMDBError with the
-                        # TimeoutError below and sending a TMDB fault on to the
-                        # rungs.
-                        for task in tasks:
-                            task.cancel()
-                    page += len(tasks)
-        except TimeoutError:
-            logger.warning(
-                "catalog paging budget spent, %d candidates in hand", len(candidates)
-            )
-
-    # Paging before relaxing, and toward `limit` rather than `floor` — a thin
-    # page usually means exclusion ate it, and the answer to that is the next
-    # page of what was asked for, not a wider question.
-    #
-    # Page 1 is read whatever the budget has left: it is the answer, not the
-    # widening, so only what follows it is bounded.
-    rows = await discover(page=1)
-    absorb(rows, 0)
-
-    # Everything that widens the answer, under one deadline: an in-flight
-    # discover() is cancelled rather than left to finish its own retries.
-    # timeout_at, not timeout, because page 1 above spent part of the same
-    # budget — so a slow page 1 leaves less room to widen, which is the point.
-    # It bounds the widening only; page 1 can still outlast turnDeadline on a
-    # degraded TMDB (tmdb.py's retry envelope is longer than the turn).
-    try:
-        async with asyncio.timeout_at(ladder_deadline):
-            # A page short of PAGE_SIZE was TMDB's last one, so there is no page
-            # 2 to read. Past the last page TMDB answers 200 with an empty
-            # `results`, so an over-fetched page inside a batch reads as short
-            # rather than failing the batch it is in.
-            if len(rows) == PAGE_SIZE:
-                await page_the_query()
-
-            # Adding a rung, in order: guard on the field's own falsy value
-            # (`is not None` for an int, truthiness for a list) *and* on the
-            # constraint having actually reached TMDB — clearing one that was
-            # already dropped re-sends an identical query and claims a drop
-            # that never happened. Put that cheap guard before thin(), which
-            # walks the candidate list. Number the rung `len(relaxed) + 1`, not
-            # a literal, so reordering can't duplicate one; rung 0 is the query
-            # as asked. absorb() the rows, never assign them. Each rung is
-            # guarded on its own constraint having actually reached TMDB, so a
-            # drop that would re-send an identical query never fires.
-            keywords_applied = any(client.is_keyword_resolved(k) for k in keywords)
-            if keywords_applied and thin():
-                keywords = []
-                absorb(await discover(), len(relaxed) + 1)
-                relaxed.append("keywords")
-
-            if max_runtime_minutes is not None and thin():
-                max_runtime_minutes = None
-                absorb(await discover(), len(relaxed) + 1)
-                relaxed.append("runtime")
-
-            year_is_set = release_year_gte is not None or release_year_lte is not None
-            if year_is_set and thin():
-                release_year_gte = release_year_lte = None
-                absorb(await discover(), len(relaxed) + 1)
-                relaxed.append("year")
-
-            # Genre bends only while an actor or director still says what this search
-            # is about. "A horror movie" widened to "any movie" answers a different
-            # question; "a horror movie with Hanks" widened to "Hanks films" is the
-            # same question asked less narrowly. Keywords above need no such guard
-            # because the interpret prompt *infers* them from tone, so dropping one
-            # discards a guess; the prompt only asks the model to set genres when
-            # the message names one explicitly (DiscoverIntent.genres), so relaxing
-            # one discards a stated fact, not a guess.
-            #
-            # Resolved, not merely named: _resolve_name drops a person TMDB can't find,
-            # so a typo'd name would widen "a horror movie with <typo>" to "any movie"
-            # — what this guard exists to prevent. Same check the keywords rung makes.
-            subject_remains = any(
-                client.is_person_resolved(n) for n in [*intent.cast, *intent.crew]
-            )
-            # And the genre has to have reached TMDB at all, for the same reason the
-            # keywords rung checks: the movie and TV vocabularies differ, so a TV
-            # search for "horror" (a movie-only genre) has the constraint dropped by
-            # _genres_into before the request goes out. Clearing it then re-sends an
-            # identical query and tells the user their genre was widened when it was
-            # never applied.
-            genres_applied = any(
-                is_genre_resolved(intent.media_type, g) for g in genres
-            )
-            if genres_applied and subject_remains and thin():
-                genres = []
-                absorb(await discover(), len(relaxed) + 1)
-                relaxed.append("genres")
-
-            # Last, and the only rung that drops something the user did not
-            # state. Ordering by rating carries a 1000-vote floor (tmdb.py's
-            # MIN_VOTE_COUNT_TOP_RATED) to stop small-sample inflation, and on a
-            # narrow request that floor is most of the result set: Korean horror
-            # on a six-service account is 15 titles at 200 votes and 3 at 1000.
-            # Lowering the bar restores the other twelve.
-            #
-            # The bar, not the sort. Dropping to vote_count.desc would also
-            # restore them, but rank() is never given a rating (see
-            # _format_candidates), so nothing downstream could put a
-            # most-watched page back into rating order — "the best Korean
-            # horror" would quietly stop being about ratings at all.
-            #
-            # Last on purpose. These rows are exactly the small-sample ratings
-            # the floor exists to suppress, so the rung sort keeps them behind
-            # the confidently-rated ones.
-            if intent.sort_by == "vote_average.desc" and thin():
-                min_vote_count = MIN_VOTE_COUNT
-                absorb(await discover(), len(relaxed) + 1)
-                relaxed.append("rating")
-    except TimeoutError:
-        logger.warning(
-            "catalog ladder budget spent, answering with %d candidates",
-            len(candidates),
-        )
-    except TMDBError as exc:
-        # Widening only. Page 1 is outside this block, so a query that found
-        # nothing at all still fails the turn; what this rescues is the
-        # answer already in hand when a *wider* call fails.
-        #
-        # Ends the ladder, where a spent paging clock above falls through to
-        # the rungs: a clock says nothing about whether the next call would
-        # succeed, and a TMDB fault is that same call.
-        logger.warning(
-            "catalog widening failed (%s), answering with %d candidates",
-            exc,
-            len(candidates),
-        )
-
-    # One exclusion pass, at the end, over everything every page and rung
-    # brought back.
-    before_exclusion = len(candidates)
-    not_judged = [c for c in candidates if key(c) not in judged]
-    candidates = [c for c in candidates if key(c) not in excluded]
-    all_judged = bool(before_exclusion) and not not_judged
-    # Survived the verdict filter, removed by the already-shown one: the
-    # query still has answers, the user has just seen them all.
-    all_shown = bool(not_judged) and not candidates
-
-    # This search's media type only — liked TV shows are no hint for "find me
-    # a movie", and each costs a round trip. Guarded on candidates because
-    # rank() short-circuits on an empty list anyway.
-    taste: list[str] = []
-    if candidates:
-        liked = [
-            v
-            for v in verdicts
-            if v.verdict == "liked" and v.media_type == intent.media_type
-        ][:MAX_TASTE_TITLES]
-        taste = await _resolve_taste(client, liked)
+    found = await find_candidates(
+        intent,
+        client=client,
+        watch_region=watch_region,
+        watch_providers=watch_providers,
+        verdicts=verdicts,
+        shown=shown,
+    )
+    candidates, rung_of, relaxed = found.candidates, found.rung_of, found.relaxed
+    limit, floor, taste = found.limit, found.floor, found.taste
+    all_judged, all_shown = found.all_judged, found.all_shown
 
     ranked = await rank(
         _with_target_count(_with_taste(message, taste), limit=limit, floor=floor),
@@ -1991,3 +2112,120 @@ def google_ranker(model: BaseChatModel) -> Ranker:
         return cast(RankResult, result)
 
     return call
+
+
+@dataclass
+class TurnContext:
+    """What the tools read from the run rather than from the model: the
+    caller's own TMDB client, country, ticked services, verdicts and shown
+    titles. A ToolRuntime parameter is left out of a tool's schema, so none of
+    these is a field the model can fill."""
+
+    client: TMDBClient
+    watch_region: str
+    # Never empty: chat.py answers a caller with no ticked services before any
+    # search runs, and discover() raises on an empty list.
+    watch_providers: list[int]
+    verdicts: list[TitleVerdict]
+    shown: list[TitleRef]
+
+
+@tool(args_schema=SearchArgs)
+async def search_catalog(runtime: ToolRuntime[TurnContext], **fields: Any) -> str:
+    """Find films or shows to recommend from a description — a mood, a genre,
+    a person, a decade, or a title to compare to ('something like Heat'). Use
+    it for every request for titles that does not name one specific film or
+    show the user is asking about, including a blind 'surprise me'."""
+    # fields arrive already validated against SearchArgs, defaults filled in;
+    # rebuilding the model is what gives find_candidates() a typed argument.
+    context = runtime.context
+    found = await find_candidates(
+        SearchArgs(**fields),
+        client=context.client,
+        watch_region=context.watch_region,
+        watch_providers=context.watch_providers,
+        verdicts=context.verdicts,
+        shown=context.shown,
+    )
+    return _format_candidates(found.candidates)
+
+
+# LookUpArgs, AnswerArgs and the tool docstrings restate DiscoverIntent's
+# title, is_capability_question, clarifying_question and reply descriptions,
+# which interpret() still sends. A wording change belongs in both.
+class LookUpArgs(BaseModel):
+    title: str = Field(
+        description=(
+            "The name of the one film or show the user is asking about — 'is "
+            "The Matrix on Netflix', 'do you have Fargo'. Copy it as they "
+            "wrote it; never correct it, expand it, or supply a year, and "
+            "never put a title here that they did not type. Read it only from "
+            "the current message, never from earlier turns of the conversation."
+        )
+    )
+    reply: str = Field(
+        default="",
+        description=(
+            "The one-line opener that goes above the answer — 'let me check "
+            "where that is streaming' — written before anything is found, so "
+            "it can promise nothing about what will be found."
+        ),
+    )
+
+    # One line for the reason search() gives _one_line, and never blank:
+    # search() takes the lookup path only on a non-blank title, and a blank one
+    # would reach TMDB as an empty query.
+    @field_validator("title")
+    @classmethod
+    def _one_nonblank_line(cls, value: str) -> str:
+        value = _one_line(value)
+        if not value:
+            raise ValueError("title is blank")
+        return value
+
+
+@tool(args_schema=LookUpArgs)
+async def look_up_title(
+    runtime: ToolRuntime[TurnContext], title: str, reply: str = ""
+) -> str:
+    """Look up one specific film or show the user asks about by name — 'is The
+    Matrix on Netflix', 'do you have Fargo' — and where it is streaming. Not
+    for a title named only as a comparison ('something like Heat'): that is a
+    search for other titles."""
+    context = runtime.context
+    picks = await lookup_title(
+        title,
+        client=context.client,
+        watch_region=context.watch_region,
+        watch_providers=context.watch_providers,
+    )
+    return json.dumps(picks)
+
+
+class AnswerArgs(BaseModel):
+    text: str = Field(
+        description=(
+            "The whole reply, in the assistant's own words. For a capability "
+            "question: say what you can do, name the user's own streaming "
+            "services if the request lists them, and invite them to describe "
+            "a mood or a genre. For a clarifying question: one short, natural "
+            "question fishing for what they want to watch — a genre, a mood, a "
+            "favorite film or show to riff on, who they're watching with."
+        )
+    )
+    kind: Literal["capability", "clarifying"] = Field(
+        description=(
+            "'capability' for a question about the assistant itself; "
+            "'clarifying' when asking what they want to watch."
+        )
+    )
+
+
+@tool(args_schema=AnswerArgs)
+async def answer(text: str, kind: Literal["capability", "clarifying"]) -> str:
+    """Reply without searching: when the user asks about the assistant itself
+    ('what can you do', a bare 'help'), or when nothing in the conversation
+    says what they want to watch yet — no genre, mood, person, decade, or
+    title to compare to. Never ask twice in a row: if the assistant's last
+    message already asked, search on whatever the user said next."""
+    return _one_line(text)

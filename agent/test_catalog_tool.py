@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 
 import httpx2
 import pytest
+from pydantic import ValidationError
 
 import catalog_tool
 import tmdb
@@ -25,6 +26,7 @@ from catalog_tool import (
     _TONE,
     _UNAVAILABLE_PLACEHOLDER,
     DISCOVER_BATCH_PAGES,
+    LIMIT_MAX,
     MAX_DISCOVER_PAGES,
     MAX_TASTE_TITLES,
     MAX_TITLE_MATCHES,
@@ -3662,3 +3664,54 @@ def test_the_answer_rules_reach_the_two_prompts_that_write_stored_text() -> None
     assert _ANSWER_RULES in _INTERPRET_SYSTEM_PROMPT
     assert _ANSWER_RULES in _OUTCOME_SYSTEM_PROMPT
     assert _ANSWER_RULES not in _RANK_SYSTEM_PROMPT
+
+
+def test_a_count_past_the_schema_bound_clamps_instead_of_failing() -> None:
+    """A rejected field fails an interpret() turn, so "show me 25" must
+    arrive as the bound rather than as a validation error. A whole-number
+    float too: a JSON number need not be an integer literal."""
+    assert make_intent(limit=25).limit == LIMIT_MAX
+    assert make_intent(limit=25.0).limit == LIMIT_MAX
+    assert make_intent(limit=0).limit == 1
+
+
+def test_a_runtime_ceiling_under_a_minute_reads_as_none() -> None:
+    """Not a ceiling the user gave: rejected, it would fail the turn; clamped
+    up to 1, it would filter on a minute."""
+    assert make_intent(max_runtime_minutes=0).max_runtime_minutes is None
+    assert make_intent(max_runtime_minutes=-30).max_runtime_minutes is None
+    assert make_intent(max_runtime_minutes=0.5).max_runtime_minutes is None
+    assert make_intent(max_runtime_minutes=90).max_runtime_minutes == 90
+
+
+def test_a_count_that_is_not_a_number_still_fails() -> None:
+    with pytest.raises(ValidationError):
+        make_intent(limit="lots")
+
+
+def test_interpret_schema_keeps_the_routing_fields_ahead_of_the_search() -> None:
+    """Gemini writes a structured response in schema order, and reply's
+    description depends on is_capability_question and clarifying_question
+    having been decided first. model_dump() — the intent event — follows the
+    same order."""
+    order = [
+        "media_type",
+        "is_capability_question",
+        "clarifying_question",
+        "title",
+        "keywords",
+        "without_keywords",
+        "genres",
+        "without_genres",
+        "cast",
+        "crew",
+        "max_runtime_minutes",
+        "release_year_gte",
+        "release_year_lte",
+        "sort_by",
+        "monetization",
+        "limit",
+        "reply",
+    ]
+    assert list(DiscoverIntent.model_json_schema()["properties"]) == order
+    assert list(make_intent().model_dump()) == order

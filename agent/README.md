@@ -152,7 +152,21 @@ a rung is about to make. It is a deadline around the whole widening, so a call a
 in flight is cancelled rather than left to finish its own retries; page 1 sits outside
 it, being the answer rather than the widening. What accumulated is then the reply —
 which makes it a real answer rather than a truncated one.
-LangChain is confined to `google_interpreter()`/`google_ranker()`; everything
+That deterministic part — paging, the rungs, exclusion and the taste hint — is
+`find_candidates()`, which `search()` calls and which takes no model.
+
+Three agent tools are declared beside it, not yet given to any model:
+`search_catalog`, whose arguments (`SearchArgs`) are `DiscoverIntent`'s search fields
+and `reply`, under the same names, and whose body runs `find_candidates()`;
+`look_up_title(title, reply)`, which runs `lookup_title()`; and
+`answer(text, kind)`, for a capability or clarifying reply. The caller's region,
+services, verdicts and shown titles reach a tool through its run context
+(`TurnContext`), which LangChain leaves out of the schema the model is sent — so, as
+with `DiscoverIntent`, no argument lets the model choose them. A `limit` past its schema
+bound is clamped to it, so "show me 25" asks for 20, and a runtime ceiling under a minute
+reads as no ceiling.
+
+LangChain is confined to the `google_*()` model bindings and those tools; everything
 else takes a plain async callable, the same shape as `TMDBClient`'s `transport=`.
 
 ## Chat pipeline
@@ -289,5 +303,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy .
 ```
 
 The suite runs offline: `test_tmdb.py` against a mock transport, `test_catalog_tool.py`
-against that plus fake interpret/rank callables. Nothing here calls TMDB or the model —
+against that plus fake interpret/rank callables, and `test_agent_tools.py` against the
+tools' schemas and `testutil.ScriptedChatModel`, a chat model that answers each call with
+the next scripted message. Nothing here calls TMDB or the model —
 prompt behaviour is checked by running the app, not by asserting on a model's output.
