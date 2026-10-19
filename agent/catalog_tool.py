@@ -1,56 +1,60 @@
 """Catalog tool — turns a message into ranked, real TMDB titles.
 
-Two model calls around one deterministic TMDB step, never an agent loop:
+A LangChain agent bounded to two model calls around one deterministic TMDB
+step (TwoCallTurn holds the bound):
 
-    interpret()  message      -> DiscoverIntent   (what to search for)
-    tmdb.discover()           -> list[Title]       (TMDB applies every hard
-                                                     constraint: service,
+    interpret call   message     -> one tool call   (search_catalog's
+                                                     arguments: what to
+                                                     search for)
+    search_catalog   find_candidates() -> list[Title]  (TMDB applies every
+                                                     hard constraint: service,
                                                      region, runtime, year,
                                                      genre, exclusions)
-    rank()       candidates   -> list[RankedPick]  (pick from what's real,
+    rank call        candidates  -> RankResult      (pick from what's real,
                                                      explain the fit)
+    finish_search()  RankResult  -> picks           (validate, order, cut,
+                                                     enrich)
 
-This is structurally two calls, not a style choice: rank() must condition on
-the real candidates discover() returns, which do not exist until interpret()'s
-output has been used to call TMDB. (Below the result floor — see
-``RESULT_FLOOR`` — the TMDB step retries with progressively fewer soft
-constraints; see search().)
+This is structurally two calls, not a style choice: the rank call must
+condition on the real candidates discover() returns, which do not exist until
+the interpret call's arguments have been used to call TMDB. (Below the result
+floor — see ``RESULT_FLOOR`` — the TMDB step retries with progressively fewer
+soft constraints; see find_candidates().)
 
-A message naming a film or show takes a shorter path — interpret() sets
-DiscoverIntent.title, and search() answers with the titles carrying that name
-rather than a discover() query, one model call instead of two (see
-lookup_title()).
+A message naming a film or show takes a shorter path — the interpret call
+picks look_up_title, which answers with the titles carrying that name rather
+than a discover() query, one model call instead of two (see lookup_title()).
+A question about the assistant, or one asked back, is the answer tool: one
+call, no TMDB.
 
-Both steps read text anyone can edit — the user's message, and the overviews
-TMDB lets third parties write — but they differ in blast radius. interpret()'s
-output populates tmdb.discover()'s already-typed parameter surface (Literals,
-and bounds on ``limit``, runtime, and year), so a manipulated message can at
-most produce a weird-but-valid query. rank()'s output schema carries no title
-metadata — only a selected id and a blurb — so a manipulated overview can win
-a bad blurb, never assert a fake title, year, or availability.
-``title`` is the one field that is free text rather than a bounded parameter:
-it reaches TMDB as a ``query`` term, the same way the model's cast, crew and
-keyword names already do. What bounds it is not its type but its destination —
-the endpoint is a literal and every card is a real TMDB row fetched by id. rank()'s
-id-validation doesn't apply on that path since rank() never runs there;
-lookup_title() only ever enriches rows TMDB returned.
+Both calls read text anyone can edit — the user's message, and the overviews
+TMDB lets third parties write — but they differ in blast radius. The interpret
+call's output populates tmdb.discover()'s already-typed parameter surface
+(Literals, and bounds on ``limit``, runtime, and year), so a manipulated
+message can at most produce a weird-but-valid query. The rank call's output
+schema carries no title metadata — only a selected id and a blurb — so a
+manipulated overview can win a bad blurb, never assert a fake title, year, or
+availability. ``title`` is free text rather than a bounded parameter, and it
+reaches TMDB as a ``query`` term the same way the model's cast, crew and
+keyword names do. What bounds it is not its
+type but its destination — the endpoint is a literal and every card is a real
+TMDB row fetched by id. finish_search()'s id-validation doesn't apply on that
+path since no rank call runs there; lookup_title() only ever enriches rows
+TMDB returned.
 
-watch_region and watch_providers are keyword arguments to search(), never
-fields the model can set, so which services results come from is never the
-model's choice. What it can choose is whether the turn asks about
-subscriptions or about rentals
-(DiscoverIntent.monetization). A subscription query is filtered to the
-caller's own services; a rent query carries no provider list, since the
-ticked list is what the user subscribes to and that is not what "where can I
-rent this" asks. What a card claims about streaming is cut to that list
-either way, by _merge_enrichment, whichever query produced the row.
+watch_region and watch_providers reach the tools through TurnContext, never
+as arguments the model can set, so which services results come from is never
+the model's choice. What it can choose is whether the turn asks about
+subscriptions or about rentals (SearchArgs.monetization). A subscription query
+is filtered to the caller's own services; a rent query carries no provider
+list, since the ticked list is what the user subscribes to and that is not
+what "where can I rent this" asks. What a card claims about streaming is cut
+to that list either way, by _merge_enrichment, whichever query produced the
+row.
 
-LangChain is confined to the bottom of this file — the google_*() model
-bindings, and the three declared tools (search_catalog, look_up_title, answer),
-which no model is given yet. Everything else takes the plain
-Interpreter/Ranker/Composer callables — the same dependency-injection shape as
-TMDBClient's ``transport`` seam — so tests fake an async function, not a
-framework.
+LangChain lives at the bottom of this file — the agent, its tools, the
+TwoCallTurn middleware and the composer's model binding. Everything above it
+is plain TMDB and Python, tested without a model.
 """
 
 from __future__ import annotations
@@ -62,11 +66,24 @@ import re
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, NotRequired, cast
 
+from langchain.agents import AgentState, create_agent
+from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
+from langchain.agents.middleware.types import InputAgentState, OutputAgentState
+from langchain.agents.structured_output import ProviderStrategy
 from langchain.tools import ToolRuntime, tool
+from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolCall,
+    ToolMessage,
+)
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
 from tmdb import (
@@ -96,14 +113,7 @@ logger = logging.getLogger("holster.catalog_tool")
 LIMIT_MAX = 20
 
 
-class _IntentBase(BaseModel):
-    """The field SearchArgs and _Routing share, so DiscoverIntent can inherit
-    from both without declaring it twice."""
-
-    media_type: MediaType = Field(description="'movie' for films, 'tv' for series.")
-
-
-class SearchArgs(_IntentBase):
+class SearchArgs(BaseModel):
     """search_catalog's arguments and find_candidates()' input —
     tmdb.discover()'s creative parameters, none of its identity parameters,
     plus limit, which sizes the pick list, and reply, what the assistant says
@@ -111,6 +121,7 @@ class SearchArgs(_IntentBase):
     absent: which services a query filters on is never the model's to set. The
     search tool reads them from TurnContext, which no tool schema shows."""
 
+    media_type: MediaType = Field(description="'movie' for films, 'tv' for series.")
     keywords: list[str] = Field(
         default_factory=list,
         description=(
@@ -202,10 +213,9 @@ class SearchArgs(_IntentBase):
             "for more of the same."
         ),
     )
-    # interpret()'s structured-output call shows Gemini these bounds; a tool's
-    # schema does not — langchain-google-genai drops each argument's minimum and
-    # maximum. On either path _clamp_limit pulls a number outside them back in
-    # before `le` can reject it, which on interpret() would fail the turn.
+    # Gemini never sees these bounds: langchain-google-genai drops each tool
+    # argument's minimum and maximum. _clamp_limit pulls a number outside them
+    # back in before `le` can reject it, which would fail the turn.
     # RESULT_CEILING, enforced by find_candidates(), is the real ceiling; the
     # prose below is what tells the model ten.
     limit: int = Field(
@@ -223,8 +233,8 @@ class SearchArgs(_IntentBase):
     # Defaulted, like every other free-text field here: a response this field
     # is missing from still carries a usable search, and failing the turn over
     # a one-line pleasantry trades a whole answer for a cosmetic one.
-    # _INTERPRET_SYSTEM_PROMPT asks for it instead, and chat.py treats "" as
-    # "no opener".
+    # _INTERPRET_SYSTEM_PROMPT asks for it instead, and search_catalog treats
+    # "" as "no opener".
     reply: str = Field(
         default="",
         description=(
@@ -245,7 +255,7 @@ class SearchArgs(_IntentBase):
         return value
 
     # A ceiling under a minute is not one the user gave, so it reads as no
-    # ceiling rather than failing an interpret() turn on `ge=1` or, clamped up
+    # ceiling rather than failing the turn on `ge=1` or, clamped up
     # like limit, filtering the query on one minute.
     @field_validator("max_runtime_minutes", mode="before")
     @classmethod
@@ -254,99 +264,22 @@ class SearchArgs(_IntentBase):
             return None
         return value
 
-
-class _Routing(_IntentBase):
-    """interpret()'s fields that choose a path rather than a query: answer a
-    question about the assistant, ask one back, or look one title up."""
-
-    is_capability_question: bool = Field(
-        default=False,
-        description=(
-            "True only for an explicit question about the assistant itself — "
-            "'what can you do', 'how does this work', a bare 'help' with "
-            "nothing else attached. False for anything that is still a title "
-            "request, however vague — 'what movies do you have', 'surprise "
-            "me', and 'help me find something to watch' are all searches, "
-            "not this."
-        ),
-    )
-    clarifying_question: str = Field(
-        default="",
-        description=(
-            "One short, natural question fishing for what they want to watch "
-            "— a genre, a mood, a favorite film or show to riff on, who "
-            "they're watching with — the way a person would ask, not a form. "
-            "Set it only when there's no real signal to search on yet, "
-            "anywhere in the conversation: no genre, mood, actor, director, "
-            "decade, or title-to-compare-to. Leave it empty the instant any "
-            "of those appears, however small, and also for an explicit "
-            "blind request ('surprise me', 'just pick something') — that is "
-            "a real instruction, not vagueness. Never set it twice in a "
-            "row: if the assistant's last message was already a clarifying "
-            "question, treat whatever the user says next as enough to "
-            "search on, however thin."
-        ),
-    )
-    title: str = Field(
-        default="",
-        description=(
-            "The name of one specific film or show the user is asking about "
-            "by name — 'is The Matrix on Netflix', 'do you have Fargo'. "
-            "Copy it as they wrote it; never correct it, expand it, or "
-            "supply a year, and never put a title here that they did not "
-            "type. Read it only from the current message, never from earlier "
-            "turns of the conversation — a title asked about two turns ago "
-            "is not what they're asking now. Leave it empty when a title is "
-            "named only as a comparison ('something like Heat') — that is a "
-            "search for other titles, so let the mood and genre fields carry "
-            "it instead."
-        ),
-    )
-
-
-# Bases in this order on purpose. Pydantic collects fields base-first along
-# the MRO (_IntentBase, _Routing, SearchArgs), so media_type leads, the routing
-# fields follow, and reply comes last — after the fields its description
-# names. Gemini generates a structured response in its schema's property
-# order, and model_dump() — the intent event — uses the same order.
-class DiscoverIntent(SearchArgs, _Routing):
-    """interpret()'s output — tmdb.discover()'s creative parameters, none of
-    its identity parameters, plus the fields that are not discover()
-    parameters at all: is_capability_question and clarifying_question,
-    search()'s signal to skip discover()/rank() entirely; title, its signal to
-    look one named title up instead; limit, which sizes the pick list; and
-    reply, what the assistant says while the search runs.
-    watch_region and watch_providers are deliberately absent: which services a
-    query filters on is never the model's to set. What it can set is
-    monetization — whether the turn asks about subscriptions or rentals —
-    which decides whether a provider filter applies at all, never which
-    providers."""
-
-    # Redeclared for the description alone, which names routing fields
-    # SearchArgs lacks.
-    reply: str = Field(
-        default="",
-        description=(
-            "What the assistant says to the user, in its own words. On a "
-            "search or a lookup this is the one-line opener that goes above "
-            "the results — 'one sec while I look', 'let me check where that "
-            "is streaming' — written before any result exists, so it can "
-            "promise nothing about what will be found. When "
-            "is_capability_question is true this is the whole answer instead: "
-            "say what you can do, name the user's own streaming services if "
-            "the request lists them, and invite them to describe a mood or a "
-            "genre. Leave it empty when clarifying_question is set — that "
-            "question is already the reply, and two sentences would say the "
-            "same thing twice."
-        ),
-    )
+    # Clamped, not dropped like a sub-minute runtime: the year still reaches
+    # TMDB, so find_candidates' year rung decides whether to widen past it and
+    # records it in `relaxed`. None would search every year with no note.
+    @field_validator("release_year_gte", "release_year_lte", mode="before")
+    @classmethod
+    def _clamp_year(cls, value: Any) -> Any:
+        if isinstance(value, int | float):
+            return min(max(value, 1900), 2100)
+        return value
 
 
 class RankedPick(BaseModel):
-    """rank()'s output for one title. No title/year/overview/media_type field
-    exists here on purpose: catalog facts always come from the real candidate
-    list, never from the model. media_type in particular is redundant — every
-    candidate in one search() call already shares the single media_type
+    """The rank call's output for one title. No title/year/overview/media_type
+    field exists here on purpose: catalog facts always come from the real
+    candidate list, never from the model. media_type in particular is
+    redundant — every candidate in one search already shares the single media_type
     discover() was called with — so it isn't asked of the model at all,
     closing off a spurious-drop risk if the model echoed it back wrong."""
 
@@ -361,20 +294,21 @@ class RankResult(BaseModel):
 
 
 class CatalogToolError(Exception):
-    """The model step of this pipeline — interpret() or rank() — failed: a
-    network/API error talking to the model, or a response that didn't satisfy
-    the structured-output schema. Not transient in the sense that retrying
-    the exact same call is unlikely to help without a different message.
+    """A model step of the turn failed: a network/API error talking to the
+    model, a response that didn't satisfy the structured-output schema, or a
+    call that broke TwoCallTurn's rule. Not transient in the sense that
+    retrying the exact same call is unlikely to help without a different
+    message.
 
     tmdb.TMDBError/TMDBUnavailable are a different failure class (the TMDB
-    step) and propagate out of search() unwrapped, same as calling
-    tmdb.discover() directly would. A bare ValueError out of search() means
-    the *caller* passed something invalid (e.g. a malformed watch_region) —
-    a bug to fix, not a case to handle here.
+    step) and propagate out of the agent unwrapped, same as calling
+    tmdb.discover() directly would. A bare ValueError means the *caller*
+    passed something invalid (e.g. a malformed watch_region) — a bug to fix,
+    not a case to handle here.
     """
 
 
-# The soft constraints search() can drop, in the order it drops them, when a
+# The soft constraints find_candidates() can drop, in the order it drops them, when a
 # query comes back under the result floor (see RESULT_FLOOR). watch_region,
 # Never in this list: watch_region and watch_providers, which are the caller's
 # own country and ticked services rather than anything the turn asked for; and
@@ -396,7 +330,7 @@ RelaxedConstraint = Literal["keywords", "runtime", "year", "genres", "rating"]
 # count in the message still wins downward, via min(RESULT_FLOOR, limit) — a
 # "just one" request must not fire a rung hunting for five. It cannot win
 # upward: ten is the most a turn shows, which is why
-# DiscoverIntent.limit's own description says so.
+# SearchArgs.limit's own description says so.
 RESULT_FLOOR = 5
 RESULT_CEILING = 10
 
@@ -419,21 +353,13 @@ MAX_DISCOVER_PAGES = 25
 # paid for past the page that met the stop condition, and simultaneous requests
 # per turn make a 429 likelier, whose backoff comes out of
 # PAGING_BUDGET_SECONDS. What it mostly does not cost is prompt — the stop
-# conditions are re-checked as each page is absorbed, so it hands rank() a
+# conditions are re-checked as each page is absorbed, so it hands the rank call a
 # bigger candidate list only when a full page arrives behind a short one in the
 # same batch.
 #
 # At least 1. A zero-width batch awaits nothing, so the loop would spin without
 # ever yielding to its own deadline.
 DISCOVER_BATCH_PAGES = 3
-
-# Which path search() took. Set where the branch is actually taken, not
-# re-derived downstream from intent.title: the two agree today, but they are
-# not the same question, and stored history is where a wrong answer compounds
-# (gateway/chat.go's summarizePicks writes it, and the next turn's
-# interpret() reads it back).
-CatalogKind = Literal["search", "lookup"]
-
 
 # Why a turn ended with nothing to show. Fed to the composer, never guessed by
 # it: each cause owes the user a different sentence, and a model asked to work
@@ -448,9 +374,9 @@ OutcomeCause = Literal["nothing_matched", "all_shown", "all_judged", "title_not_
 
 @dataclass
 class CatalogResult:
-    # None when search() short-circuits before calling interpret() at all
-    # (e.g. the caller has no streaming subscriptions) — see search().
-    intent: DiscoverIntent | None
+    """finish_search()'s output: what a search turn shows, and why when it
+    shows nothing."""
+
     # Each dict is the real Title, merged with the model's blurb and TMDB
     # enrichment (genre_names, runtime_minutes, cast, and where it can be
     # watched) — see _merge_enrichment() for the full key set. Not a named type:
@@ -458,12 +384,12 @@ class CatalogResult:
     # keys" idiom Title/Provider/WatchAvailability already use, not model
     # output (that's RankedPick).
     picks: list[dict[str, Any]]
-    # Soft constraints search() had to drop to get any candidates, in the order
+    # Soft constraints find_candidates() had to drop to get any candidates, in the order
     # dropped; empty when the first query returned results. Reflects only the
     # rungs actually tried — the ladder stops at the first one that returns
     # candidates, so picks == [] doesn't imply every rung was exhausted. Nor
-    # is this the explanation for an empty result — rank() finding nothing
-    # worth surfacing, and the verdict exclusion filter, both empty picks
+    # is this the explanation for an empty result — the rank call finding
+    # nothing worth surfacing, and the verdict exclusion filter, both empty picks
     # without touching this field. It only ever describes the query.
     relaxed: list[RelaxedConstraint]
     # How many of `picks` came from the query as originally asked, rather than
@@ -474,17 +400,11 @@ class CatalogResult:
     # always the leading ones. Meaningless when `relaxed` is empty, where
     # every pick is exact by definition.
     exact_matches: int = 0
-    # "lookup" when the turn answered about one named title (see
-    # lookup_title), "search" for the discover()/rank() ladder. The caller
-    # forwards it rather than inferring the path from intent fields.
-    kind: CatalogKind = "search"
-    # Why this turn has nothing to show, for the sentence the caller composes.
-    # Carried rather than left for the caller to derive from empty picks, which
-    # is not the same question: a capability or clarifying turn has no picks
-    # and owes no explanation, having answered already. None whenever the turn
-    # has its answer; search() decides it where it computes the facts behind
-    # it, so the composer's duty and the fallback's wording cannot be settled
-    # separately and then disagree on the degraded path.
+    # Why this search has nothing to show, for the sentence the caller
+    # composes; None exactly when picks is non-empty. finish_search() decides
+    # it where it computes the facts behind it, so the composer's duty and the
+    # fallback's wording cannot be settled separately and then disagree on the
+    # degraded path.
     cause: OutcomeCause | None = None
 
 
@@ -496,28 +416,11 @@ class ComposedReply(BaseModel):
     text: str = Field(description="What the assistant says to the user.")
 
 
-Interpreter = Callable[[str], Awaitable[DiscoverIntent]]
-Ranker = Callable[[str, list[Title]], Awaitable[RankResult]]
 # The user's message, why the turn came back empty, and one cause-specific
 # detail — what the ladder loosened, or the name that resolved to nothing.
-# google_composer folds all three into the prompt, the way google_ranker folds
+# google_composer folds all three into the prompt, the way _rank_content folds
 # the candidate list in, rather than this signature growing a field per cause.
 Composer = Callable[[str, OutcomeCause, str], Awaitable[ComposedReply]]
-
-
-async def interpret(message: str, *, model: Interpreter) -> DiscoverIntent:
-    """Turn a user's message into TMDB discover() parameters. Never asked to
-    recall a title from memory — only to describe what to search for.
-
-    Wraps any failure from ``model`` — a network/API error, or a response
-    that doesn't satisfy DiscoverIntent's schema — as CatalogToolError.
-    ``except Exception``, not ``BaseException``, so a cancelled turn
-    (asyncio.CancelledError) still propagates.
-    """
-    try:
-        return await model(message)
-    except Exception as exc:
-        raise CatalogToolError(str(exc)) from exc
 
 
 async def compose(
@@ -525,15 +428,15 @@ async def compose(
 ) -> ComposedReply:
     """Write the sentence for a turn that found nothing to show.
 
-    Wraps any failure from ``model`` as CatalogToolError, same as interpret()
-    and rank() — see interpret()'s docstring. ``except Exception``, not
-    BaseException, so the caller's own timeout still cancels this.
+    Wraps any failure from ``model`` as CatalogToolError, the way TwoCallTurn
+    wraps the agent's own calls. ``except Exception``, not BaseException, so
+    the caller's own timeout still cancels this.
     """
     try:
         reply = await model(message, cause, detail)
     except Exception as exc:
         raise CatalogToolError(str(exc)) from exc
-    # Validated where interpret() and rank() are not. Their shape faults land
+    # Validated where the agent's calls are not. Their shape faults land
     # inside stream_chat's own except and become an error frame, which is the
     # right answer when the turn has no other; this turn already has its answer
     # in the template beside it, so a fault here has to degrade to that instead.
@@ -542,52 +445,6 @@ async def compose(
     if not isinstance(reply, ComposedReply):
         raise CatalogToolError(f"composer returned {type(reply).__name__}")
     return reply
-
-
-async def rank(
-    message: str,
-    candidates: list[Title],
-    *,
-    model: Ranker,
-) -> list[RankedPick]:
-    """Pick and explain the real candidates TMDB returned, in the model's own
-    best-first order.
-
-    A pick naming a tmdb_id outside ``candidates`` is dropped with a warning,
-    mirroring tmdb.py's "unresolved constraint dropped" idiom — this is the
-    actual enforcement point against a manipulated overview trying to
-    introduce a title that was never in the filtered set. Duplicates are
-    dropped too.
-
-    Deliberately says nothing about how many picks a turn shows: search()
-    owns the whole size band, because cutting to a limit here would cut in
-    the model's fit order, before search() has had a chance to put the
-    titles that actually matched the request first — so a widened query
-    could lose every exact match to the truncation. See search().
-
-    Wraps any failure from ``model`` as CatalogToolError, same as
-    interpret() — see that function's docstring.
-    """
-    if not candidates:
-        return []
-
-    try:
-        result = await model(message, candidates)
-    except Exception as exc:
-        raise CatalogToolError(str(exc)) from exc
-
-    valid_ids = {c["tmdb_id"] for c in candidates}
-    seen: set[int] = set()
-    picks: list[RankedPick] = []
-    for pick in result.picks:
-        if pick.tmdb_id not in valid_ids:
-            logger.warning("catalog_tool rank id outside candidates, dropped")
-            continue
-        if pick.tmdb_id in seen:
-            continue
-        seen.add(pick.tmdb_id)
-        picks.append(pick)
-    return picks
 
 
 async def _safe[T](coro: Awaitable[T], *, tmdb_id: int, what: str) -> T | None:
@@ -804,8 +661,7 @@ async def enrich_known_title(
     tmdb_id: int,
 ) -> dict[str, Any]:
     """The by-id counterpart to _enrich_pick, for a title_verdicts row
-    rather than a discover()/rank() candidate — no
-    interpret_model/rank_model, no LLM call, just TMDB lookups run fresh
+    rather than a discover() candidate — no model call, just TMDB lookups run fresh
     every time.
 
     Never raises and never returns None: title_verdicts is stored data, so
@@ -961,8 +817,8 @@ async def lookup_title(
     watch_region: str,
     watch_providers: list[int],
 ) -> list[dict[str, Any]]:
-    """Answer about a named film or show — search()'s other path, taken when
-    interpret() sets ``intent.title``.
+    """Answer about a named film or show — the look_up_title tool's body,
+    taken instead of a search when the interpret call picks that tool.
 
     Selection is _matching_titles() for *which* rows carry the name, then one
     judgement here: of those, keep the ones prominent enough to believe.
@@ -981,7 +837,7 @@ async def lookup_title(
     Three things this deliberately does not do, each of which would answer a
     different question than the one asked:
 
-    - **No media_type filter.** interpret() always sets one, but on a name it
+    - **No media_type filter.** A search always carries one, but on a name it
       is a guess with nothing to go on, and getting it wrong is unrecoverable
       here: "The Office" as a movie is a 1930 silent film. search_titles()
       ranks films and series against each other, so the guess is not used.
@@ -993,7 +849,7 @@ async def lookup_title(
       — which the UI renders as "Not on your services", followed by where it
       can be rented when rent_on has anything. That filter is still the only
       thing deciding what available_on may name.
-    - **No verdict exclusion.** search() drops candidates the user has already
+    - **No verdict exclusion.** A search drops candidates the user has already
       judged, because a recommendation should not repeat them. A question
       about a named title is not a recommendation — "is Heat on my services"
       deserves an answer whether or not Heat is already marked seen.
@@ -1005,7 +861,7 @@ async def lookup_title(
     web/src/lib/chat-socket.ts's AgentPick document `unavailable` as absent on
     every /chat pick.
 
-    rank() never runs: there is nothing to rank, so this path costs one model
+    No rank call runs: there is nothing to rank, so this path costs one model
     call rather than two. Picks carry no blurb for the same reason — nothing
     here is explaining a fit — and title-card.tsx already omits the line when
     it is empty.
@@ -1044,8 +900,8 @@ class TitleVerdict(BaseModel):
     gateway's Verdict struct (gateway/verdicts.go), field for field.
 
     verdict is a plain str, not a Literal, while media_type is a Literal:
-    media_type reaches a URL path, but verdict reaches only search()'s two
-    comparisons. A Literal there would be a third hand-kept copy of the enum
+    media_type reaches a URL path, but verdict reaches only find_candidates()'
+    two comparisons. A Literal there would be a third hand-kept copy of the enum
     and would reject every chat turn if a sixth value ever shipped
     gateway-first; a str fails safe, since an unknown verdict excludes.
     """
@@ -1074,8 +930,8 @@ async def enrich_watchlist(
     items: list[TitleRef],
 ) -> list[dict[str, Any]]:
     """Batched enrich_known_title, one item per gather_all task — same
-    concurrent fan-out idiom search() uses per pick. Unlike search(), this
-    never short-circuits on empty watch_providers: a
+    concurrent fan-out idiom finish_search() uses per pick. Unlike a chat
+    turn, this never short-circuits on empty watch_providers: a
     saved title with no ticked services still needs "Not on your services"
     to render as live truth, which is different information than "nothing
     to search for." enrich_known_title never raises, so a single item's
@@ -1097,17 +953,17 @@ async def enrich_watchlist(
 # so this bounds the fan-out's wall clock too.
 TASTE_TIMEOUT_SECONDS = 5.0
 
-# How many liked titles feed rank()'s taste hint. A real per-turn cost, not
+# How many liked titles feed the rank call's taste hint. A real per-turn cost, not
 # just prompt length: title_with_details() deliberately does not cache (see
 # tmdb.py — a cached vote_average would be served as current), so each one is
 # a fresh TMDB call. They run concurrently, so the cost is roughly one extra
-# round trip before rank().
+# round trip before the rank call.
 MAX_TASTE_TITLES = 8
 
 # How long the relaxation ladder may keep widening. Same job as
 # TASTE_TIMEOUT_SECONDS above, and the same mechanism: a real deadline rather
 # than a check between calls, so a slow call is cancelled mid-flight instead
-# of being left to finish its retries. search() then answers with what it
+# of being left to finish its retries. The search then answers with what it
 # has, which accumulation makes a real answer rather than a truncated one.
 #
 # It bounds the widening and nothing else. Page 1 sits outside it, and one
@@ -1121,7 +977,7 @@ LADDER_BUDGET_SECONDS = 12.0
 # which is what lets depth crowd width out of a shared clock.
 #
 # Half. It only binds on a slow TMDB — paging normally stops early, and
-# search() usually meets the floor on the first rung that fires — so when it
+# a search usually meets the floor on the first rung that fires — so when it
 # does bind, giving width a real chance is worth more than one more page of
 # depth.
 #
@@ -1159,12 +1015,12 @@ async def _one_taste_line(client: TMDBClient, v: TitleVerdict) -> str | None:
 
 
 async def _resolve_taste(client: TMDBClient, liked: list[TitleVerdict]) -> list[str]:
-    """Describe the caller's liked titles for rank(). title_verdicts stores
+    """Describe the caller's liked titles for the rank call. title_verdicts stores
     only ids, so the names have to come from TMDB — the agent still reads
     nothing it was not handed; it was handed the ids.
 
     gather_all, not plain asyncio.gather: a homogeneous fan-out, the same
-    case enrich_watchlist and search()'s own pick enrichment use.
+    case enrich_watchlist and finish_search()'s pick enrichment use.
     _safe_title_with_details degrades to None on TMDBError, so a title that
     404s and a title TMDB couldn't serve are both simply dropped — a taste
     hint is a nudge, and losing one line of it must never cost the turn.
@@ -1182,17 +1038,17 @@ PROVIDERS_HEADER = "The user's streaming services:"
 
 
 def _with_providers(message: str, provider_names: list[str]) -> str:
-    """Fold the caller's own service names into the text handed to interpret(),
-    so the model can name them when it answers a question about what it can
-    do. That answer rides on a call the turn was making anyway.
+    """Fold the caller's own service names into the interpret call's human
+    message, so the model can name them when it answers a question about what
+    it can do. That answer rides on a call the turn was making anyway.
 
-    interpret() only, never rank(): a blurb naming a service would sit beside
-    a card whose availability line is computed from the caller's real
-    subscriptions (_merge_enrichment), and the two contradicting each other is
-    the one thing that path is most careful about.
+    The interpret call only, never the rank call: a blurb naming a service
+    would sit beside a card whose availability line is computed from the
+    caller's real subscriptions (_merge_enrichment), and the two contradicting
+    each other is the one thing that path is most careful about.
 
     Prepended, like _with_taste, so chat.py's "Current message: ..." stays the
-    last thing interpret() reads.
+    last thing the interpret call reads.
 
     Emitted even when the names are empty — the gateway's per-country cache may
     not have warmed up. An empty list says the names could not be resolved,
@@ -1204,13 +1060,12 @@ def _with_providers(message: str, provider_names: list[str]) -> str:
     list beats the real one. The capability answer then names services the
     caller does not have, and the gateway stores that sentence as the turn's
     assistant text, so chat.py's _with_history replays it into the next turn's
-    interpret() inside the history block, where the clause about which list is
-    real says nothing. What it cannot reach is which services results come
-    from: the model has no providers field, and its one availability choice
-    (DiscoverIntent.monetization) is between the caller's own list and a
+    interpret call inside the history block, where the clause about which list
+    is real says nothing. What it cannot reach is which services results come
+    from: the model has no providers argument, and its one availability choice
+    (SearchArgs.monetization) is between the caller's own list and a
     region-wide rent|buy filter — never a service it named. Closing
-    it means moving the names into the SystemMessage, which widens the
-    Interpreter callable and reaches every implementation of it.
+    it means moving the names into the system message.
 
     json.dumps, like _with_taste: a provider *name* cannot forge a section
     break here.
@@ -1224,13 +1079,13 @@ TASTE_HEADER = "Previously liked:"
 
 
 def _with_taste(message: str, taste: list[str]) -> str:
-    """Fold the taste hint into the text handed to rank(), mirroring how
-    chat.py's _with_history folds recent turns in. Done here rather than by
-    widening the Ranker callable, which would reach every implementation.
+    """Fold the taste hint into the rank call's human message, mirroring how
+    chat.py's _with_history folds recent turns in.
 
     Prepended, not appended: chat.py may already have shaped `message` to end
     with "Current message: ...", and appending would bury the live request
-    mid-blob, between the history and the candidate list rank() adds after.
+    mid-blob, between the history and the candidate list _rank_content adds
+    after.
 
     json.dumps, like the candidate list: it escapes newlines, quotes and the
     Unicode line separators, so a TMDB title cannot forge a section break
@@ -1243,14 +1098,14 @@ def _with_taste(message: str, taste: list[str]) -> str:
 
 
 def _with_target_count(message: str, *, limit: int, floor: int) -> str:
-    """Tell rank() how many picks to aim for. Without it a broad query comes
+    """Tell the rank call how many picks to aim for. Without it a broad query comes
     back with whatever the model feels like — five picks for "action movies"
     when twenty candidates were available.
 
     Folded in here rather than put in the prompt because the count is
     per-call and the prompt is static. Appended, so it lands after the user's
-    text and last before google_ranker() adds the candidate list. A target,
-    not a guarantee: search() cuts to `limit` and tops up to `floor` whatever
+    text and last before _rank_content adds the candidate list. A target,
+    not a guarantee: finish_search() cuts to `limit` and tops up to `floor` whatever
     comes back.
     """
     if limit <= 1:
@@ -1264,8 +1119,8 @@ def _with_target_count(message: str, *, limit: int, floor: int) -> str:
 
 @dataclass
 class Candidates:
-    """find_candidates()' output: what rank() reads, plus what search() needs
-    to order, cut and explain the picks it returns."""
+    """find_candidates()' output: what the rank call reads, plus what
+    finish_search() needs to order, cut and explain the picks it returns."""
 
     # Already filtered by verdicts and shown, in TMDB's own ranking order,
     # rung 0 first.
@@ -1275,7 +1130,7 @@ class Candidates:
     relaxed: list[RelaxedConstraint]
     limit: int
     floor: int
-    # Liked titles of this search's media type, as rank() hint lines.
+    # Liked titles of this search's media type, as the rank call's hint lines.
     taste: list[str]
     all_judged: bool
     all_shown: bool
@@ -1292,11 +1147,70 @@ async def find_candidates(
 ) -> Candidates:
     """The deterministic TMDB step of a search: page the query, widen it
     below the floor, exclude what the user judged or was shown, and resolve
-    the taste hint. No model call. search() and the search_catalog tool both
-    run it; search()'s docstring is the contract for everything it does.
+    the taste hint. No model call; the search_catalog tool runs it.
+
+    ``watch_region``/``watch_providers`` come only from the caller — the real
+    user's subscriptions and country. ``watch_region`` reaches discover()
+    regardless of anything in ``args``; ``watch_providers`` does too on a
+    subscription turn, which is every turn the user did not ask to rent on.
+
+    A rent turn (``args.monetization == "rent"``) drops the provider list
+    rather than choosing a different one: the ticked list is what the user
+    subscribes to, and which of those rents a title is not what "where can I
+    rent this" asks. The model still cannot name a service — it has no field
+    for one — and what a card claims about streaming is cut to the caller's
+    own subscriptions downstream, by _merge_enrichment. The rung order, the
+    vote floor, the verdict and shown exclusions and the exactness-first cut
+    all apply to a rent turn as to any other. A rent turn that finds a title
+    the user already subscribes to reports it as streaming, not as rentable.
+
+    ``args.monetization`` also reaches the gateway in the intent event, which
+    says so in the interpreting line and drops its provider clause there
+    (gateway/chat.go's interpretingLine). It does not reach the lookup path,
+    which filters by no provider anyway, so "can I rent Heat" is answered by
+    the card's own rent line rather than a different search.
+
+    ``verdicts`` is the caller's whole title_verdicts set, and this function
+    is where each value's meaning for a recommendation lives —
+    the gateway only reads the rows. Every verdict but ``want_to_watch``
+    removes that title from the candidates the rank call sees, and ``liked``
+    titles of this search's media type become a hint prepended to its message.
+    Exclusion is a set filter, not a prompt instruction, so it holds whatever
+    the model does.
+
+    ``shown`` is what the caller has already put on screen in this
+    conversation, excluded unconditionally — including ``want_to_watch``
+    titles, which verdicts alone keep. It is what makes "show me 10 more" mean
+    ten *different* titles. It never reaches ``all_judged``: a query run dry
+    by re-asking is not a query whose every result the user has rated, and
+    saying so would be false. That case is ``all_shown`` instead.
+
+    When fewer candidates survive exclusion than the result floor
+    (``min(RESULT_FLOOR, limit)``), soft constraints are dropped one rung at a
+    time — in ``RelaxedConstraint``'s order — and the query retried until the
+    floor is met or the ladder is exhausted, bounded by
+    ``LADDER_BUDGET_SECONDS`` — of which paging may spend only
+    ``PAGING_BUDGET_SECONDS``, so depth cannot leave the rungs no clock.
+    ``Candidates.relaxed`` records what was dropped. The user's services,
+    region and exclusions are never in the ladder, and neither are cast and
+    crew: a named person is the request
+    itself, so padding two genuine matches with three unrelated films buys a
+    count and loses the answer.
+
+    Rungs accumulate — a wider query's rows are appended to the narrower
+    query's, never substituted for them — so the titles that matched exactly
+    survive being widened past. Surviving is not being picked, though: the
+    rank call's candidate list carries no rung marker, so it can name only
+    widened titles. finish_search() therefore reserves every exact match a
+    place itself, stable-sorts by rung, and only then cuts to ``limit``.
+    Accumulation also makes the long tail rare — the floor is usually met by
+    the first rung that fires, because one widened page is twenty rows.
+    (agent/README.md walks the whole ladder.)
 
     Raises tmdb.TMDBError/TMDBUnavailable from page 1 unwrapped; a failure
-    while widening keeps the rows already in hand instead."""
+    while widening keeps the rows already in hand instead, and the taste step
+    degrades to a missing hint. A bare ValueError means the *caller* passed
+    something invalid, such as a malformed watch_region."""
     # The band a recommendation list aims for. limit is what paging works
     # toward and what the pick list is cut to; floor is the weaker target that
     # fires the ladder and tops the picks up. floor tracks limit rather than
@@ -1375,7 +1289,7 @@ async def find_candidates(
     # Exclusion-aware on purpose: a "show me more" whose whole first page is
     # already shown sits at zero survivors, and a blind count would never widen
     # for it. A rung that buys nothing costs only a wasted call, since rungs
-    # accumulate rather than replace, and search()'s cause ladder settles which
+    # accumulate rather than replace, and finish_search()'s cause ladder settles which
     # story the turn tells, so the user is never told the wrong one.
     def surviving() -> int:
         return sum(1 for c in candidates if key(c) not in excluded)
@@ -1399,7 +1313,7 @@ async def find_candidates(
         """Append a wider query's rows to the narrower query's, deduped —
         never substitute, or the matches the user actually asked for are lost
         in the act of being given more. ``rung`` is recorded per title so the
-        sort in search() can put the exact matches back in front.
+        sort in finish_search() can put the exact matches back in front.
         """
         for c in more:
             if c["tmdb_id"] in rung_of:
@@ -1424,7 +1338,7 @@ async def find_candidates(
                     tasks = [asyncio.create_task(discover(page=p)) for p in batch]
                     # Awaited in page order, not as they complete, and absorbed
                     # one at a time: `candidates` order is TMDB's own ranking,
-                    # which rank() reads and the exact-match top-up walks in
+                    # which the rank call reads and the exact-match top-up walks in
                     # order, so completion order would leave holes in it.
                     # Absorbing per page is also what keeps the pages that did
                     # arrive when the clock runs out mid-batch — a gather,
@@ -1441,7 +1355,7 @@ async def find_candidates(
                             if len(page_rows) < PAGE_SIZE:
                                 exhausted = True
                             # Checked per page: a met ceiling means the rest of
-                            # this batch is rows rank() would read through for
+                            # this batch is rows the rank call would read through for
                             # picks already found. They cost a request either
                             # way — batching buys the round trip, not a bigger
                             # candidate list.
@@ -1549,7 +1463,7 @@ async def find_candidates(
             # Lowering the bar restores the other twelve.
             #
             # The bar, not the sort. Dropping to vote_count.desc would also
-            # restore them, but rank() is never given a rating (see
+            # restore them, but the rank call is never given a rating (see
             # _format_candidates), so nothing downstream could put a
             # most-watched page back into rating order — "the best Korean
             # horror" would quietly stop being about ratings at all.
@@ -1592,7 +1506,7 @@ async def find_candidates(
 
     # This search's media type only — liked TV shows are no hint for "find me
     # a movie", and each costs a round trip. Guarded on candidates because
-    # rank() short-circuits on an empty list anyway.
+    # TwoCallTurn skips the rank call on an empty list anyway.
     taste: list[str] = []
     if candidates:
         liked = [
@@ -1614,242 +1528,100 @@ async def find_candidates(
     )
 
 
-async def search(
-    message: str,
+def _valid_picks(
+    result: RankResult | None, candidates: list[Title]
+) -> list[RankedPick]:
+    """The rank call's picks that name a real candidate, in the model's own
+    best-first order. None — no rank call, because no candidates — is no picks.
+
+    A pick naming a tmdb_id outside ``candidates`` is dropped with a warning,
+    mirroring tmdb.py's "unresolved constraint dropped" idiom — this is the
+    actual enforcement point against a manipulated overview trying to
+    introduce a title that was never in the filtered set. Duplicates are
+    dropped too.
+    """
+    if result is None:
+        return []
+    valid_ids = {c["tmdb_id"] for c in candidates}
+    seen: set[int] = set()
+    picks: list[RankedPick] = []
+    for pick in result.picks:
+        if pick.tmdb_id not in valid_ids:
+            logger.warning("catalog_tool rank id outside candidates, dropped")
+            continue
+        if pick.tmdb_id in seen:
+            continue
+        seen.add(pick.tmdb_id)
+        picks.append(pick)
+    return picks
+
+
+async def finish_search(
+    found: Candidates,
+    ranked: RankResult | None,
     *,
     client: TMDBClient,
     watch_region: str,
     watch_providers: list[int],
-    interpret_model: Interpreter,
-    rank_model: Ranker,
-    on_intent: Callable[[DiscoverIntent], Awaitable[None]] | None = None,
-    verdicts: list[TitleVerdict] | None = None,
-    shown: list[TitleRef] | None = None,
-    watch_provider_names: list[str] | None = None,
 ) -> CatalogResult:
-    """The full two-step pipeline.
+    """Turn the rank call's answer into the picks a search turn shows: keep the
+    ids that are real candidates, top up to the floor, put the exact matches
+    first, cut to ``limit``, enrich, and say why when nothing is left.
 
-    ``watch_region``/``watch_providers`` come only from the caller — the real
-    user's subscriptions and country. ``watch_region`` reaches discover()
-    regardless of anything in ``intent``; ``watch_providers`` does too on a
-    subscription turn, which is every turn the user did not ask to rent on.
+    Sizing lives here, not in the rank call: cutting in the model's fit order,
+    before the exact matches are put first, could lose every exact match a
+    widened query found.
 
-    A rent turn (``intent.monetization == "rent"``) drops the provider list
-    rather than choosing a different one: the ticked list is what the user
-    subscribes to, and which of those rents a title is not what "where can I
-    rent this" asks. The model still cannot name a service — it has no field
-    for one — and what a card claims about streaming is cut to the caller's
-    own subscriptions downstream, by _merge_enrichment. The rung order, the
-    vote floor, the verdict and shown exclusions and the exactness-first cut
-    all apply to a rent turn as to any other. A rent turn that finds a title
-    the user already subscribes to reports it as streaming, not as rentable.
-
-    ``intent.monetization`` also reaches the gateway, which says so in the
-    interpreting line and drops its provider clause there
-    (gateway/chat.go's interpretingLine). It does not reach the
-    lookup path: a message naming a title is answered below before any query
-    runs, and that path filters by no provider anyway, so "can I rent Heat"
-    is answered by the card's own rent line rather than a different search.
-
-    ``on_intent``, if given, is awaited once interpret() resolves and before
-    discover()/rank() run — the hook a caller needs to stream an "interpreting"
-    line within ~1-2s, well before the full pipeline (page 1, then batched
-    pages, then the rungs, plus rank()) finishes. Optional and additive, so
-    every existing caller and test is unaffected.
-
-    ``verdicts`` is the caller's whole title_verdicts set, and this function
-    is where each value's meaning for a recommendation lives —
-    the gateway only reads the rows. Every verdict but ``want_to_watch``
-    removes that title from the candidates rank() sees, and ``liked`` titles of
-    this search's media type become a hint prepended to rank()'s message.
-    Exclusion is a set filter, not a prompt instruction, so it holds whatever
-    the model does.
-
-    ``shown`` is what the caller has already put on screen in this
-    conversation, excluded unconditionally — including ``want_to_watch``
-    titles, which verdicts alone keep. It is what makes "show me 10 more" mean
-    ten *different* titles. It never reaches ``all_judged``: a query run dry
-    by re-asking is not a query whose every result the user has rated, and
-    saying so would be false. That case is ``all_shown`` instead.
-
-    When fewer candidates survive exclusion than the result floor
-    (``min(RESULT_FLOOR, limit)``), soft constraints are dropped one rung at a
-    time — in ``RelaxedConstraint``'s order — and the query retried until the
-    floor is met or the ladder is exhausted, bounded by
-    ``LADDER_BUDGET_SECONDS`` — of which paging may spend only
-    ``PAGING_BUDGET_SECONDS``, so depth cannot leave the rungs no clock.
-    ``CatalogResult.relaxed`` records what was dropped. The user's services,
-    region and exclusions are never in the ladder, and neither are cast and
-    crew: a named person is the request
-    itself, so padding two genuine matches with three unrelated films buys a
-    count and loses the answer.
-
-    Rungs accumulate — a wider query's rows are appended to the narrower
-    query's, never substituted for them — so the titles that matched exactly
-    survive being widened past. Surviving is not being picked, though: rank()'s
-    candidate list carries no rung marker, so it can name only widened titles.
-    This function therefore reserves every exact match a place itself,
-    stable-sorts by rung, and only then cuts to ``limit`` — in that order,
-    because cutting in rank()'s own fit order could discard every exact match a
-    widened query found. Accumulation also makes the long tail rare — the
-    floor is usually met by the first rung that fires, because one widened
-    page is twenty rows. (agent/README.md walks the whole ladder.)
-
-    Returns a picks-less CatalogResult with ``intent=None``, calling neither
-    the model nor TMDB, when ``watch_providers`` is empty: a user with no
-    ticked streaming services can't get results from any. A rent turn needs no
-    such list, so someone who has ticked nothing and asks to rent gets that
-    same answer — accepted, because answering it instead would mean running
-    interpret() on every zero-service message.
-
-    Takes a different path entirely when interpret() sets ``intent.title``,
-    i.e. the message asks about one film or show by name: neither discover()
-    nor rank() runs, and the answer is that title itself, looked up by name and
-    enriched — see lookup_title(). ``relaxed`` is empty there, no ladder having
-    run.
-
-    Also returns picks-less (this time with ``intent`` set) when interpret()
-    flags the message as a capability question rather than a title request, or
-    sets ``intent.clarifying_question`` because neither the message nor the
-    conversation gives anything to search on.
-    discover()/rank() never run either way, and ``on_intent`` never fires,
-    there being no search to narrate.
-
-    ``watch_provider_names`` is the same subscriptions the caller already
-    passes as ``watch_providers``, in the names the user would recognise. It
-    reaches interpret() only — never rank(), never discover() — so that a
-    capability question can be answered with the caller's own services inside
-    this turn's first model call. It cannot change which services results come
-    from — the model has no providers field — but it is still text in front of
-    a model that fills ``keywords``, which is why _INTERPRET_SYSTEM_PROMPT
-    forbids a service name there.
-
-    Raises CatalogToolError if interpret() or rank() fails.
-    tmdb.TMDBError/TMDBUnavailable propagate unwrapped from the discover step,
-    exactly as calling tmdb.discover() directly would — but not from the taste
-    step, which degrades to a missing hint. A bare ValueError means the
-    *caller* passed something invalid, such as a malformed watch_region.
+    Raises tmdb.TMDBError only from a bug in enrichment; each pick's own
+    enrichment degrades to missing fields on a TMDB failure (_enrich_pick).
     """
-    if not watch_providers:
-        # No cause: chat.py answers this before calling search() at all, so
-        # nothing composes here.
-        return CatalogResult(intent=None, picks=[], relaxed=[])
-
-    verdicts = verdicts or []
-    shown = shown or []
-    intent = await interpret(
-        _with_providers(message, watch_provider_names or []), model=interpret_model
-    )
-    # Normalised here, before search() reads any of it.
-    # Blank must read as absent: a whitespace-only clarifying_question or title
-    # short-circuits below as a real question or a real lookup, a blank title
-    # reaches search_titles() as an empty query, and a blank reply must read as
-    # "no opener" to chat.py rather than reaching the browser as an empty
-    # paragraph.
-    #
-    # One line because each of these becomes a whole stored assistant turn on
-    # some path — clarifying_question and a capability reply as themselves,
-    # title inside chat.py's _title_not_found_message — and _with_history folds
-    # stored turns back in as "Assistant: <text>" lines, where a break forges a
-    # turn boundary.
-    intent.clarifying_question = _one_line(intent.clarifying_question)
-    intent.title = _one_line(intent.title)
-    intent.reply = _one_line(intent.reply)
-    if intent.is_capability_question or intent.clarifying_question:
-        # Nothing to search for either way — an explicit question about the
-        # assistant, or too little signal yet to search on. Before on_intent:
-        # an "interpreting: looking for movies on Netflix" line would
-        # contradict the reply that's about to follow it, so discover()/
-        # rank() never run and on_intent never fires. The caller (chat.py's
-        # stream_chat) turns this into what the assistant can do, or
-        # intent.clarifying_question itself.
-        return CatalogResult(intent=intent, picks=[], relaxed=[])
-    if on_intent is not None:
-        await on_intent(intent)
-
-    # After on_intent, not before: a lookup still costs a search plus per-title
-    # details and availability, so it needs an interpreting line as much as a
-    # discover() turn does. The gateway templates a different one off
-    # intent.title (gateway/chat.go's interpretingLine).
-    if intent.title:
-        picks = await lookup_title(
-            intent.title,
-            client=client,
-            watch_region=watch_region,
-            watch_providers=watch_providers,
-            # intent.limit is deliberately not passed: it sizes a
-            # recommendation list, and this path answers a question.
-            # MAX_TITLE_MATCHES is the only ceiling that applies.
-        )
-        return CatalogResult(
-            intent=intent,
-            picks=picks,
-            relaxed=[],
-            kind="lookup",
-            cause=None if picks else "title_not_found",
-        )
-
-    found = await find_candidates(
-        intent,
-        client=client,
-        watch_region=watch_region,
-        watch_providers=watch_providers,
-        verdicts=verdicts,
-        shown=shown,
-    )
     candidates, rung_of, relaxed = found.candidates, found.rung_of, found.relaxed
-    limit, floor, taste = found.limit, found.floor, found.taste
-    all_judged, all_shown = found.all_judged, found.all_shown
-
-    ranked = await rank(
-        _with_target_count(_with_taste(message, taste), limit=limit, floor=floor),
-        candidates,
-        model=rank_model,
-    )
+    limit, floor = found.limit, found.floor
+    ranked_picks = _valid_picks(ranked, candidates)
 
     def rung(pick: RankedPick) -> int:
-        # Total: rank() only returns ids from `candidates`, and every
+        # Total: _valid_picks only keeps ids from `candidates`, and every
         # candidate was absorbed under a rung. No default, so a key that ever
         # stops matching fails loudly instead of reading as an exact match.
         return rung_of[pick.tmdb_id]
 
     # Top up, then order, then cut. The floor is a property of this code, not a
-    # request made of the model — same reason rank() validates ids rather than
-    # asking for valid ones. Topped-up picks carry no blurb (the shape
+    # request made of the model — same reason _valid_picks validates ids rather
+    # than asking for valid ones. Topped-up picks carry no blurb (the shape
     # lookup_title() returns and title-card.tsx renders) and come in candidate
     # order, so the closest unused match is reached for first.
     #
     # An exact candidate is admitted whether or not the floor is already met,
-    # which is what holds the "what was asked for leads" promise: rank() cannot
-    # see rungs, so on a widened query it can name ten widened picks and never
-    # mention the three that matched.
+    # which is what holds the "what was asked for leads" promise: the rank call
+    # cannot see rungs, so on a widened query it can name ten widened picks and
+    # never mention the three that matched.
     #
     # It cannot crowd the list out: a rung only fires below `floor`, so a
     # non-empty `relaxed` means fewer than `floor` exact survivors. The
     # `relaxed` guard is what keeps that true — with no rung fired every
     # candidate is rung 0, and an unguarded test would admit the whole page.
     reserve_exact = bool(relaxed)
-    seen = {p.tmdb_id for p in ranked}
+    seen = {p.tmdb_id for p in ranked_picks}
     for c in candidates:
         exact = reserve_exact and rung_of[c["tmdb_id"]] == 0
-        if not exact and len(ranked) >= floor:
+        if not exact and len(ranked_picks) >= floor:
             break
         if c["tmdb_id"] in seen:
             continue
-        ranked.append(RankedPick(tmdb_id=c["tmdb_id"], blurb=""))
-    # Exactness first: rank() orders by fit within what it was given, but it
-    # cannot know that a later candidate reached the list only because a
-    # constraint was dropped. A stable sort on the rung keeps rank()'s own
+        ranked_picks.append(RankedPick(tmdb_id=c["tmdb_id"], blurb=""))
+    # Exactness first: the rank call orders by fit within what it was given,
+    # but it cannot know that a later candidate reached the list only because a
+    # constraint was dropped. A stable sort on the rung keeps the model's own
     # ordering inside each rung and puts the titles that actually matched the
     # request at the head of the carousel, with the widening behind them.
-    ranked.sort(key=rung)
+    ranked_picks.sort(key=rung)
     # Cut last, so it falls on the least exact picks: cutting before the sort
     # would cut in the model's fit order and can discard every exact match a
     # widened query found.
-    del ranked[limit:]
-    exact_matches = sum(1 for p in ranked if rung(p) == 0)
-    # Built from the filtered list, which is what rank() validated against —
-    # that is what keeps this lookup total.
+    del ranked_picks[limit:]
+    exact_matches = sum(1 for p in ranked_picks if rung(p) == 0)
+    # Built from the filtered list, which is what _valid_picks validated
+    # against — that is what keeps this lookup total.
     by_id = {c["tmdb_id"]: c for c in candidates}
     # Enrichment only runs for these final, already-limited picks — never for
     # every candidate — and each pick's two TMDB calls run concurrently with
@@ -1861,7 +1633,7 @@ async def search(
     picks = await gather_all(
         *(
             _enrich_pick(client, watch_region, wanted, by_id[p.tmdb_id], p.blurb)
-            for p in ranked
+            for p in ranked_picks
         )
     )
     # Mutually exclusive by construction: all_judged needs every candidate
@@ -1869,14 +1641,13 @@ async def search(
     # reported when picks exist; the turn has its answer.
     if picks:
         cause: OutcomeCause | None = None
-    elif all_judged:
+    elif found.all_judged:
         cause = "all_judged"
-    elif all_shown:
+    elif found.all_shown:
         cause = "all_shown"
     else:
         cause = "nothing_matched"
     return CatalogResult(
-        intent=intent,
         picks=picks,
         relaxed=relaxed,
         exact_matches=exact_matches,
@@ -1905,7 +1676,7 @@ _GENRE_VOCABULARY = (
 # How every sentence the user reads should sound. Prepended to all three
 # system prompts so they cannot drift into three different assistants.
 #
-# Scoped to prose deliberately: rank() is asked for a list of per-title blurbs
+# Scoped to prose deliberately: the rank call is asked for a list of per-title blurbs
 # and _with_target_count appends a count to its message, so a tone rule that
 # forbade lists or counts outright would contradict the job on the same call.
 _TONE = (
@@ -1918,7 +1689,7 @@ _TONE = (
 # line alongside it. Carried by _OUTCOME_SYSTEM_PROMPT, and by
 # _INTERPRET_SYSTEM_PROMPT for the capability case only — those two produce the
 # text the gateway stores as the turn's assistant text, which chat.py's
-# _with_history feeds back to the next turn's interpret(), where a film this
+# _with_history feeds back to the next turn's interpret call, where a film this
 # turn invented reads as a title request and a number reads as a limit. A
 # search turn's opener is never stored, and a blurb reaches history only as
 # summarizePicks' "Suggested: ...".
@@ -1939,34 +1710,34 @@ _INTERPRET_SYSTEM_PROMPT = _TONE + (
     "you are describing what to search for, not recalling titles from "
     "memory. Leave a field empty when the message does not mention it, "
     "except keywords. "
-    "The one exception is title: when the user asks about a specific film or "
-    "show by name ('is The Matrix on Netflix', 'do you have Fargo'), put "
-    "their words in title and leave keywords and genres empty — that request "
-    "is answered by looking the title up, not by searching for others like "
-    "it. A title named as a comparison ('something like Heat') is the "
-    "opposite case: leave title empty and describe what to search for. "
+    "The one exception is a specific film or show the user asks about by "
+    "name ('is The Matrix on Netflix', 'do you have Fargo'): call "
+    "look_up_title with their words instead of searching — that request is "
+    "answered by looking the title up, not by searching for others like it. "
+    "A title named as a comparison ('something like Heat') is the opposite "
+    "case: search, describing what to search for. "
     "Only set genres when the message explicitly names a genre (e.g. 'a "
     "horror movie', 'documentaries'). Mood words like 'scary', 'funny', or "
     "'intense' go in keywords, never in genres, even if a mood word happens "
     "to match a genre name (e.g. 'scary' is NOT 'horror'). "
-    "Set is_capability_question only for an explicit question about you, the "
-    "assistant, itself — 'what can you do', 'how does this work', a bare "
-    "'help'. Anything that is still asking for a title, however vague — "
+    "Call answer with kind 'capability' only for an explicit question about "
+    "you, the assistant, itself — 'what can you do', 'how does this work', a "
+    "bare 'help'. Anything that is still asking for a title, however vague — "
     "'what movies do you have', 'surprise me', 'help me find something to "
-    "watch' — is a search, not this; leave it false and fill in the fields "
-    "above as best you can. "
+    "watch' — is a search, not this; search, filling in the fields above as "
+    "best you can. "
     "Set monetization, per its own field description, and never infer it from "
     "how specific or how urgent the request sounds — wanting something "
     "tonight is not willingness to pay. "
-    "Set clarifying_question, per its own field description, whenever "
+    "Call answer with kind 'clarifying', per its own description, whenever "
     "there's truly nothing to search on yet — never guess at fields "
     "instead, and never ask twice in a row. "
     "A follow-up that asks for more of the same ('show me more', 'any "
     "others') repeats the previous request: carry that request's parameters "
     "forward from the conversation rather than starting from nothing. "
-    "Always write reply, per its own field description. When "
-    "is_capability_question is true, reply is the whole of what the user "
-    "reads, so it owes what any whole answer owes: "
+    "Always write reply when you search or look a title up, per its own "
+    "field description. With kind 'capability', answer's text is the whole "
+    "of what the user reads, so it owes what any whole answer owes: "
     + _ANSWER_RULES
     + f"A '{PROVIDERS_HEADER}' list, when the request carries one, is the "
     "services this user subscribes to — context for answering a question "
@@ -2002,7 +1773,7 @@ _RANK_SYSTEM_PROMPT = _TONE + (
 #
 # The untrusted-data clause matters more here than in the other two prompts:
 # this output is stored as the turn's assistant text and replayed into the next
-# turn's interpret(), so a message that talked the model out of its given
+# turn's interpret call, so a message that talked the model out of its given
 # reason would persist.
 _OUTCOME_SYSTEM_PROMPT = (
     _TONE
@@ -2053,33 +1824,28 @@ def _format_candidates(candidates: list[Title]) -> str:
     return json.dumps(rows)
 
 
-def google_interpreter(model: BaseChatModel) -> Interpreter:
-    """Bind DiscoverIntent's schema to ``model``. Swap this function, not
-    catalog_tool's internals, to change how interpret() is powered."""
-    bound = model.with_structured_output(DiscoverIntent)
-
-    async def call(message: str) -> DiscoverIntent:
-        result = await bound.ainvoke(
-            [SystemMessage(_INTERPRET_SYSTEM_PROMPT), HumanMessage(message)]
-        )
-        return cast(DiscoverIntent, result)
-
-    return call
+def _rank_content(message: str, found: Candidates) -> str:
+    """The rank call's human message: the request, the taste hint before it,
+    the target count after it, then the candidate list last."""
+    request = _with_target_count(
+        _with_taste(message, found.taste), limit=found.limit, floor=found.floor
+    )
+    return f"{request}\n\nCandidates:\n{_format_candidates(found.candidates)}"
 
 
 def _compose_content(message: str, cause: OutcomeCause, detail: str) -> str:
     """The composer's human message: the user's words, then the facts.
 
-    Facts last, mirroring google_ranker's candidate list, so a "Reason:" line
+    Facts last, mirroring _rank_content's candidate list, so a "Reason:" line
     pasted into the message reads before the real one rather than after it.
     ensure_ascii=False where _format_candidates needs True: the prompt asks for
     the detail quoted back exactly, and an escaped "Am\\u00e9lie" is not the
     name the user typed. The separators escaping would otherwise catch are gone
-    before this runs — _one_line takes them out in search(). The accepted cost
-    is the other half of _format_candidates' reason: a lone surrogate, which
-    the model's own JSON can carry, raises when the request body is encoded,
-    which compose() turns into a CatalogToolError the turn answers from its
-    template. cause needs no escaping, being a Literal written here.
+    before this runs — the tools pass the title through _one_line. The accepted
+    cost is the other half of _format_candidates' reason: a lone surrogate,
+    which the model's own JSON can carry, raises when the request body is
+    encoded, which compose() turns into a CatalogToolError the turn answers
+    from its template. cause needs no escaping, being a Literal written here.
     """
     quoted = json.dumps(detail, ensure_ascii=False)
     return f"{message}\n\nReason: {cause}\nDetail: {quoted}"
@@ -2087,7 +1853,7 @@ def _compose_content(message: str, cause: OutcomeCause, detail: str) -> str:
 
 def google_composer(model: BaseChatModel) -> Composer:
     """Bind ComposedReply's schema to ``model``. The cause and detail are
-    folded into the human message here, the way google_ranker folds the
+    folded into the human message here, the way _rank_content folds the
     candidate list in, so Composer stays one signature across every cause."""
     bound = model.with_structured_output(ComposedReply)
 
@@ -2101,58 +1867,94 @@ def google_composer(model: BaseChatModel) -> Composer:
     return call
 
 
-def google_ranker(model: BaseChatModel) -> Ranker:
-    bound = model.with_structured_output(RankResult)
-
-    async def call(message: str, candidates: list[Title]) -> RankResult:
-        content = f"{message}\n\nCandidates:\n{_format_candidates(candidates)}"
-        result = await bound.ainvoke(
-            [SystemMessage(_RANK_SYSTEM_PROMPT), HumanMessage(content)]
-        )
-        return cast(RankResult, result)
-
-    return call
-
-
 @dataclass
 class TurnContext:
-    """What the tools read from the run rather than from the model: the
-    caller's own TMDB client, country, ticked services, verdicts and shown
-    titles. A ToolRuntime parameter is left out of a tool's schema, so none of
-    these is a field the model can fill."""
+    """What the tools and TwoCallTurn read from the run rather than from the
+    model: the caller's own TMDB client, country, ticked services and their
+    names, verdicts and shown titles. A ToolRuntime parameter is left out of a
+    tool's schema, so none of these is a field the model can fill."""
 
     client: TMDBClient
     watch_region: str
-    # Never empty: chat.py answers a caller with no ticked services before any
-    # search runs, and discover() raises on an empty list.
+    # Never empty: chat.py answers a caller with no ticked services before the
+    # agent runs, and discover() raises on an empty list.
     watch_providers: list[int]
+    # Read by the interpret call alone, never the rank call — see _with_providers.
+    watch_provider_names: list[str]
     verdicts: list[TitleVerdict]
     shown: list[TitleRef]
 
 
+class TurnState(AgentState[RankResult]):
+    """The agent's state, plus what each tool found, typed for chat.py to
+    read. At most one tool runs a turn, so at most one group is set."""
+
+    # search_catalog
+    found: NotRequired[Candidates]
+    # look_up_title: the enriched rows, and the name asked about, which the
+    # composer quotes back when nothing carries it.
+    lookup_picks: NotRequired[list[dict[str, Any]]]
+    lookup_title: NotRequired[str]
+    # answer
+    answer_kind: NotRequired[Literal["capability", "clarifying"]]
+    answer_text: NotRequired[str]
+
+
+def _tool_result(
+    runtime: ToolRuntime[TurnContext], content: str, **fields: Any
+) -> Command[Any]:
+    """Write `fields` onto TurnState beside the tool message every tool call
+    must answer with."""
+    message = ToolMessage(content, tool_call_id=runtime.tool_call_id)
+    return Command(update={"messages": [message], **fields})
+
+
+def _narrate(
+    runtime: ToolRuntime[TurnContext], reply: str, intent: dict[str, Any]
+) -> None:
+    """The opener, then the intent the gateway templates its interpreting line
+    from, both before any TMDB call. The opener goes first because it is prose
+    above the interpreting line and the gateway forwards in arrival order.
+    The opener is cut to one line, and skipped when blank rather than sent
+    empty — reply is defaulted, so a response can leave it out."""
+    reply = _one_line(reply)
+    if reply:
+        runtime.stream_writer({"type": "reply", "text": reply})
+    runtime.stream_writer({"type": "intent", "intent": intent})
+
+
 @tool(args_schema=SearchArgs)
-async def search_catalog(runtime: ToolRuntime[TurnContext], **fields: Any) -> str:
+async def search_catalog(
+    runtime: ToolRuntime[TurnContext], **fields: Any
+) -> Command[Any]:
     """Find films or shows to recommend from a description — a mood, a genre,
     a person, a decade, or a title to compare to ('something like Heat'). Use
     it for every request for titles that does not name one specific film or
     show the user is asking about, including a blind 'surprise me'."""
     # fields arrive already validated against SearchArgs, defaults filled in;
     # rebuilding the model is what gives find_candidates() a typed argument.
+    args = SearchArgs(**fields)
+    # The intent event is SearchArgs by JSON name, which gateway/chat.go's
+    # agentIntent mirrors. reply leaves it because it has its own event.
+    _narrate(
+        runtime,
+        args.reply,
+        args.model_dump(exclude_none=True, exclude={"reply"}),
+    )
     context = runtime.context
     found = await find_candidates(
-        SearchArgs(**fields),
+        args,
         client=context.client,
         watch_region=context.watch_region,
         watch_providers=context.watch_providers,
         verdicts=context.verdicts,
         shown=context.shown,
     )
-    return _format_candidates(found.candidates)
+    return _tool_result(runtime, _format_candidates(found.candidates), found=found)
 
 
-# LookUpArgs, AnswerArgs and the tool docstrings restate DiscoverIntent's
-# title, is_capability_question, clarifying_question and reply descriptions,
-# which interpret() still sends. A wording change belongs in both.
+# LookUpArgs, AnswerArgs and the tool docstrings carry the routing rules
+# _INTERPRET_SYSTEM_PROMPT also states. A wording change belongs in both.
 class LookUpArgs(BaseModel):
     title: str = Field(
         description=(
@@ -2172,9 +1974,11 @@ class LookUpArgs(BaseModel):
         ),
     )
 
-    # One line for the reason search() gives _one_line, and never blank:
-    # search() takes the lookup path only on a non-blank title, and a blank one
-    # would reach TMDB as an empty query.
+    # One line because the composer quotes the title back in a sentence the
+    # gateway stores as the turn's assistant text, and chat.py's _with_history
+    # folds stored turns back in as "Assistant: <text>" lines, where a break
+    # forges a turn boundary. Never blank, which would reach TMDB as an empty
+    # query.
     @field_validator("title")
     @classmethod
     def _one_nonblank_line(cls, value: str) -> str:
@@ -2184,14 +1988,17 @@ class LookUpArgs(BaseModel):
         return value
 
 
-@tool(args_schema=LookUpArgs)
+@tool(args_schema=LookUpArgs, return_direct=True)
 async def look_up_title(
     runtime: ToolRuntime[TurnContext], title: str, reply: str = ""
-) -> str:
+) -> Command[Any]:
     """Look up one specific film or show the user asks about by name — 'is The
     Matrix on Netflix', 'do you have Fargo' — and where it is streaming. Not
     for a title named only as a comparison ('something like Heat'): that is a
     search for other titles."""
+    # The gateway templates a lookup's interpreting line off title alone
+    # (gateway/chat.go's interpretingLine).
+    _narrate(runtime, reply, {"title": title})
     context = runtime.context
     picks = await lookup_title(
         title,
@@ -2199,7 +2006,9 @@ async def look_up_title(
         watch_region=context.watch_region,
         watch_providers=context.watch_providers,
     )
-    return json.dumps(picks)
+    return _tool_result(
+        runtime, json.dumps(picks), lookup_picks=picks, lookup_title=title
+    )
 
 
 class AnswerArgs(BaseModel):
@@ -2221,11 +2030,149 @@ class AnswerArgs(BaseModel):
     )
 
 
-@tool(args_schema=AnswerArgs)
-async def answer(text: str, kind: Literal["capability", "clarifying"]) -> str:
+@tool(args_schema=AnswerArgs, return_direct=True)
+async def answer(
+    runtime: ToolRuntime[TurnContext],
+    text: str,
+    kind: Literal["capability", "clarifying"],
+) -> Command[Any]:
     """Reply without searching: when the user asks about the assistant itself
     ('what can you do', a bare 'help'), or when nothing in the conversation
     says what they want to watch yet — no genre, mood, person, decade, or
     title to compare to. Never ask twice in a row: if the assistant's last
     message already asked, search on whatever the user said next."""
-    return _one_line(text)
+    # No intent event: this reply is the answer itself, and an interpreting
+    # line above it would announce a search that never runs. One line for the
+    # reason LookUpArgs gives — this text is stored as the turn's answer.
+    text = _one_line(text)
+    return _tool_result(runtime, text, answer_kind=kind, answer_text=text)
+
+
+CATALOG_TOOLS = [search_catalog, look_up_title, answer]
+
+MODEL_CALLS_PER_TURN = 2
+
+
+class TwoCallTurn(AgentMiddleware[TurnState, TurnContext, RankResult]):
+    """The two-call rule, in one place. Only the first call is offered tools
+    and there is no third, so nothing read after the user's message — TMDB
+    overviews included — can pick an action.
+
+    Call one is the interpret call: the interpret prompt, the three tools,
+    tool_choice="any", and no response format; a reply with anything but
+    exactly one tool call ends the turn. Call two is the rank call: the rank
+    prompt, no tools, and RankResult as the provider-native response format,
+    so its only answer is a ranking. look_up_title and answer are
+    return_direct, so those turns end at one call. A search that left no
+    candidates ends the agent without call two; chat.py composes that turn's
+    sentence outside the agent.
+
+    The call index is counted from the turn's own messages rather than kept
+    on the instance, which every concurrent turn shares.
+    """
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[TurnContext],
+        handler: Callable[
+            [ModelRequest[TurnContext]], Awaitable[ModelResponse[RankResult]]
+        ],
+    ) -> ModelResponse[RankResult] | AIMessage:
+        made = sum(isinstance(m, AIMessage) for m in request.messages)
+        if made >= MODEL_CALLS_PER_TURN:
+            raise CatalogToolError("model call budget spent")
+        # The turn's input, which chat.py sends as one human message. Each
+        # call is sent its own human message built from it, so the providers
+        # block reaches the interpret call and never the rank call.
+        message = request.messages[0].text
+        if made == 0:
+            names = request.runtime.context.watch_provider_names
+            response = await _model_call(
+                handler,
+                request.override(
+                    system_message=SystemMessage(_INTERPRET_SYSTEM_PROMPT),
+                    messages=[HumanMessage(_with_providers(message, names))],
+                    tool_choice="any",
+                    response_format=None,
+                ),
+            )
+            # Never the first of several: a message asking two things at once
+            # can draw two tool calls, and taking one would answer half of it.
+            if len(_tool_calls(response)) != 1:
+                raise CatalogToolError("interpret call did not pick exactly one tool")
+            return response
+        found = cast(TurnState, request.state)["found"]
+        if not found.candidates:
+            return AIMessage(content="")
+        response = await _model_call(
+            handler,
+            request.override(
+                system_message=SystemMessage(_RANK_SYSTEM_PROMPT),
+                messages=[HumanMessage(_rank_content(message, found))],
+                tools=[],
+            ),
+        )
+        # Nothing in a provider-native binding stops a reply carrying a tool
+        # call, which would skip the parse and route to the tool node.
+        if _tool_calls(response):
+            raise CatalogToolError("rank call asked for a tool")
+        return response
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        # The tool node answers an argument the schema rejected, or a tool
+        # that does not exist, with an error message for the model to retry
+        # on. A retry is a third call, so the turn ends instead. Any other
+        # exception a tool raises propagates unchanged.
+        result = await handler(request)
+        if isinstance(result, ToolMessage) and result.status == "error":
+            raise CatalogToolError(f"tool call rejected: {request.tool_call['name']}")
+        return result
+
+
+async def _model_call(
+    handler: Callable[
+        [ModelRequest[TurnContext]], Awaitable[ModelResponse[RankResult]]
+    ],
+    request: ModelRequest[TurnContext],
+) -> ModelResponse[RankResult]:
+    """Run the call, wrapping any failure — a network/API error, or a ranking
+    that doesn't satisfy RankResult's schema — as CatalogToolError, which
+    chat.py's _error_reason maps to model_unavailable. ``except Exception``,
+    not ``BaseException``, so a cancelled turn still propagates."""
+    try:
+        return await handler(request)
+    except Exception as exc:
+        raise CatalogToolError(str(exc)) from exc
+
+
+def _tool_calls(response: ModelResponse[RankResult]) -> list[ToolCall]:
+    message = response.result[-1]
+    return message.tool_calls if isinstance(message, AIMessage) else []
+
+
+CatalogAgent = CompiledStateGraph[
+    AgentState[RankResult],
+    TurnContext,
+    InputAgentState,
+    OutputAgentState[RankResult],
+]
+
+
+def catalog_agent(model: BaseChatModel) -> CatalogAgent:
+    """The turn's agent around ``model``. ProviderStrategy is named rather than
+    left to the library, which picks a strategy by model name — so the test
+    fake and a GOOGLE_MODEL override would otherwise run a different path from
+    production. Provider-native structured output is also what fails a bad
+    ranking at once, where the tool strategy's default retry spends a call."""
+    return create_agent(
+        model,
+        tools=CATALOG_TOOLS,
+        response_format=ProviderStrategy(RankResult),
+        context_schema=TurnContext,
+        state_schema=TurnState,
+        middleware=[TwoCallTurn()],
+    )

@@ -666,7 +666,7 @@ class TMDBClient:
             # Ordering by rating is the one thing this floor has to protect,
             # and 200 does not protect it — see MIN_VOTE_COUNT_TOP_RATED.
             # Caller-only, like watch_region above: the default follows the
-            # sort, and search()'s last rung overrides it to bend the bar
+            # sort, and find_candidates()' last rung overrides it to bend the bar
             # without giving up the ordering the user asked for.
             "vote_count.gte": (
                 min_vote_count
@@ -721,7 +721,7 @@ class TMDBClient:
             # "thriller AND (slow-burn OR tense)" is 19. Zero then loses the
             # mood entirely to the relaxation ladder, so ANDing them meant a
             # mood was silently discarded on almost every request. OR lets
-            # some noise in (Tokyo Drift is not a slow burn) and rank() is
+            # some noise in (Tokyo Drift is not a slow burn) and the rank call is
             # what filters that, reading the user's actual words against 19
             # mood-adjacent candidates instead of a page of anything.
             self._resolve_into(params, "with_keywords", keywords, "keyword", join="|"),

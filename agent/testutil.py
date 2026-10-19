@@ -12,38 +12,29 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import httpx2
+from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatResult
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
+from pydantic import Field
 
 from catalog_tool import (
     CatalogToolError,
     ComposedReply,
     Composer,
-    DiscoverIntent,
-    Interpreter,
     OutcomeCause,
-    Ranker,
+    RankedPick,
     RankResult,
+    SearchArgs,
 )
-from tmdb import Title, TMDBClient
+from tmdb import TMDBClient
 
 # gateway's constant, hand-copied -- the two services share no code.
 # Nothing enforces the copy: update it by hand when chat.go changes.
 GATEWAY_MAX_HISTORY_EXCHANGES = 5
-
-# The reasons rank() or the outcome composer must not be reached, shared so a
-# typo at a call site is a NameError rather than a silently drifted string.
-DISCOVER_RAISED = "discover() raised"
-NO_CANDIDATES = "no candidates came back"
-ALL_JUDGED = "every candidate was judged"
-CAPABILITY_QUESTION = "on a capability question"
-NEEDS_CLARIFICATION = "on a message that needs clarification"
-INTERPRET_RAISED = "interpret() raised"
-NO_PROVIDERS = "no providers ticked"
-TITLE_LOOKUP = "on a named-title lookup"
 
 
 def raw_movie(tmdb_id: int) -> dict[str, Any]:
@@ -179,13 +170,17 @@ class FakeTMDB:
 class ScriptedChatModel(GenericFakeChatModel):
     """A chat model that answers each call with the next scripted AIMessage:
     a tool call for call one, or RankResult JSON as text with no tool calls
-    for call two, which is the reply ProviderStrategy parses.
+    for call two, which is the reply ProviderStrategy parses. Each call's
+    messages are recorded in `calls`, so a test counts a turn's model calls
+    and reads what each one was sent.
 
     bind_tools returns the model itself, so the script ignores which tools or
     response format a call binds. The base class raises NotImplementedError
     there, and create_agent binds on every call. Its streaming path drops
     tool_calls, so a scripted tool call survives ainvoke but not a token
     stream."""
+
+    calls: list[list[BaseMessage]] = Field(default_factory=list)
 
     def bind_tools(
         self,
@@ -194,13 +189,64 @@ class ScriptedChatModel(GenericFakeChatModel):
     ) -> Runnable[LanguageModelInput, AIMessage]:
         return self
 
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.calls.append(messages)
+        return self._generate(messages, stop=stop, **kwargs)
 
-def make_intent(**overrides: Any) -> DiscoverIntent:
-    return DiscoverIntent(media_type="movie", **overrides)
+
+class FailingChatModel(ScriptedChatModel):
+    """A model whose every call fails, after being recorded — a provider
+    error such as a rate limit."""
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.calls.append(messages)
+        raise RuntimeError("model call timed out")
 
 
-async def ok_interpret(message: str) -> DiscoverIntent:
-    return make_intent()
+def scripted(*replies: AIMessage) -> ScriptedChatModel:
+    return ScriptedChatModel(messages=iter(replies))
+
+
+def _tool_call(name: str, args: dict[str, Any]) -> AIMessage:
+    return AIMessage(
+        content="", tool_calls=[{"name": name, "args": args, "id": f"call-{name}"}]
+    )
+
+
+def search_call(**args: Any) -> AIMessage:
+    """Call one picking search_catalog. media_type defaults to "movie", the
+    one argument the schema requires."""
+    return _tool_call("search_catalog", {"media_type": "movie", **args})
+
+
+def lookup_call(title: str, reply: str = "") -> AIMessage:
+    return _tool_call("look_up_title", {"title": title, "reply": reply})
+
+
+def answer_call(text: str, kind: str) -> AIMessage:
+    return _tool_call("answer", {"text": text, "kind": kind})
+
+
+def rank_reply(*tmdb_ids: int, blurb: str = "fits") -> AIMessage:
+    """Call two: RankResult as JSON text, picking these ids in this order."""
+    picks = [RankedPick(tmdb_id=i, blurb=blurb) for i in tmdb_ids]
+    return AIMessage(content=RankResult(picks=picks).model_dump_json())
+
+
+def make_intent(**overrides: Any) -> SearchArgs:
+    return SearchArgs(media_type="movie", **overrides)
 
 
 COMPOSED_TEXT = "A sentence the model wrote."
@@ -209,8 +255,8 @@ COMPOSED_TEXT = "A sentence the model wrote."
 class RecordingComposer:
     """Records every outcome call instead of raising when it is unwanted.
 
-    Recorded rather than raising the way rank_must_not_run does, for the same
-    reason FakeTMDB records requests: compose() wraps anything a Composer
+    Recorded rather than raising, for the same reason FakeTMDB records
+    requests: compose() wraps anything a Composer
     raises as CatalogToolError, which _outcome_text degrades from — so a double
     that raised would answer from the template and assert nothing. A call this
     turn should not have made is asserted on `calls` after it finishes.
@@ -232,57 +278,6 @@ class RecordingComposer:
         return call
 
 
-class CountingModels:
-    """The three model seams, each counting its own calls.
-
-    The per-turn budget is the point: the free tier is 15 requests a minute,
-    so a turn that quietly grew a third call costs the whole app a third of
-    its throughput. Counting here makes "no turn makes more than two Gemini
-    calls" a thing a test reads off the fakes rather than a thing a reviewer
-    believes.
-    """
-
-    def __init__(
-        self,
-        *,
-        intent: DiscoverIntent | None = None,
-        picks: RankResult | None = None,
-        composed: str = COMPOSED_TEXT,
-    ) -> None:
-        self._intent = intent if intent is not None else make_intent()
-        self._picks = picks if picks is not None else RankResult()
-        self.interpret_calls = 0
-        self.rank_calls = 0
-        # Borrowed rather than reimplemented, so there is one place a test
-        # reads what the composer was handed.
-        self.composer = RecordingComposer(composed)
-
-    @property
-    def compose_calls(self) -> int:
-        return len(self.composer.calls)
-
-    @property
-    def total(self) -> int:
-        return self.interpret_calls + self.rank_calls + self.compose_calls
-
-    def interpret(self) -> Interpreter:
-        async def call(message: str) -> DiscoverIntent:
-            self.interpret_calls += 1
-            return self._intent.model_copy(deep=True)
-
-        return call
-
-    def rank(self) -> Ranker:
-        async def call(message: str, candidates: list[Title]) -> RankResult:
-            self.rank_calls += 1
-            return self._picks.model_copy(deep=True)
-
-        return call
-
-    def compose(self) -> Composer:
-        return self.composer()
-
-
 async def ok_compose(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
     return ComposedReply(text=COMPOSED_TEXT)
 
@@ -292,14 +287,3 @@ async def failing_compose(
 ) -> ComposedReply:
     """Drives chat.py back onto the templates that are now fallbacks."""
     raise CatalogToolError("composer unavailable")
-
-
-def rank_must_not_run(reason: str) -> Ranker:
-    """rank() must not be reached. Several unrelated contracts say so — pass
-    one of the constants above; a regression's failure then points at the
-    right one instead of a generic "rank must not run"."""
-
-    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
-        raise AssertionError(f"rank must not run: {reason}")
-
-    return fake_rank

@@ -411,7 +411,7 @@ const maxMessageLength = 4000
 // "message" on the same turn overwrites it, where this belongs above the
 // interpreting line it introduces. This event is never persisted — it is
 // written before any result exists, so feeding it back through history
-// would answer the next turn's interpret() with "Absolutely, one sec"
+// would answer the next turn's interpret call with "Absolutely, one sec"
 // (see runTurn's case, and agent/chat.py).
 //
 // "conversation_created" is the one type not translated from an agent event
@@ -1110,7 +1110,7 @@ func friendlyError(reason string) string {
 
 // summarizePicks writes the assistant's side of the turn into stored history.
 // That text is both what a reload renders (conversations.go does not surface
-// title_refs) and what feeds the next turn's interpret(), so it has to say
+// title_refs) and what feeds the next turn's interpret call, so it has to say
 // what actually happened: "Suggested" on a turn that answered a lookup would
 // claim a recommendation the assistant never made -- and would then be read
 // back as one.
@@ -1122,7 +1122,7 @@ func summarizePicks(picks []agentPick, isLookup bool) string {
 	// with every title carrying the name, so "Dune, Dune" and "Fargo, Fargo"
 	// are the normal case, not an edge one -- and this text is the whole
 	// assistant side of the turn, so an unqualified repeat is what a reload
-	// renders and what the next turn's interpret() reads back.
+	// renders and what the next turn's interpret call reads back.
 	seen := make(map[string]int, len(picks))
 	for _, p := range picks {
 		seen[p.Title]++
@@ -1325,7 +1325,7 @@ func (h *Handler) runTurn(
 				}
 				// Narrower than the persist above: only a rendered
 				// recommendation was actually offered. A lookup is exempt for
-				// the same reason search() won't filter one ("is Dune on
+				// the same reason the agent's lookup won't filter one ("is Dune on
 				// Netflix" is the same question however often it is asked), and
 				// cards that never reached the socket showed nothing to
 				// suppress.
@@ -1374,7 +1374,7 @@ func (h *Handler) runTurn(
 	h.sendTerminalEvent(connCtx, conn, turnID, outboundEvent{Type: "error", Text: genericErrorText})
 }
 
-// interpretingLine is templated from the agent's DiscoverIntent, never a
+// interpretingLine is templated from the agent's intent event, never a
 // second model call — it doubles as a comprehension check, so
 // it must be on screen well before the full pipeline finishes.
 func interpretingLine(intent agentIntent, providerNames []string) string {
@@ -1591,11 +1591,11 @@ type agentChatRequest struct {
 	// Same values as chatContext.ProviderNames, already resolved for
 	// interpretingLine below — reused here so a capability-question answer
 	// can name the caller's services without the agent needing its own TMDB
-	// lookup. The agent folds them into the text it hands interpret(), which
+	// lookup. The agent folds them into its interpret call's message, which
 	// is what lets that answer cost no model call of its own.
 	WatchProviderNames []string      `json:"watch_provider_names,omitempty"`
 	History            []historyTurn `json:"history,omitempty"`
-	// The caller's whole verdict set; agent/catalog_tool.py's search()
+	// The caller's whole verdict set; agent/catalog_tool.py's find_candidates()
 	// decides what each value means.
 	Verdicts []Verdict `json:"verdicts,omitempty"`
 	// Everything already put on screen for this conversation, so
@@ -1608,21 +1608,21 @@ type agentChatRequest struct {
 	Shown []agentTitleRef `json:"shown,omitempty"`
 }
 
-// agentIntent mirrors DiscoverIntent.model_dump(exclude_none=True) — see
-// agent/catalog_tool.py. Pointers on the fields Pydantic can leave unset.
+// agentIntent mirrors the agent's "intent" event — see agent/catalog_tool.py's
+// search_catalog and look_up_title. A search sends
+// SearchArgs.model_dump(exclude_none=True) without reply; a lookup sends
+// {"title": ...} alone. Pointers on the fields Pydantic can leave unset.
 //
 // Deliberately omits sort_by and limit: interpretingLine() is a comprehension
 // check on *what* the user asked for, not *how* the search runs — the user
 // already knows how many results they asked for and doesn't need it read
 // back. Title is the one field here that changes which line gets built at
 // all rather than adding a clause to it — a named-title turn skips
-// discover() entirely on the agent side. Every other DiscoverIntent field is
-// here, except the three the agent excludes at the source —
-// is_capability_question, clarifying_question and reply, none of which is a
-// search parameter, and the last of which arrives as its own event. An
-// omitted field silently vanishes on decode (json.Unmarshal drops unknown
-// keys), so if you add a field to DiscoverIntent that should show up in the
-// interpreting line, it must be added here too — nothing else catches the
+// discover() entirely on the agent side. Every other SearchArgs field is
+// here, except reply, which is not a search parameter and arrives as its own
+// event. An omitted field silently vanishes on decode (json.Unmarshal drops
+// unknown keys), so if you add a field to SearchArgs that should show up in
+// the interpreting line, it must be added here too — nothing else catches the
 // gap.
 type agentIntent struct {
 	MediaType         string   `json:"media_type"`
@@ -1646,7 +1646,7 @@ type agentIntent struct {
 // agentPick mirrors one entry of chat.py's "results" event: a tmdb.Title
 // merged with per-title runtime/cast (tmdb.TitleDetails), resolved genre
 // names, where the title can be watched — streaming filtered to the caller's
-// own subscriptions, rentals not — and rank()'s blurb. Forwarded to the
+// own subscriptions, rentals not — and the rank call's blurb. Forwarded to the
 // browser close to verbatim: the title-card rendering, including which of
 // the two availability lines a card shows, is the browser's job.
 type agentPick struct {
@@ -1709,15 +1709,12 @@ type agentProvider struct {
 // agent/chat.py's module docstring for the full shape of each type.
 type agentEvent struct {
 	Type string `json:"type"`
-	// Which path search() took, on "results" only: "search" or "lookup".
-	// The agent records this where the branch is actually taken, so stored
-	// history reflects what the turn did rather than what its intent looked
-	// like. interpretingLine cannot use it and reads intent.Title instead:
-	// the interpreting line is built from the "intent" event, which is
-	// emitted before search() has chosen a path (agent/catalog_tool.py fires
-	// on_intent first, deliberately). The two agree today; if they ever
-	// diverge, the cost is a premature interpreting line, never a wrong verb
-	// written into history.
+	// Which tool answered the turn, on "results" only: "search" or "lookup".
+	// The agent reads it from which tool ran, so stored history reflects
+	// what the turn did rather than what its intent looked like.
+	// interpretingLine cannot use it and reads intent.Title instead: the
+	// interpreting line is built from the "intent" event, which the tool
+	// writes before any result exists (agent/catalog_tool.py's _narrate).
 	Kind    string          `json:"kind,omitempty"`
 	Intent  json.RawMessage `json:"intent,omitempty"`
 	Picks   []agentPick     `json:"picks,omitempty"`

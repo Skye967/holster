@@ -8,20 +8,18 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from catalog_tool import DiscoverIntent, RankedPick, RankResult
+from catalog_tool import catalog_agent
 from main import (
     CORRELATION_ID_HEADER,
     CorrelationIdMiddleware,
     app,
     asgi_app,
+    get_agent,
     get_compose_model,
-    get_interpret_model,
-    get_rank_model,
     get_tmdb_client,
     lifespan,
 )
-from testutil import MOVIE_A, FakeTMDB, ok_compose
-from tmdb import Title
+from testutil import MOVIE_A, FakeTMDB, ok_compose, rank_reply, scripted, search_call
 
 client = TestClient(asgi_app)
 
@@ -61,9 +59,9 @@ def test_correlation_id_survives_server_error() -> None:
 #
 # Real TMDBClient/model construction happens in lifespan(), and the models it
 # builds call the live API, which no test in this repo reaches. These tests
-# never trigger it: they override the Depends() seams directly, the same way
-# TMDBClient's transport= and catalog_tool's Interpreter/Ranker do for
-# everything else in this codebase.
+# never trigger it: they override the Depends() seams directly, handing the
+# route an agent around a scripted model, the same way TMDBClient's
+# transport= does for everything else in this codebase.
 
 
 @pytest.fixture(autouse=True)
@@ -76,16 +74,10 @@ def test_chat_streams_ndjson_events() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return DiscoverIntent(media_type="movie", keywords=["heist"])
-
-    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
-        pick = RankedPick(tmdb_id=candidates[0]["tmdb_id"], blurb="fits")
-        return RankResult(picks=[pick])
+    agent = catalog_agent(scripted(search_call(keywords=["heist"]), rank_reply(101)))
 
     app.dependency_overrides[get_tmdb_client] = fake_tmdb.client
-    app.dependency_overrides[get_interpret_model] = lambda: fake_interpret
-    app.dependency_overrides[get_rank_model] = lambda: fake_rank
+    app.dependency_overrides[get_agent] = lambda: agent
     app.dependency_overrides[get_compose_model] = lambda: ok_compose
 
     resp = client.post(
@@ -103,10 +95,9 @@ def test_chat_requires_a_message() -> None:
     # FastAPI resolves Depends() alongside body validation rather than only
     # after it succeeds, so the route's dependencies still need a value even
     # on a request this test expects to fail on the body — see main.py's
-    # get_tmdb_client/get_interpret_model/get_rank_model/get_compose_model.
+    # get_tmdb_client/get_agent/get_compose_model.
     app.dependency_overrides[get_tmdb_client] = FakeTMDB().client
-    app.dependency_overrides[get_interpret_model] = lambda: _must_not_be_called
-    app.dependency_overrides[get_rank_model] = lambda: _must_not_be_called
+    app.dependency_overrides[get_agent] = lambda: catalog_agent(scripted())
     app.dependency_overrides[get_compose_model] = lambda: _must_not_be_called
 
     resp = client.post("/chat", json={"watch_region": "US", "watch_providers": [8]})

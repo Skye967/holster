@@ -1,14 +1,14 @@
-"""catalog_tool tests — offline, against fake interpret/rank models and a
-fake TMDB transport (same FakeTMDB shape as test_tmdb.py). No LangChain
-import here: interpret()/rank()/search() depend on plain callables, so a
-fake is just an ``async def``, matching TMDBClient's ``transport=`` seam.
+"""catalog_tool tests — offline, against a fake TMDB transport (same
+FakeTMDB shape as test_tmdb.py) and plain async functions standing in for the
+agent's two model calls (see search_turn). The agent itself, driven by a
+scripted model, is test_chat.py's.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -29,56 +29,124 @@ from catalog_tool import (
     LIMIT_MAX,
     MAX_DISCOVER_PAGES,
     MAX_TASTE_TITLES,
-    MAX_TITLE_MATCHES,
     PROVIDERS_HEADER,
     RESULT_CEILING,
     RESULT_FLOOR,
     TASTE_HEADER,
     CatalogResult,
-    CatalogToolError,
-    DiscoverIntent,
-    Interpreter,
+    LookUpArgs,
     RankedPick,
-    Ranker,
     RankResult,
+    SearchArgs,
     TitleRef,
     TitleVerdict,
     _compose_content,
     _format_candidates,
     _matching_titles,
     _one_line,
+    _rank_content,
+    _valid_picks,
     _with_providers,
     _with_target_count,
     _with_taste,
     enrich_known_title,
     enrich_watchlist,
-    interpret,
-    rank,
-    search,
+    find_candidates,
+    finish_search,
+    lookup_title,
 )
 from testutil import (
-    ALL_JUDGED,
-    CAPABILITY_QUESTION,
-    DISCOVER_RAISED,
-    INTERPRET_RAISED,
     MOVIE_A,
-    NEEDS_CLARIFICATION,
-    NO_CANDIDATES,
-    NO_PROVIDERS,
-    TITLE_LOOKUP,
     FakeTMDB,
     make_intent,
-    ok_interpret,
-    rank_must_not_run,
     raw_movie,
     raw_movie_full,
     raw_named,
 )
-from tmdb import PAGE_SIZE, Title, TMDBUnavailable
+from tmdb import PAGE_SIZE, Title, TMDBClient, TMDBUnavailable
 
 
 def run[T](coro: Coroutine[Any, Any, T]) -> T:
     return asyncio.run(coro)
+
+
+# What the interpret call's one tool call carries: a search, or a lookup.
+Intent = SearchArgs | LookUpArgs
+Interpreter = Callable[[str], Awaitable[Intent]]
+Ranker = Callable[[str, list[Title]], Awaitable[RankResult]]
+
+# The reasons a rank call must not be reached, shared so a typo at a call site
+# is a NameError rather than a silently drifted string.
+DISCOVER_RAISED = "discover() raised"
+NO_CANDIDATES = "no candidates came back"
+ALL_JUDGED = "every candidate was judged"
+TITLE_LOOKUP = "on a named-title lookup"
+
+
+async def ok_interpret(message: str) -> Intent:
+    return make_intent()
+
+
+def rank_must_not_run(reason: str) -> Ranker:
+    """The rank call must not be reached. Several unrelated contracts say so
+    — pass one of the constants above; a regression's failure then points at
+    the right one instead of a generic "rank must not run"."""
+
+    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
+        raise AssertionError(f"rank must not run: {reason}")
+
+    return fake_rank
+
+
+async def search_turn(
+    message: str,
+    *,
+    client: TMDBClient,
+    watch_region: str,
+    watch_providers: list[int],
+    interpret_model: Interpreter,
+    rank_model: Ranker,
+    verdicts: list[TitleVerdict] | None = None,
+    shown: list[TitleRef] | None = None,
+) -> CatalogResult:
+    """A turn's catalog path with plain async functions where the agent's two
+    model calls go: the interpret call's arguments, then either
+    lookup_title(), or find_candidates(), the rank call — skipped on no
+    candidates, as TwoCallTurn skips it — and finish_search(). The rank fake is
+    handed the request as _rank_content builds it, minus the candidate list it
+    gets as its own argument."""
+    args = await interpret_model(message)
+    if isinstance(args, LookUpArgs):
+        picks = await lookup_title(
+            args.title,
+            client=client,
+            watch_region=watch_region,
+            watch_providers=watch_providers,
+        )
+        return CatalogResult(
+            picks=picks, relaxed=[], cause=None if picks else "title_not_found"
+        )
+    found = await find_candidates(
+        args,
+        client=client,
+        watch_region=watch_region,
+        watch_providers=watch_providers,
+        verdicts=verdicts or [],
+        shown=shown or [],
+    )
+    ranked = None
+    if found.candidates:
+        request = _with_target_count(
+            _with_taste(message, found.taste), limit=found.limit, floor=found.floor
+        )
+        ranked = await rank_model(request, found.candidates)
+    return await finish_search(
+        found,
+        ranked,
+        client=client,
+        watch_region=watch_region,
+        watch_providers=watch_providers,
+    )
 
 
 def _title(
@@ -101,74 +169,48 @@ def _title(
     )
 
 
-def test_interpret_calls_model_and_returns_its_intent() -> None:
-    intent = make_intent(keywords=["heist"])
-
-    async def fake(message: str) -> DiscoverIntent:
-        assert message == "something like Heat"
-        return intent
-
-    assert run(interpret("something like Heat", model=fake)) is intent
-
-
 def test_rank_drops_ids_outside_candidates() -> None:
     candidates = [_title(1), _title(2)]
+    result = RankResult(
+        picks=[
+            RankedPick(tmdb_id=1, blurb="fits"),
+            RankedPick(tmdb_id=999, blurb="hallucinated"),
+        ]
+    )
 
-    async def fake(message: str, cands: list[Title]) -> RankResult:
-        return RankResult(
-            picks=[
-                RankedPick(tmdb_id=1, blurb="fits"),
-                RankedPick(tmdb_id=999, blurb="hallucinated"),
-            ]
-        )
-
-    picks = run(rank("mood", candidates, model=fake))
+    picks = _valid_picks(result, candidates)
     assert [p.tmdb_id for p in picks] == [1]
 
 
 def test_rank_dedupes_but_does_not_size_the_list() -> None:
-    """Sizing lives in search(): cutting here would cut in the model's fit
-    order, before search() can put the exact matches first."""
+    """Sizing happens after the exact matches are put first: cutting here
+    would cut in the model's fit order."""
     candidates = [_title(1), _title(2), _title(3)]
+    result = RankResult(
+        picks=[
+            RankedPick(tmdb_id=1, blurb="a"),
+            RankedPick(tmdb_id=1, blurb="dup"),
+            RankedPick(tmdb_id=2, blurb="b"),
+            RankedPick(tmdb_id=3, blurb="c"),
+        ]
+    )
 
-    async def fake(message: str, cands: list[Title]) -> RankResult:
-        return RankResult(
-            picks=[
-                RankedPick(tmdb_id=1, blurb="a"),
-                RankedPick(tmdb_id=1, blurb="dup"),
-                RankedPick(tmdb_id=2, blurb="b"),
-                RankedPick(tmdb_id=3, blurb="c"),
-            ]
-        )
-
-    picks = run(rank("mood", candidates, model=fake))
+    picks = _valid_picks(result, candidates)
     assert [p.tmdb_id for p in picks] == [1, 2, 3]
-
-
-def test_rank_short_circuits_on_empty_candidates() -> None:
-    called = False
-
-    async def fake(message: str, cands: list[Title]) -> RankResult:
-        nonlocal called
-        called = True
-        return RankResult(picks=[])
-
-    assert run(rank("mood", [], model=fake)) == []
-    assert not called
 
 
 def test_search_uses_callers_region_and_providers_never_the_models() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(keywords=["heist"])
 
     async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
         return RankResult(picks=[])
 
-    result = run(
-        search(
+    run(
+        search_turn(
             "something",
             client=fake_tmdb.client(),
             watch_region="GB",
@@ -183,12 +225,10 @@ def test_search_uses_callers_region_and_providers_never_the_models() -> None:
     assert params["with_watch_providers"] == "8|9"
     # Correctness floors from tmdb.py — the model must not be able to lower
     # either, and this must still hold once a request has gone through the
-    # full interpret() -> discover() -> rank() pipeline, not just discover()
-    # in isolation.
+    # full interpret -> discover() -> rank path, not just discover() in
+    # isolation.
     assert params["vote_count.gte"] == str(tmdb.MIN_VOTE_COUNT)
     assert params["with_watch_monetization_types"] == "flatrate"
-    assert result.intent is not None
-    assert result.intent.keywords == ["heist"]
 
 
 def test_search_joins_blurb_with_the_real_title_not_model_metadata() -> None:
@@ -202,7 +242,7 @@ def test_search_joins_blurb_with_the_real_title_not_model_metadata() -> None:
         )
 
     result = run(
-        search(
+        search_turn(
             "mood",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -217,45 +257,6 @@ def test_search_joins_blurb_with_the_real_title_not_model_metadata() -> None:
     assert pick["blurb"] == "great fit"
 
 
-def test_search_wraps_interpret_failure_as_catalog_tool_error() -> None:
-    fake_tmdb = FakeTMDB()
-
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        raise RuntimeError("model call timed out")
-
-    with pytest.raises(CatalogToolError):
-        run(
-            search(
-                "something",
-                client=fake_tmdb.client(),
-                watch_region="US",
-                watch_providers=[8],
-                interpret_model=fake_interpret,
-                rank_model=rank_must_not_run(INTERPRET_RAISED),
-            )
-        )
-
-
-def test_search_wraps_rank_failure_as_catalog_tool_error() -> None:
-    fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
-
-    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
-        raise RuntimeError("model returned an unparseable response")
-
-    with pytest.raises(CatalogToolError):
-        run(
-            search(
-                "something",
-                client=fake_tmdb.client(),
-                watch_region="US",
-                watch_providers=[8],
-                interpret_model=ok_interpret,
-                rank_model=fake_rank,
-            )
-        )
-
-
 def test_search_lets_a_bad_watch_region_propagate_as_a_plain_value_error() -> None:
     """watch_region comes from the caller, never from the model — a malformed
     one is a caller bug to fix, not a case CatalogToolError should describe as
@@ -264,7 +265,7 @@ def test_search_lets_a_bad_watch_region_propagate_as_a_plain_value_error() -> No
 
     with pytest.raises(ValueError) as excinfo:
         run(
-            search(
+            search_turn(
                 "something",
                 client=fake_tmdb.client(),
                 watch_region="usa",
@@ -273,7 +274,7 @@ def test_search_lets_a_bad_watch_region_propagate_as_a_plain_value_error() -> No
                 rank_model=rank_must_not_run(DISCOVER_RAISED),
             )
         )
-    assert not isinstance(excinfo.value, CatalogToolError)
+    assert type(excinfo.value) is ValueError
 
 
 def test_search_lets_tmdb_unavailable_propagate_unwrapped(
@@ -285,7 +286,7 @@ def test_search_lets_tmdb_unavailable_propagate_unwrapped(
 
     with pytest.raises(TMDBUnavailable):
         run(
-            search(
+            search_turn(
                 "something",
                 client=fake_tmdb.client(),
                 watch_region="US",
@@ -305,7 +306,7 @@ def test_search_lets_tmdb_error_propagate_unwrapped() -> None:
 
     with pytest.raises(tmdb.TMDBError) as excinfo:
         run(
-            search(
+            search_turn(
                 "something",
                 client=fake_tmdb.client(),
                 watch_region="US",
@@ -327,7 +328,7 @@ def test_search_treats_a_malformed_discover_row_as_a_bug_not_an_outage() -> None
 
     with pytest.raises(tmdb.TMDBError) as excinfo:
         run(
-            search(
+            search_turn(
                 "something",
                 client=fake_tmdb.client(),
                 watch_region="US",
@@ -337,125 +338,6 @@ def test_search_treats_a_malformed_discover_row_as_a_bug_not_an_outage() -> None
             )
         )
     assert not isinstance(excinfo.value, tmdb.TMDBUnavailable)
-
-
-def test_search_short_circuits_on_empty_watch_providers() -> None:
-    fake_tmdb = FakeTMDB()
-    called = False
-
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        nonlocal called
-        called = True
-        return make_intent()
-
-    result = run(
-        search(
-            "something",
-            client=fake_tmdb.client(),
-            watch_region="US",
-            watch_providers=[],
-            interpret_model=fake_interpret,
-            rank_model=rank_must_not_run(NO_PROVIDERS),
-        )
-    )
-
-    assert result.intent is None
-    assert result.picks == []
-    assert result.relaxed == []
-    assert not called
-    assert fake_tmdb.requests == []
-
-
-def test_search_short_circuits_on_capability_question() -> None:
-    fake_tmdb = FakeTMDB()
-
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(is_capability_question=True)
-
-    on_intent_calls: list[DiscoverIntent] = []
-
-    async def on_intent(intent: DiscoverIntent) -> None:
-        on_intent_calls.append(intent)
-
-    result = run(
-        search(
-            "what can you do?",
-            client=fake_tmdb.client(),
-            watch_region="US",
-            watch_providers=[8],
-            interpret_model=fake_interpret,
-            rank_model=rank_must_not_run(CAPABILITY_QUESTION),
-            on_intent=on_intent,
-        )
-    )
-
-    assert result.intent is not None
-    assert result.intent.is_capability_question
-    assert result.picks == []
-    assert result.relaxed == []
-    # No "interpreting" line for a question that isn't a search.
-    assert on_intent_calls == []
-    assert fake_tmdb.requests == []
-
-
-def test_search_short_circuits_on_clarifying_question() -> None:
-    fake_tmdb = FakeTMDB()
-
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(clarifying_question="What are you in the mood for?")
-
-    on_intent_calls: list[DiscoverIntent] = []
-
-    async def on_intent(intent: DiscoverIntent) -> None:
-        on_intent_calls.append(intent)
-
-    result = run(
-        search(
-            "recommend something",
-            client=fake_tmdb.client(),
-            watch_region="US",
-            watch_providers=[8],
-            interpret_model=fake_interpret,
-            rank_model=rank_must_not_run(NEEDS_CLARIFICATION),
-            on_intent=on_intent,
-        )
-    )
-
-    assert result.intent is not None
-    assert result.intent.clarifying_question == "What are you in the mood for?"
-    assert result.picks == []
-    assert result.relaxed == []
-    # No "interpreting" line, same reasoning as the capability-question case:
-    # there is no search to narrate.
-    assert on_intent_calls == []
-    assert fake_tmdb.requests == []
-
-
-def test_search_treats_a_whitespace_only_clarifying_question_as_none() -> None:
-    """A whitespace-only clarifying_question must not short-circuit the
-    search or reach the user as a blank reply — see the strip() in
-    search() right after interpret() returns."""
-    fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
-
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(keywords=["heist"], clarifying_question="  ")
-
-    result = run(
-        search(
-            "a heist movie",
-            client=fake_tmdb.client(),
-            watch_region="US",
-            watch_providers=[8],
-            interpret_model=fake_interpret,
-            rank_model=_rank_first,
-        )
-    )
-
-    assert result.intent is not None
-    assert result.intent.clarifying_question == ""
-    assert len(result.picks) == 1
-    assert fake_tmdb.count("/discover/movie") == 1
 
 
 # --- relaxation ladder -----------------------------------------------------
@@ -470,11 +352,11 @@ def test_search_relaxes_runtime_when_the_first_query_is_empty() -> None:
     fake_tmdb.ok("/discover/movie", {"results": []})  # first pass: nothing
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # runtime dropped: hit
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = run(
-        search(
+        search_turn(
             "something short",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -499,11 +381,11 @@ def test_search_skips_a_rung_with_nothing_to_drop() -> None:
     fake_tmdb.ok("/discover/movie", {"results": []})  # keywords dropped
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # runtime dropped
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90, keywords=["cozy"])
 
     result = run(
-        search(
+        search_turn(
             "something cozy and short",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -529,11 +411,11 @@ def test_search_skips_keywords_rung_when_nothing_resolved() -> None:
     fake_tmdb.ok("/search/keyword", {"results": []})  # "cozy" never resolves
     fake_tmdb.ok("/discover/movie", {"results": []})  # the only call made
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(keywords=["cozy"])  # nothing else set to relax
 
     result = run(
-        search(
+        search_turn(
             "something cozy",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -554,7 +436,7 @@ def test_search_never_relaxes_services_region_or_exclusions() -> None:
     fake_tmdb.ok("/search/keyword", {"results": [{"id": 42, "name": "cozy"}]})
     # every /discover/movie falls through to the fake's default empty result
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(
             max_runtime_minutes=90,
             release_year_gte=2015,
@@ -563,7 +445,7 @@ def test_search_never_relaxes_services_region_or_exclusions() -> None:
         )
 
     result = run(
-        search(
+        search_turn(
             "something",
             client=fake_tmdb.client(),
             watch_region="GB",
@@ -594,11 +476,11 @@ def test_search_does_not_relax_when_the_first_query_fills_the_floor() -> None:
         {"results": [raw_movie(101 + i) for i in range(RESULT_FLOOR)]},
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = run(
-        search(
+        search_turn(
             "something",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -646,7 +528,7 @@ def test_search_enriches_picks_with_runtime_cast_genres_availability() -> None:
     )
 
     result = run(
-        search(
+        search_turn(
             "mood",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -695,7 +577,7 @@ def test_search_available_on_excludes_providers_the_user_does_not_have() -> None
     )
 
     result = run(
-        search(
+        search_turn(
             "mood",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -709,7 +591,7 @@ def test_search_available_on_excludes_providers_the_user_does_not_have() -> None
     assert [p["provider_id"] for p in pick["available_on"]] == [8]
 
 
-async def _rent_interpret(_: str) -> DiscoverIntent:
+async def _rent_interpret(_: str) -> Intent:
     return make_intent(monetization="rent")
 
 
@@ -719,7 +601,7 @@ def test_search_rent_turn_queries_by_region_without_the_provider_list() -> None:
     fake_tmdb.ok("/movie/101/watch/providers", {"results": {"US": {}}})
 
     run(
-        search(
+        search_turn(
             "a thriller I can rent tonight",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -749,7 +631,7 @@ def test_search_rent_turn_still_cuts_streaming_to_the_users_services() -> None:
     )
 
     result = run(
-        search(
+        search_turn(
             "a thriller I can rent tonight",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -772,7 +654,7 @@ def test_search_rent_turn_walks_the_same_ladder() -> None:
     for _ in range(4):
         fake_tmdb.ok("/discover/movie", {"results": []})
 
-    async def fake_interpret(_: str) -> DiscoverIntent:
+    async def fake_interpret(_: str) -> Intent:
         return make_intent(
             monetization="rent",
             keywords=["heist"],
@@ -781,7 +663,7 @@ def test_search_rent_turn_walks_the_same_ladder() -> None:
         )
 
     result = run(
-        search(
+        search_turn(
             "a heist I can rent, under 90 minutes, from the 90s",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -813,11 +695,11 @@ def test_search_rent_turn_naming_a_title_still_takes_the_lookup_path() -> None:
         link=WATCH_LINK,
     )
 
-    async def fake_interpret(_: str) -> DiscoverIntent:
-        return make_intent(title="Heat", monetization="rent")
+    async def fake_interpret(_: str) -> Intent:
+        return LookUpArgs(title="Heat")
 
     result = run(
-        search(
+        search_turn(
             "can I rent Heat?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -827,7 +709,6 @@ def test_search_rent_turn_naming_a_title_still_takes_the_lookup_path() -> None:
         )
     )
 
-    assert result.kind == "lookup"
     assert fake_tmdb.all_params_for("/discover/movie") == []
     [pick] = result.picks
     assert pick["available_on"] == []
@@ -972,7 +853,7 @@ def test_unavailable_placeholder_carries_every_key_a_resolved_pick_has() -> None
 
 def test_search_enrichment_only_runs_for_final_ranked_picks() -> None:
     """More candidates than RESULT_FLOOR, so the floor top-up cannot be what
-    keeps the last one out: rank() picked one, the top-up filled to the floor,
+    keeps the last one out: the rank call picked one, the top-up filled to the floor,
     and the candidate past that is enriched by nothing."""
     fake_tmdb = FakeTMDB()
     extra = RESULT_FLOOR + 2
@@ -981,7 +862,7 @@ def test_search_enrichment_only_runs_for_final_ranked_picks() -> None:
     )
 
     result = run(
-        search(
+        search_turn(
             "mood",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -1024,7 +905,7 @@ def test_search_enrichment_failure_for_one_title_degrades_not_fails(
     )
 
     result = run(
-        search(
+        search_turn(
             "mood",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -1156,7 +1037,7 @@ def test_enrich_watchlist_one_items_failure_does_not_drop_siblings(
 
 
 def test_enrich_watchlist_does_not_short_circuit_on_empty_providers() -> None:
-    # Unlike search(), a saved title with no ticked services must still be
+    # Unlike a chat turn, a saved title with no ticked services must still be
     # enriched — "Not on your services" is live truth here, not a reason to
     # skip the lookup.
     fake_tmdb = FakeTMDB()
@@ -1221,7 +1102,7 @@ def _search_with_verdicts(
     interpret_model: Interpreter = ok_interpret,
 ) -> CatalogResult:
     return run(
-        search(
+        search_turn(
             "something good",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -1234,7 +1115,7 @@ def _search_with_verdicts(
 
 
 def test_search_drops_judged_titles_before_ranking() -> None:
-    """The done-when's core: a title marked seen never reaches rank(), so no
+    """The done-when's core: a title marked seen never reaches the rank call, so no
     model behaviour can put it back on screen."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101), raw_movie(102)]})
@@ -1296,7 +1177,7 @@ def test_search_relaxes_for_a_page_the_user_has_entirely_judged() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = _search_with_verdicts(
@@ -1413,7 +1294,7 @@ def test_search_rescues_an_all_excluded_page_from_the_next_one() -> None:
 
 
 def test_search_gives_liked_titles_to_rank_but_never_to_interpret() -> None:
-    """Taste shapes the ranking, never the query: interpret()'s output
+    """Taste shapes the ranking, never the query: the interpret call's output
     becomes hard TMDB filters, and a past like is a preference, not a
     constraint the user asked for."""
     fake_tmdb = FakeTMDB()
@@ -1422,7 +1303,7 @@ def test_search_gives_liked_titles_to_rank_but_never_to_interpret() -> None:
     interpret_saw: list[str] = []
     rank_saw: list[str] = []
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         interpret_saw.append(message)
         return make_intent()
 
@@ -1436,7 +1317,7 @@ def test_search_gives_liked_titles_to_rank_but_never_to_interpret() -> None:
     assert "Heat" in rank_saw[0]
     assert "Crime" in rank_saw[0]  # genres resolved from the full-title shape
     # The hint sits above the request, and the request above the count line
-    # rank() is given last — see _with_taste and _with_target_count.
+    # The rank call is given last — see _with_taste and _with_target_count.
     assert rank_saw[0].index("Heat") < rank_saw[0].index("something good")
     assert rank_saw[0].index("something good") < rank_saw[0].index("Return ")
     assert "Heat" not in interpret_saw[0]
@@ -1459,7 +1340,7 @@ def test_search_ignores_liked_titles_of_another_media_type() -> None:
 
 
 def test_search_skips_taste_lookups_when_nothing_survives_exclusion() -> None:
-    """rank() short-circuits on an empty candidate list anyway, so resolving
+    """TwoCallTurn skips the rank call on an empty candidate list anyway, so resolving
     liked titles then would spend round trips on a turn that shows nothing."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
@@ -1595,9 +1476,7 @@ def test_search_does_not_report_all_judged_when_the_query_found_nothing() -> Non
 
 
 def test_format_candidates_escapes_third_party_text() -> None:
-    """_format_candidates has no other coverage - every test fakes the Ranker,
-    so google_ranker never runs and this is the only thing exercising it.
-    Overviews are arbitrary third-party text, so the fixture carries what a
+    """Overviews are arbitrary third-party text, so the fixture carries what a
     hostile one would: a separator, a quote and a lone surrogate. All three
     have to come back escaped, and the result has to survive encoding - that
     last part is what fails if the escaping is ever loosened."""
@@ -1643,7 +1522,7 @@ def test_search_drops_only_the_bad_taste_line_not_the_whole_hint() -> None:
 def test_search_with_no_verdicts_sends_rank_the_bare_message() -> None:
     """A brand-new account has no verdicts at all. That must not merely fail
     to inject a taste hint — with zero liked titles, taste is [] and
-    _with_taste is a no-op, so rank() sees the caller's message and nothing
+    _with_taste is a no-op, so the rank call sees the caller's message and nothing
     else about them. This is what "leans on what the user typed" rests on.
     (The count line _with_target_count adds is about the reply's shape, not
     about the user, so it is not what this guards against.)"""
@@ -1863,11 +1742,11 @@ def test_search_looks_a_named_title_up_instead_of_discovering() -> None:
         fake_tmdb, media_type="movie", tmdb_id=1, title="Heat", flatrate=[NETFLIX]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Heat")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Heat")
 
     result = run(
-        search(
+        search_turn(
             "is Heat on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -1886,42 +1765,9 @@ def test_search_looks_a_named_title_up_instead_of_discovering() -> None:
     assert fake_tmdb.count("/discover/movie") == 0
 
 
-def test_title_lookup_still_streams_an_interpreting_line() -> None:
-    # A lookup is several TMDB round trips, so it needs the comprehension
-    # line as much as a discover() turn does — unlike the capability and
-    # clarifying short-circuits, which fire no on_intent at all.
-    fake_tmdb = FakeTMDB()
-    _queue_title_lookup(fake_tmdb, raw_named(1, "Heat", 8658))
-    _queue_enrichment(
-        fake_tmdb, media_type="movie", tmdb_id=1, title="Heat", flatrate=[]
-    )
-
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Heat")
-
-    seen: list[DiscoverIntent] = []
-
-    async def on_intent(intent: DiscoverIntent) -> None:
-        seen.append(intent)
-
-    run(
-        search(
-            "is Heat on netflix?",
-            client=fake_tmdb.client(),
-            watch_region="US",
-            watch_providers=[8],
-            interpret_model=fake_interpret,
-            rank_model=rank_must_not_run(TITLE_LOOKUP),
-            on_intent=on_intent,
-        )
-    )
-
-    assert [i.title for i in seen] == ["Heat"]
-
-
 def test_title_lookup_ignores_the_interpreted_media_type() -> None:
     # "The Office" as a movie is a 1930 silent film; as TV it is the 2005
-    # series. interpret() guessed movie here and must not be believed.
+    # series. The interpret call guessed movie here and must not be believed.
     fake_tmdb = FakeTMDB()
     # TMDB's own order: the series first, the 1930 film after it. The film
     # is under MIN_VOTE_COUNT anyway, so both signals point the same way.
@@ -1937,12 +1783,12 @@ def test_title_lookup_ignores_the_interpreted_media_type() -> None:
         fake_tmdb, media_type="movie", tmdb_id=11, title="The Office", flatrate=[]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         # make_intent's media_type is "movie" — the wrong guess, on purpose.
-        return make_intent(title="The Office")
+        return LookUpArgs(title="The Office")
 
     result = run(
-        search(
+        search_turn(
             "do you have The Office?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -1966,11 +1812,11 @@ def test_title_lookup_answers_no_rather_than_nothing_matched() -> None:
         fake_tmdb, media_type="movie", tmdb_id=1, title="Heat", flatrate=[]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Heat")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Heat")
 
     result = run(
-        search(
+        search_turn(
             "is Heat on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -1985,7 +1831,7 @@ def test_title_lookup_answers_no_rather_than_nothing_matched() -> None:
 
 
 def test_title_lookup_is_not_filtered_by_verdicts() -> None:
-    # search() drops already-judged titles from a recommendation. A question
+    # A search drops already-judged titles from a recommendation. A question
     # about a named title is not a recommendation — "is Heat on my services"
     # deserves an answer whether or not Heat is marked seen.
     fake_tmdb = FakeTMDB()
@@ -1994,11 +1840,11 @@ def test_title_lookup_is_not_filtered_by_verdicts() -> None:
         fake_tmdb, media_type="movie", tmdb_id=1, title="Heat", flatrate=[NETFLIX]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Heat")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Heat")
 
     result = run(
-        search(
+        search_turn(
             "is Heat on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2022,11 +1868,11 @@ def test_title_lookup_caps_the_number_of_matches() -> None:
             fake_tmdb, media_type="movie", tmdb_id=i, title="Dune", flatrate=[]
         )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Dune")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Dune")
 
     result = run(
-        search(
+        search_turn(
             "is Dune streaming?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2043,11 +1889,11 @@ def test_title_lookup_that_resolves_to_nothing_returns_no_picks() -> None:
     fake_tmdb = FakeTMDB()
     _queue_title_lookup(fake_tmdb)
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Nonexistent Film")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Nonexistent Film")
 
     result = run(
-        search(
+        search_turn(
             "do you have Nonexistent Film?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2058,35 +1904,7 @@ def test_title_lookup_that_resolves_to_nothing_returns_no_picks() -> None:
     )
 
     assert result.picks == []
-    assert result.intent is not None and result.intent.title == "Nonexistent Film"
     assert fake_tmdb.count("/discover/movie") == 0
-
-
-def test_whitespace_only_title_is_not_a_lookup() -> None:
-    # Normalized alongside clarifying_question — a blank must never reach
-    # search_titles() as an empty query.
-    fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
-
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="   ")
-
-    async def fake_rank(message: str, candidates: list[Title]) -> RankResult:
-        return RankResult(picks=[])
-
-    run(
-        search(
-            "something funny",
-            client=fake_tmdb.client(),
-            watch_region="US",
-            watch_providers=[8],
-            interpret_model=fake_interpret,
-            rank_model=fake_rank,
-        )
-    )
-
-    assert fake_tmdb.count("/discover/movie") == 1
-    assert fake_tmdb.count("/search/multi") == 0
 
 
 def test_title_lookup_never_names_a_service_the_user_lacks() -> None:
@@ -2106,11 +1924,11 @@ def test_title_lookup_never_names_a_service_the_user_lacks() -> None:
         ],
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Heat")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Heat")
 
     result = run(
-        search(
+        search_turn(
             "is Heat on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2139,11 +1957,11 @@ def test_title_lookup_keeps_the_real_title_when_enrichment_degrades(
     fake_tmdb.queue("/movie/1", *[httpx2.Response(503) for _ in range(3)])
     fake_tmdb.ok("/movie/1/watch/providers", {"results": {"US": {"flatrate": []}}})
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Heat")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Heat")
 
     result = run(
-        search(
+        search_turn(
             "is Heat on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2172,11 +1990,11 @@ def test_title_lookup_wont_let_a_zero_vote_namesake_win() -> None:
         fake_tmdb, media_type="movie", tmdb_id=1, title="Spider-Man", flatrate=[]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Spiderman")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Spiderman")
 
     result = run(
-        search(
+        search_turn(
             "do you have Spiderman?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2208,11 +2026,11 @@ def test_title_lookup_prefers_an_article_carry_to_an_obscure_namesake() -> None:
         flatrate=[NETFLIX],
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="godfather")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="godfather")
 
     result = run(
-        search(
+        search_turn(
             "is godfather on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2240,11 +2058,11 @@ def test_title_lookup_wont_answer_about_heat_with_the_heat() -> None:
         fake_tmdb, media_type="movie", tmdb_id=2, title="Heat", flatrate=[NETFLIX]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Heat")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Heat")
 
     result = run(
-        search(
+        search_turn(
             "is Heat on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2271,11 +2089,11 @@ def test_title_lookup_matches_a_ligature_spelled_out() -> None:
         flatrate=[NETFLIX],
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Aeon Flux")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Aeon Flux")
 
     result = run(
-        search(
+        search_turn(
             "is Aeon Flux on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2302,11 +2120,11 @@ def test_title_lookup_answers_about_a_title_under_the_vote_floor() -> None:
         flatrate=[NETFLIX],
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Somebody Somewhere")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Somebody Somewhere")
 
     result = run(
-        search(
+        search_turn(
             "is Somebody Somewhere on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2331,11 +2149,11 @@ def test_title_lookup_returns_nothing_when_no_row_carries_the_name() -> None:
         raw_named(3, "Red Heat", 900),
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Heat 2")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Heat 2")
 
     result = run(
-        search(
+        search_turn(
             "is Heat 2 on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2366,11 +2184,11 @@ def test_title_lookup_keeps_an_exact_match_under_the_vote_floor() -> None:
         fake_tmdb, media_type="movie", tmdb_id=2, title="Task Force", flatrate=[]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Task")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Task")
 
     result = run(
-        search(
+        search_turn(
             "is Task on my services?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2398,11 +2216,11 @@ def test_title_lookup_answers_about_the_name_when_nothing_clears_the_floor() -> 
         fake_tmdb, media_type="movie", tmdb_id=2, title="Nightfall", flatrate=[]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Nightfall")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Nightfall")
 
     result = run(
-        search(
+        search_turn(
             "do you have Nightfall?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2432,11 +2250,11 @@ def test_title_lookup_picks_the_name_over_tmdbs_top_result() -> None:
         fake_tmdb, media_type="movie", tmdb_id=1, title="Task Force", flatrate=[]
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Task")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Task")
 
     result = run(
-        search(
+        search_turn(
             "is Task on my services?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2464,11 +2282,11 @@ def test_title_lookup_shows_the_rest_of_a_franchise() -> None:
             fake_tmdb, media_type="movie", tmdb_id=i, title=name, flatrate=[]
         )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Star Wars")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Star Wars")
 
     result = run(
-        search(
+        search_turn(
             "is Star Wars on netflix?",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2482,37 +2300,6 @@ def test_title_lookup_shows_the_rest_of_a_franchise() -> None:
         "Star Wars",
         "Star Wars: The Last Jedi",
     ]
-
-
-def test_title_lookup_ignores_an_explicit_limit() -> None:
-    # intent.limit sizes a recommendation list, and carries forward from an
-    # earlier turn. A lookup answers a question instead, and an ambiguous
-    # name *is* the answer: "just one" said two turns ago must not hide Dune
-    # (1984) from someone asking whether Dune is streaming.
-    fake_tmdb = FakeTMDB()
-    _queue_title_lookup(
-        fake_tmdb, *(raw_named(i, "Dune", 1000 - i) for i in range(1, 7))
-    )
-    for i in range(1, 7):
-        _queue_enrichment(
-            fake_tmdb, media_type="movie", tmdb_id=i, title="Dune", flatrate=[]
-        )
-
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Dune", limit=1)
-
-    result = run(
-        search(
-            "just one — is Dune streaming?",
-            client=fake_tmdb.client(),
-            watch_region="US",
-            watch_providers=[8],
-            interpret_model=fake_interpret,
-            rank_model=rank_must_not_run(TITLE_LOOKUP),
-        )
-    )
-
-    assert len(result.picks) == MAX_TITLE_MATCHES
 
 
 # --- result sizing: the floor, the ceiling, and accumulation ----------------
@@ -2531,7 +2318,7 @@ def _search(
     verdicts: list[TitleVerdict] | None = None,
 ) -> CatalogResult:
     return run(
-        search(
+        search_turn(
             "something good",
             client=fake_tmdb.client(),
             watch_region="US",
@@ -2551,7 +2338,7 @@ def test_search_relaxes_a_partial_page_not_only_an_empty_one() -> None:
     fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2568,7 +2355,7 @@ def test_relaxing_keeps_the_titles_that_matched_exactly_and_leads_with_them() ->
     fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2580,13 +2367,13 @@ def test_relaxing_keeps_the_titles_that_matched_exactly_and_leads_with_them() ->
 
 
 def test_relaxing_orders_exact_matches_first_however_rank_returned_them() -> None:
-    """rank() cannot know a candidate reached the list only because a
+    """The rank call cannot know a candidate reached the list only because a
     constraint was dropped, so the ordering is applied here, not asked for."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(101))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     async def rank_reversed(message: str, candidates: list[Title]) -> RankResult:
@@ -2605,16 +2392,16 @@ def test_relaxing_orders_exact_matches_first_however_rank_returned_them() -> Non
 
 
 def test_relaxing_keeps_exact_matches_the_cut_would_otherwise_discard() -> None:
-    """The cut has to fall after the exactness sort. rank() is told to order
+    """The cut has to fall after the exactness sort. The rank call is told to order
     best-first and cannot see rungs, so a widened row can outrank an exact one;
-    cutting in its order — which is what passing a limit into rank() did —
+    cutting in its order — which is what passing it a limit would —
     threw away every title the user actually asked for and then told them
     nothing matched."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
     fake_tmdb.ok("/discover/movie", _page(*range(201, 221)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     async def rank_widened_first(message: str, candidates: list[Title]) -> RankResult:
@@ -2644,7 +2431,7 @@ def test_paging_reads_toward_the_ceiling_not_merely_the_floor() -> None:
     fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
     fake_tmdb.ok("/discover/movie", _page(*range(201, 221)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(limit=10)
 
     # Fifteen of page 1's twenty rows are already on screen, leaving five —
@@ -2680,7 +2467,7 @@ def test_genres_holds_when_the_named_person_did_not_resolve() -> None:
     fake_tmdb.ok("/discover/movie", _page(101))
     fake_tmdb.ok("/discover/movie", _page(*range(301, 321)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(genres=["horror"], cast=["Jonn Smyth"])
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2694,7 +2481,7 @@ def test_search_stops_relaxing_once_the_floor_is_met() -> None:
     fake_tmdb.ok("/discover/movie", _page(101, 102))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90, release_year_gte=1990)
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2710,7 +2497,7 @@ def test_an_explicit_count_lowers_the_floor_instead_of_firing_a_rung() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(101))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90, limit=1)
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2724,7 +2511,7 @@ def test_search_never_returns_more_than_the_ceiling() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(limit=20)
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2734,7 +2521,7 @@ def test_search_never_returns_more_than_the_ceiling() -> None:
 
 def test_search_tops_up_to_the_floor_when_the_model_underdelivers() -> None:
     """The floor is a property of the code, not a request made of the model —
-    same reason rank() validates ids rather than asking for valid ones."""
+    same reason _valid_picks validates ids rather than asking for valid ones."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(*range(101, 109)))
 
@@ -2753,7 +2540,7 @@ def test_search_top_up_never_exceeds_an_explicit_count() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(*range(101, 109)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(limit=2)
 
     async def rank_none(message: str, candidates: list[Title]) -> RankResult:
@@ -2767,7 +2554,7 @@ def test_search_top_up_never_exceeds_an_explicit_count() -> None:
 def test_what_reaches_rank_is_bounded_by_the_paging_stop() -> None:
     """No separate cap is needed, and one here would be dead code: paging
     stops once `limit` rows survive, and a rung only fires below `floor`, so
-    the most rank() can ever be handed is one page on top of a survivor count
+    the most the rank call can ever be handed is one page on top of a survivor count
     that was still short of the limit."""
     seen: list[int] = []
 
@@ -2779,7 +2566,7 @@ def test_what_reaches_rank_is_bounded_by_the_paging_stop() -> None:
     for start in (101, 201, 301):
         fake_tmdb.ok("/discover/movie", _page(*range(start, start + 20)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         # Two rungs available, and no page clears the floor after exclusion.
         return make_intent(max_runtime_minutes=90, release_year_gte=1990)
 
@@ -2801,7 +2588,7 @@ def test_genres_bends_when_an_actor_still_says_what_the_search_is_about() -> Non
     fake_tmdb.ok("/discover/movie", _page(101))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(genres=["horror"], cast=["Tom Hanks"])
 
     fake_tmdb.ok("/search/person", {"results": [{"id": 31, "name": "Tom Hanks"}]})
@@ -2821,7 +2608,7 @@ def test_genres_holds_when_dropping_it_would_leave_no_subject() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(101))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(genres=["horror"])
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2838,12 +2625,10 @@ def test_genres_holds_when_the_genre_never_reached_the_query() -> None:
     fake_tmdb.ok("/search/person", {"results": [{"id": 66, "name": "Bryan Cranston"}]})
     fake_tmdb.ok("/discover/tv", _page(101))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         # A resolved subject, so genres_applied is the only thing holding the
         # rung — "horror" is a movie genre, TV's nearest is nothing at all.
-        return DiscoverIntent(
-            media_type="tv", genres=["horror"], cast=["Bryan Cranston"]
-        )
+        return SearchArgs(media_type="tv", genres=["horror"], cast=["Bryan Cranston"])
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
 
@@ -2863,7 +2648,7 @@ def test_the_rating_bar_bends_for_a_narrow_best_query() -> None:
     fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(sort_by="vote_average.desc")
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2872,7 +2657,7 @@ def test_the_rating_bar_bends_for_a_narrow_best_query() -> None:
     assert result.relaxed == ["rating"]
     assert calls[0]["sort_by"] == "vote_average.desc"
     assert calls[0]["vote_count.gte"] == str(tmdb.MIN_VOTE_COUNT_TOP_RATED)
-    # The bar bends; the ordering the user asked for does not. rank() never
+    # The bar bends; the ordering the user asked for does not. The rank call never
     # sees a rating, so a most-watched page could not be put back in rating
     # order downstream.
     assert calls[1]["sort_by"] == "vote_average.desc"
@@ -2898,7 +2683,7 @@ def test_the_rating_bar_bends_after_every_constraint_the_user_stated() -> None:
     fake_tmdb.ok("/discover/movie", _page(102))  # runtime dropped
     fake_tmdb.ok("/discover/movie", _page(103))  # rating bar dropped
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90, sort_by="vote_average.desc")
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2921,7 +2706,7 @@ def test_the_ladder_stops_widening_once_its_budget_is_spent(
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(101))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -2974,7 +2759,7 @@ def test_a_deadline_mid_batch_keeps_the_pages_that_did_arrive() -> None:
         return httpx2.Response(200, json=_page(301))
 
     async def go() -> CatalogResult:
-        return await search(
+        return await search_turn(
             "something good",
             client=tmdb.TMDBClient("t", transport=httpx2.MockTransport(one_slow_page)),
             watch_region="US",
@@ -3014,7 +2799,7 @@ def test_a_spent_paging_budget_still_leaves_the_rungs_their_turn(
         _page(*range(201, 201 + PAGE_SIZE)),
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = _search(
@@ -3054,7 +2839,7 @@ def test_the_budget_cancels_a_discover_already_in_flight(
     monkeypatch.setattr(catalog_tool, "LADDER_BUDGET_SECONDS", 0.05)
 
     async def go() -> CatalogResult:
-        return await search(
+        return await search_turn(
             "something good",
             client=tmdb.TMDBClient("t", transport=httpx2.MockTransport(slow_transport)),
             watch_region="US",
@@ -3081,7 +2866,7 @@ def test_a_deep_session_pages_further_rather_than_widening() -> None:
     for start in (101, 121, 141, 161):
         fake_tmdb.ok("/discover/movie", _page(*range(start, start + PAGE_SIZE)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(release_year_gte=1990, release_year_lte=1999)
 
     result = _search(
@@ -3104,7 +2889,7 @@ def test_a_deep_session_pages_further_rather_than_widening() -> None:
 
 
 def test_a_widened_query_never_loses_an_exact_match() -> None:
-    """rank() cannot see rungs, so it can name ten widened picks and never
+    """The rank call cannot see rungs, so it can name ten widened picks and never
     mention the two that actually matched. Ordering alone cannot fix that —
     there has to be something exact in the list to order."""
     fake_tmdb = FakeTMDB()
@@ -3112,7 +2897,7 @@ def test_a_widened_query_never_loses_an_exact_match() -> None:
     fake_tmdb.ok("/discover/movie", _page(101, 102))
     fake_tmdb.ok("/discover/movie", _page(*range(201, 201 + PAGE_SIZE)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(keywords=["slow burn"])
 
     async def rank_widened_only(message: str, candidates: list[Title]) -> RankResult:
@@ -3138,13 +2923,13 @@ def test_a_widened_query_never_loses_an_exact_match() -> None:
 
 def test_a_reserved_exact_match_carries_no_blurb() -> None:
     """Same shape the floor top-up already returns. A blurb would mean a
-    second rank() call, against a 15 req/min free tier."""
+    second rank call, against a 15 req/min free tier."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/search/keyword", {"results": [{"id": 42, "name": "slow burn"}]})
     fake_tmdb.ok("/discover/movie", _page(101))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(keywords=["slow burn"])
 
     async def rank_widened_only(message: str, candidates: list[Title]) -> RankResult:
@@ -3167,7 +2952,7 @@ def test_a_reserved_exact_match_carries_no_blurb() -> None:
 
 def test_nothing_is_reserved_when_the_query_was_never_widened() -> None:
     """With no rung fired every candidate is rung 0, so an unguarded
-    reservation would hand back the whole page instead of rank()'s picks."""
+    reservation would hand back the whole page instead of the rank call's picks."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(*range(101, 101 + PAGE_SIZE)))
 
@@ -3190,7 +2975,7 @@ def test_a_named_person_is_never_a_rung() -> None:
     fake_tmdb.ok("/search/person", {"results": [{"id": 31, "name": "Tom Hanks"}]})
     fake_tmdb.ok("/discover/movie", _page(101, 102))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(cast=["Tom Hanks"])
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -3279,8 +3064,8 @@ def test_a_named_title_is_answered_however_often_it_has_been_shown() -> None:
     fake_tmdb.ok("/movie/101", raw_movie_full(101, "Fake Heist"))
     fake_tmdb.ok("/movie/101/watch/providers", {"results": {}})
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
-        return make_intent(title="Fake Heist")
+    async def fake_interpret(message: str) -> Intent:
+        return LookUpArgs(title="Fake Heist")
 
     result = _search(
         fake_tmdb,
@@ -3290,11 +3075,37 @@ def test_a_named_title_is_answered_however_often_it_has_been_shown() -> None:
     )
 
     assert [p["tmdb_id"] for p in result.picks] == [101]
-    assert result.kind == "lookup"
+    assert fake_tmdb.count("/discover/movie") == 0
+
+
+def test_the_rank_call_reads_the_candidate_list_last() -> None:
+    """The taste hint before the request, the target count after it, and the
+    candidates after everything: the rank prompt is written around that
+    order."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
+    found = run(
+        find_candidates(
+            make_intent(),
+            client=fake_tmdb.client(),
+            watch_region="US",
+            watch_providers=[8],
+            verdicts=[],
+            shown=[],
+        )
+    )
+    found.taste = ["Heat (1995)"]
+
+    content = _rank_content("a heist movie", found)
+
+    request, candidates = content.split("\n\nCandidates:\n")
+    assert request.startswith(TASTE_HEADER)
+    assert request.index("a heist movie") < request.index("Return 10 picks")
+    assert json.loads(candidates) == json.loads(_format_candidates(found.candidates))
 
 
 def test_rank_is_told_how_many_picks_to_return() -> None:
-    """Never told a number, rank() answers a broad query with whatever it
+    """Never told a number, the rank call answers a broad query with whatever it
     feels like — five picks where twenty candidates were available."""
     seen: list[str] = []
 
@@ -3320,7 +3131,7 @@ def test_the_count_asked_of_rank_follows_an_explicit_request() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(limit=1)
 
     _search(fake_tmdb, interpret_model=fake_interpret, rank_model=capture)
@@ -3347,7 +3158,7 @@ def test_the_query_as_asked_is_read_before_anything_is_loosened() -> None:
     fake_tmdb.ok("/discover/movie", _page(*range(101, 101 + PAGE_SIZE)))
     fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90, release_year_gte=1990)
 
     result = _search(
@@ -3405,7 +3216,7 @@ def test_paging_outruns_what_the_conversation_has_already_shown() -> None:
         *(_page(*range(start * 100, start * 100 + PAGE_SIZE)) for start in range(1, 7)),
     )
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = _search(
@@ -3501,7 +3312,7 @@ def test_a_rung_reads_one_page_not_the_whole_ladder_again() -> None:
     fake_tmdb.ok("/discover/movie", _page(101))  # short: no page 2 to read
     fake_tmdb.ok("/discover/movie", _page(*range(201, 201 + PAGE_SIZE)))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
     result = _search(fake_tmdb, interpret_model=fake_interpret)
@@ -3520,7 +3331,7 @@ def test_a_guessed_mood_is_dropped_before_a_stated_year() -> None:
     fake_tmdb.ok("/discover/movie", _page())  # mood zeroes the query
     fake_tmdb.ok("/discover/movie", _page(101, 102, 103, 104, 105))
 
-    async def fake_interpret(message: str) -> DiscoverIntent:
+    async def fake_interpret(message: str) -> Intent:
         return make_intent(
             keywords=["slow burn"],
             genres=["thriller"],
@@ -3586,7 +3397,7 @@ def test_the_composer_message_puts_the_facts_after_the_users_words() -> None:
 
 
 def test_a_title_cannot_open_a_second_labelled_line() -> None:
-    """detail carries the user's own words back — interpret() copies a title
+    """detail carries the user's own words back — the interpret call copies a title
     verbatim — so a newline in it would otherwise forge a line the model reads
     as ours."""
     content = _compose_content(
@@ -3598,7 +3409,7 @@ def test_a_title_cannot_open_a_second_labelled_line() -> None:
 
 def test_the_providers_block_leads_so_the_live_request_stays_last() -> None:
     """Prepended like _with_taste, so chat.py's "Current message: ..." is
-    still the last thing interpret() reads."""
+    still the last thing the interpret call reads."""
     folded = _with_providers("what can you do?", ["Netflix", "Hulu"])
     assert folded.index(PROVIDERS_HEADER) < folded.index("what can you do?")
 
@@ -3658,8 +3469,8 @@ def test_the_shared_tone_reaches_all_three_prompts() -> None:
 
 def test_the_answer_rules_reach_the_two_prompts_that_write_stored_text() -> None:
     """Both of these produce text the gateway stores as the turn's assistant
-    text, which _with_history replays into the next turn's interpret() — where
-    a film this turn invented reads as a title request. rank() is excluded: its
+    text, which _with_history replays into the next turn's interpret call — where
+    a film this turn invented reads as a title request. The rank call is excluded: its
     job is a list of per-title blurbs, and none of them is stored."""
     assert _ANSWER_RULES in _INTERPRET_SYSTEM_PROMPT
     assert _ANSWER_RULES in _OUTCOME_SYSTEM_PROMPT
@@ -3667,12 +3478,21 @@ def test_the_answer_rules_reach_the_two_prompts_that_write_stored_text() -> None
 
 
 def test_a_count_past_the_schema_bound_clamps_instead_of_failing() -> None:
-    """A rejected field fails an interpret() turn, so "show me 25" must
+    """A rejected field fails the turn, so "show me 25" must
     arrive as the bound rather than as a validation error. A whole-number
     float too: a JSON number need not be an integer literal."""
     assert make_intent(limit=25).limit == LIMIT_MAX
     assert make_intent(limit=25.0).limit == LIMIT_MAX
     assert make_intent(limit=0).limit == 1
+
+
+def test_a_year_past_the_schema_bound_clamps_instead_of_failing() -> None:
+    """ "Silent films from the 1890s" must reach the search as the bound, where
+    the year rung can widen past it and say so, rather than fail the turn."""
+    clamped = make_intent(release_year_gte=1890, release_year_lte=1899)
+    assert (clamped.release_year_gte, clamped.release_year_lte) == (1900, 1900)
+    assert make_intent(release_year_gte=2300).release_year_gte == 2100
+    assert make_intent(release_year_lte=1995).release_year_lte == 1995
 
 
 def test_a_runtime_ceiling_under_a_minute_reads_as_none() -> None:
@@ -3687,31 +3507,3 @@ def test_a_runtime_ceiling_under_a_minute_reads_as_none() -> None:
 def test_a_count_that_is_not_a_number_still_fails() -> None:
     with pytest.raises(ValidationError):
         make_intent(limit="lots")
-
-
-def test_interpret_schema_keeps_the_routing_fields_ahead_of_the_search() -> None:
-    """Gemini writes a structured response in schema order, and reply's
-    description depends on is_capability_question and clarifying_question
-    having been decided first. model_dump() — the intent event — follows the
-    same order."""
-    order = [
-        "media_type",
-        "is_capability_question",
-        "clarifying_question",
-        "title",
-        "keywords",
-        "without_keywords",
-        "genres",
-        "without_genres",
-        "cast",
-        "crew",
-        "max_runtime_minutes",
-        "release_year_gte",
-        "release_year_lte",
-        "sort_by",
-        "monetization",
-        "limit",
-        "reply",
-    ]
-    assert list(DiscoverIntent.model_json_schema()["properties"]) == order
-    assert list(make_intent().model_dump()) == order
