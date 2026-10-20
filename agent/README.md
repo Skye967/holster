@@ -106,8 +106,8 @@ environment — the token is passed to `TMDBClient(...)`.
 `catalog_tool.py` puts a model in front of `tmdb.py`: a LangChain agent
 (`create_agent`) bounded to two model calls by one middleware class, `TwoCallTurn`. The
 first call — the interpret call — is offered three declared tools and must pick exactly
-one: `search_catalog`, `look_up_title`, or `answer`, for a capability or clarifying
-reply. The tool runs; a search then gets the second call — the rank call — with no tools
+one: `search_catalog`, `look_up_title`, or `answer`, for a capability, clarifying,
+chat or off-topic reply. The tool runs; a search then gets the second call — the rank call — with no tools
 and `RankResult` as its only answer. A lookup or an answer ends the turn at one call. A
 lookup answers with every title carrying that name — the film itself, and anything
 carrying it on, so "Star Wars" reaches the sequels too.
@@ -237,14 +237,33 @@ the rating rung bends and only back to that same floor. The copy says exactly th
 Every sentence the user reads is written by the model, bar the ones that cannot be.
 `_TONE` in `catalog_tool.py` is prepended to all three system prompts, so the opener, a
 blurb, a clarifying question and an outcome sentence come from one assistant rather than
-three. It says only how to sound — the rank call is asked for a list of per-title blurbs, so a
-tone rule forbidding lists or counts would contradict the job on the same call.
+three. It says who is talking — a friendly film and TV buff with opinions, who makes a
+case rather than overselling — and how: plain words, one or two sentences. It forbids
+nothing the rank call's job needs: that call is asked for a list of per-title blurbs, so a
+tone rule forbidding lists or counts would contradict the job on the same call. It
+repeats two guardrails in the character's voice: an opener, written before anything is
+checked, never names a film from memory, and nothing it writes says from memory where a
+title streams.
+
+A blurb's hook may come from what the model knows about the title — a performance, the
+director, the ending — not only the overview the rank call is sent. A wrong clause there
+sits beside a card whose title, year, rating, genres, runtime, cast and availability are
+TMDB's either way, so the cost of a slip is one clause, not a wrong card. The blurb is told to say
+only what it is sure of and never to assert where a title streams, awards, or ratings.
+If blurbs assert false things, the fix is tightening that clause or sending the call more
+real data, not confining hooks to the overview.
 
 `_ANSWER_RULES` carries what a whole answer owes — name no film the user did not, give no
 count, never say the catalog has run out, always say what to try next — and goes only to
-the outcome prompt and to the capability case of the interpret prompt. Those two produce
-the text the gateway stores as the turn's assistant text, which is read back into the next
-turn's interpret call, where a named film reads as a title request and a number as a limit.
+the outcome prompt and to the interpret prompt, where it frames every `answer` kind.
+Those two produce the text the gateway stores as the turn's assistant text, which is read
+back into the next turn's interpret call, where a named film reads as a title request and
+a number as a limit. A blurb is exempt: only its title reaches history, in the gateway's
+"Suggested: …" line.
+
+`answer` has four kinds — `capability`, `clarifying`, `chat` for film and TV talk that
+wants no search ("is Heat any good?"), and `off_topic` for a decline. The kind never
+leaves the agent: `chat.py` emits every one as the same `message` event.
 
 **A turn makes at most two model calls** (`MODEL_CALLS_PER_TURN`, whose comment says
 why two and what raising it takes), which `TwoCallTurn` enforces. The opener rides
