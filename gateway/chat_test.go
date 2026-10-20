@@ -1632,6 +1632,31 @@ func TestChatOverLongMessageIsRejected(t *testing.T) {
 	}
 }
 
+// TestChatBlankMessageIsRejected: text that trims to nothing, U+0085 included,
+// gets a generic error without reaching the agent, and the connection still
+// takes the next message.
+func TestChatBlankMessageIsRejected(t *testing.T) {
+	callAgent, requests := captureAgentRequests()
+	srv, token := newChatTestServer(t, noopChatCtx, callAgent, noopLoadVerdicts)
+	conn := dialChat(t, srv, mintTicket(t, srv, token))
+
+	for i, text := range []string{"", " \n", "\u0085"} {
+		turn := fmt.Sprintf("blank%d", i)
+		events := sendAndDrain(t, conn, inboundMessage{Type: "message", Turn: turn, Text: text, Conversation: testConversationID})
+		if len(events) != 1 || events[0].Type != "error" || events[0].Text != genericErrorText || events[0].Turn != turn {
+			t.Errorf("text %q: events = %+v, want one generic error for turn %s", text, events, turn)
+		}
+	}
+
+	events := sendAndDrain(t, conn, inboundMessage{Type: "message", Turn: "valid", Text: "a heist", Conversation: testConversationID})
+	if last := events[len(events)-1]; last.Type != "done" {
+		t.Errorf("events = %+v, want the valid message's turn to end in done", events)
+	}
+	if got := requests(); len(got) != 1 || got[0].Message != "a heist" {
+		t.Errorf("agent requests = %+v, want only the valid message", got)
+	}
+}
+
 // TestChatTurnDeadlineSendsATerminalErrorEvent is the direct regression test
 // for the original bug: a turn that never comes back before turnDeadline
 // must still end with a terminal event, not silence. Shortens the package
