@@ -43,9 +43,9 @@ survivable rather than trying to prevent it:
 - **The agent cannot write anything.** Every mutation — subscriptions, ratings,
   messages — goes through the gateway. The model has no path to a write.
 - **The agent is not reachable from the internet.** Only the gateway is.
-- **The agent holds only app-level secrets** — the TMDB key, the LLM provider key —
-  neither of which opens any user's account. Losing one costs a key rotation, not a
-  user.
+- **The agent holds only app-level secrets** — the TMDB key, the LLM provider key,
+  the optional LangSmith tracing key — none of which opens any user's account. Losing
+  one costs a key rotation, not a user.
 - **Tools are a fixed menu, not an open door.** The agent picks from a declared list of
   catalog operations. It cannot compose an arbitrary request or reach an endpoint that
   is not on the list.

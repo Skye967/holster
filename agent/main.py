@@ -224,6 +224,7 @@ async def chat(
             client=tmdb_client,
             agent=agent,
             compose_model=compose_model,
+            correlation_id=_correlation_id.get(),
         ):
             yield json.dumps(event, default=str).encode() + b"\n"
 

@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 import httpx2
 import pytest
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from pydantic import ValidationError
 
 import catalog_tool
@@ -3398,7 +3399,7 @@ def _composed(message: str, cause: OutcomeCause, detail: str) -> list[BaseMessag
     model = scripted(composed_reply(COMPOSED_TEXT))
 
     async def call() -> ComposedReply:
-        return await google_composer(model)(message, cause, detail)
+        return await google_composer(model)(message, cause, detail, RunnableConfig())
 
     reply = run(call())
     assert reply.text == COMPOSED_TEXT

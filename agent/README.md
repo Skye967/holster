@@ -35,8 +35,8 @@ prevent it. See `../CLAUDE.md` for the invariants; the ones that bind this servi
   not the world.
 - **Its tools are a fixed, declared list.** No tool takes a URL, an endpoint, or a raw
   query from the model.
-- **It holds only app-level secrets** — the TMDB key, the LLM provider key — neither of
-  which opens any user's account.
+- **It holds only app-level secrets** — the TMDB key, the LLM provider key, and the
+  optional LangSmith key — none of which opens any user's account.
 - **Its database reads are scoped** to the catalog and conversation tables, nothing
   user-scoped beyond what the gateway hands it.
 
@@ -60,9 +60,19 @@ CLI above is the same thing with reload for local work.
 | `GOOGLE_API_KEY` | yes | — | Read when the catalog tool's model is constructed. |
 | `GOOGLE_MODEL` | no | `gemini-3.5-flash-lite` | Powers all three catalog_tool steps — interpret, rank, and the outcome sentence. |
 | `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
+| `LANGSMITH_TRACING` | no | off | Exactly `true` sends each turn's trace to LangSmith. |
+| `LANGSMITH_API_KEY` | only with tracing | — | Read by the `langsmith` library, not by this service's code. |
+| `LANGSMITH_PROJECT` | no | `default` | The LangSmith project traces land in. |
 
-Both keys are app-level: neither opens any user's account, so losing one costs a
+All three keys are app-level: none opens any user's account, so losing one costs a
 rotation, not a user. See `CLAUDE.md`.
+
+Tracing is opt-in because traces carry the turn's prompts and outputs: when it is on,
+the user's message and recent history, their services and liked titles, and the TMDB
+overviews the rank call reads all leave for LangSmith, a third-party service. A turn
+that reaches the agent is traced as `chat_turn`; if it ends with nothing to show, the
+outcome composer's call is a second `chat_turn` trace. Both carry the request's
+correlation id in their metadata — the id on this service's log lines for that request.
 
 Logs are structured JSON to stdout, nothing else — routing and retention belong to
 whatever runs the container. Lines logged while handling a request carry its

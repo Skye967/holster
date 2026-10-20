@@ -83,6 +83,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
@@ -420,12 +421,18 @@ class ComposedReply(BaseModel):
 # The user's message, why the turn came back empty, and one cause-specific
 # detail — what the ladder loosened, or the name that resolved to nothing.
 # google_composer fills them into _COMPOSE_PROMPT's slots rather than this
-# signature growing a field per cause.
-Composer = Callable[[str, OutcomeCause, str], Awaitable[ComposedReply]]
+# signature growing a field per cause. The config is the turn's own, so a
+# trace shows this call under the turn's run name and correlation id.
+Composer = Callable[[str, OutcomeCause, str, RunnableConfig], Awaitable[ComposedReply]]
 
 
 async def compose(
-    message: str, cause: OutcomeCause, detail: str, *, model: Composer
+    message: str,
+    cause: OutcomeCause,
+    detail: str,
+    *,
+    model: Composer,
+    config: RunnableConfig,
 ) -> ComposedReply:
     """Write the sentence for a turn that found nothing to show.
 
@@ -434,7 +441,7 @@ async def compose(
     the caller's own timeout still cancels this.
     """
     try:
-        reply = await model(message, cause, detail)
+        reply = await model(message, cause, detail, config)
     except Exception as exc:
         raise CatalogToolError(str(exc)) from exc
     # Validated where the agent's calls are not. Their shape faults land
@@ -1855,7 +1862,9 @@ def google_composer(model: BaseChatModel) -> Composer:
     """Bind ComposedReply's schema to ``model``."""
     chain = _COMPOSE_PROMPT | model.with_structured_output(ComposedReply)
 
-    async def call(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
+    async def call(
+        message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
+    ) -> ComposedReply:
         # ensure_ascii=False where _format_candidates needs True: the prompt
         # asks for the detail quoted back exactly, and an escaped
         # "Am\u00e9lie" is not the name the user typed. The separators
@@ -1870,7 +1879,8 @@ def google_composer(model: BaseChatModel) -> Composer:
                 "message": message,
                 "cause": cause,
                 "detail": json.dumps(detail, ensure_ascii=False),
-            }
+            },
+            config=config,
         )
         return cast(ComposedReply, result)
 
