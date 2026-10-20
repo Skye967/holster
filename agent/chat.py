@@ -71,6 +71,7 @@ from collections.abc import AsyncGenerator, Sequence
 from typing import Any, Literal, cast
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from catalog_tool import (
@@ -324,6 +325,7 @@ async def _outcome_text(
     cause: OutcomeCause,
     *,
     model: Composer,
+    config: RunnableConfig,
     title: str,
     relaxed: Sequence[str],
 ) -> str:
@@ -359,7 +361,7 @@ async def _outcome_text(
         detail = _relaxed_labels(relaxed) if cause == "nothing_matched" else ""
     try:
         async with asyncio.timeout(COMPOSE_TIMEOUT_SECONDS):
-            composed = await compose(message, cause, detail, model=model)
+            composed = await compose(message, cause, detail, model=model, config=config)
     except TimeoutError:
         logger.info("outcome composer timed out, degraded", extra={"cause": cause})
         return fallback
@@ -400,6 +402,7 @@ async def stream_chat(
     client: TMDBClient,
     agent: CatalogAgent,
     compose_model: Composer,
+    correlation_id: str | None,
 ) -> AsyncGenerator[dict[str, Any]]:
     # gateway's runTurn skips loading verdicts entirely for a caller
     # with no ticked services, on the strength of this early return — and its
@@ -429,6 +432,13 @@ async def stream_chat(
         verdicts=req.verdicts,
         shown=shown,
     )
+    # One config for every run the turn starts — the agent's and the outcome
+    # composer's — so both carry the request's correlation id, the one this
+    # service's log lines for it carry. LangSmith receives these runs only when
+    # tracing is switched on; see README.md.
+    config = RunnableConfig(
+        run_name="chat_turn", metadata={"correlation_id": correlation_id}
+    )
 
     try:
         # "custom" is what the tools write as they start — the opener and the
@@ -440,6 +450,7 @@ async def stream_chat(
             AsyncGenerator[tuple[str, Any]],
             agent.astream(
                 {"messages": [*messages]},
+                config=config,
                 context=context,
                 stream_mode=["custom", "values"],
             ),
@@ -485,6 +496,7 @@ async def stream_chat(
                         req.message,
                         "title_not_found",
                         model=compose_model,
+                        config=config,
                         title=state["lookup_title"],
                         relaxed=[],
                     ),
@@ -514,6 +526,7 @@ async def stream_chat(
                         req.message,
                         result.cause,
                         model=compose_model,
+                        config=config,
                         title="",
                         relaxed=result.relaxed,
                     ),

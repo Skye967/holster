@@ -20,6 +20,9 @@ import httpx2
 import pytest
 from langchain.agents.middleware import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tracers.context import collect_runs
+from langsmith.utils import tracing_is_enabled
 from pydantic import ValidationError
 
 import chat
@@ -41,6 +44,7 @@ from catalog_tool import (
     TwoCallTurn,
     _interpret_system_message,
     catalog_agent,
+    google_composer,
 )
 from chat import (
     _RELAXED_LABELS,
@@ -61,6 +65,7 @@ from testutil import (
     RecordingComposer,
     ScriptedChatModel,
     answer_call,
+    composed_reply,
     failing_compose,
     lookup_call,
     ok_compose,
@@ -78,6 +83,7 @@ async def _collect(
     client: TMDBClient,
     model: ScriptedChatModel,
     compose: Any = None,
+    correlation_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """`compose` defaults to a composer that answers without complaint. A turn
     that must not compose is asserted on a RecordingComposer's own `calls`
@@ -89,6 +95,7 @@ async def _collect(
             client=client,
             agent=catalog_agent(model),
             compose_model=compose or ok_compose,
+            correlation_id=correlation_id,
         )
     ]
 
@@ -239,6 +246,7 @@ def test_intent_event_arrives_before_the_rank_call() -> None:
             client=fake_tmdb.client(),
             agent=catalog_agent(model),
             compose_model=ok_compose,
+            correlation_id=None,
         )
         first = await anext(gen)
         calls = len(model.calls)
@@ -493,6 +501,7 @@ def test_early_disconnect_cancels_the_background_search() -> None:
             client=TMDBClient("test-token", transport=httpx2.MockTransport(hanging)),
             agent=catalog_agent(model),
             compose_model=ok_compose,
+            correlation_id=None,
         )
         first = await anext(gen)
         assert first["type"] == "intent"
@@ -1018,6 +1027,25 @@ def test_an_empty_turn_spends_one_call_and_the_composer() -> None:
     assert (len(model.calls), len(composer.calls)) == (1, 1)
 
 
+def test_both_runs_of_a_turn_carry_its_correlation_id() -> None:
+    """An empty turn starts two runs, the agent's and the composer's. A real
+    google_composer, because a plain async Composer starts no run to see."""
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
+    model = scripted(search_call())
+    composer = google_composer(scripted(composed_reply(COMPOSED_TEXT)))
+
+    with collect_runs() as runs:
+        events = asyncio.run(
+            _collect(req, fake_tmdb.client(), model, composer, correlation_id="c-1")
+        )
+
+    assert events[-2] == {"type": "message", "text": COMPOSED_TEXT}
+    assert [r.name for r in runs.traced_runs].count("chat_turn") == 2
+    assert all(r.metadata["correlation_id"] == "c-1" for r in runs.traced_runs)
+    assert not tracing_is_enabled()
+
+
 def test_a_capability_turn_spends_one_call() -> None:
     fake_tmdb = FakeTMDB()
     req = ChatRequest(
@@ -1292,7 +1320,7 @@ def test_the_composer_falls_back_rather_than_outliving_the_turn(
     monkeypatch.setattr(chat, "COMPOSE_TIMEOUT_SECONDS", 0.01)
 
     async def slow_compose(
-        message: str, cause: OutcomeCause, detail: str
+        message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
     ) -> ComposedReply:
         await asyncio.sleep(5)
         return ComposedReply(text="too late")
@@ -1323,7 +1351,9 @@ def test_a_composer_that_answers_with_the_wrong_shape_ends_the_turn() -> None:
     fake_tmdb = FakeTMDB()
     req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
 
-    async def wrong_shape(message: str, cause: OutcomeCause, detail: str) -> Any:
+    async def wrong_shape(
+        message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
+    ) -> Any:
         return None
 
     events = asyncio.run(
@@ -1346,7 +1376,9 @@ def test_a_composer_that_raises_something_unexpected_still_ends_the_turn() -> No
     class Fault(BaseException):
         pass
 
-    async def hostile(message: str, cause: OutcomeCause, detail: str) -> Any:
+    async def hostile(
+        message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
+    ) -> Any:
         raise Fault("not an Exception")
 
     async def drain() -> list[dict[str, Any]]:
@@ -1357,6 +1389,7 @@ def test_a_composer_that_raises_something_unexpected_still_ends_the_turn() -> No
                 client=fake_tmdb.client(),
                 agent=catalog_agent(scripted(search_call())),
                 compose_model=hostile,
+                correlation_id=None,
             ):
                 seen.append(e)
         return seen

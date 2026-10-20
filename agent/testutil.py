@@ -17,7 +17,7 @@ from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatResult
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
 from pydantic import Field
 
@@ -282,19 +282,23 @@ class RecordingComposer:
         return [cause for cause, _ in self.calls]
 
     def __call__(self) -> Composer:
-        async def call(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
+        async def call(
+            message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
+        ) -> ComposedReply:
             self.calls.append((cause, detail))
             return ComposedReply(text=self._text)
 
         return call
 
 
-async def ok_compose(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
+async def ok_compose(
+    message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
+) -> ComposedReply:
     return ComposedReply(text=COMPOSED_TEXT)
 
 
 async def failing_compose(
-    message: str, cause: OutcomeCause, detail: str
+    message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
 ) -> ComposedReply:
     """Drives chat.py back onto the templates that are now fallbacks."""
     raise CatalogToolError("composer unavailable")
