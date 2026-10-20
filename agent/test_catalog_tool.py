@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Coroutine
+from datetime import date
 from typing import Any, get_args
 from unittest.mock import AsyncMock
 
@@ -144,9 +145,7 @@ async def search_turn(
     )
     ranked = None
     if found.candidates:
-        request = _with_target_count(
-            _with_taste(message, found.taste), limit=found.limit, floor=found.floor
-        )
+        request = _rank_content(message, found).split("\n\nCandidates:\n")[0]
         ranked = await rank_model(request, found.candidates)
     return await finish_search(
         found,
@@ -2383,6 +2382,14 @@ def test_relaxing_keeps_the_titles_that_matched_exactly_and_leads_with_them() ->
     assert result.exact_matches == 3
 
 
+async def _rank_reversed(message: str, candidates: list[Title]) -> RankResult:
+    return RankResult(
+        picks=[
+            RankedPick(tmdb_id=c["tmdb_id"], blurb="ok") for c in reversed(candidates)
+        ]
+    )
+
+
 def test_relaxing_orders_exact_matches_first_however_rank_returned_them() -> None:
     """The rank call cannot know a candidate reached the list only because a
     constraint was dropped, so the ordering is applied here, not asked for."""
@@ -2393,16 +2400,8 @@ def test_relaxing_orders_exact_matches_first_however_rank_returned_them() -> Non
     async def fake_interpret(message: str) -> Intent:
         return make_intent(max_runtime_minutes=90)
 
-    async def rank_reversed(message: str, candidates: list[Title]) -> RankResult:
-        return RankResult(
-            picks=[
-                RankedPick(tmdb_id=c["tmdb_id"], blurb="ok")
-                for c in reversed(candidates)
-            ]
-        )
-
     result = _search(
-        fake_tmdb, interpret_model=fake_interpret, rank_model=rank_reversed
+        fake_tmdb, interpret_model=fake_interpret, rank_model=_rank_reversed
     )
 
     assert [p["tmdb_id"] for p in result.picks][0] == 101
@@ -2436,6 +2435,49 @@ def test_relaxing_keeps_exact_matches_the_cut_would_otherwise_discard() -> None:
     assert ids[:3] == [101, 102, 103]
     assert len(ids) == RESULT_CEILING
     assert result.exact_matches == 3
+
+
+def test_newest_keeps_tmdbs_order_however_rank_returned_it() -> None:
+    """The rank call orders by fit and cannot see release dates, so on a newest
+    search the order the user asked for is TMDB's — kept within each rung, with
+    the exact matches still ahead of the widened ones."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(101, 102, 103))
+    fake_tmdb.ok("/discover/movie", _page(201, 202, 203, 204, 205))
+
+    async def fake_interpret(message: str) -> Intent:
+        return make_intent(sort_by="newest", max_runtime_minutes=90)
+
+    result = _search(
+        fake_tmdb, interpret_model=fake_interpret, rank_model=_rank_reversed
+    )
+
+    assert [p["tmdb_id"] for p in result.picks] == [
+        101,
+        102,
+        103,
+        201,
+        202,
+        203,
+        204,
+        205,
+    ]
+
+
+def test_newest_cuts_the_oldest_not_the_weakest_fit() -> None:
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
+
+    async def fake_interpret(message: str) -> Intent:
+        return make_intent(sort_by="newest")
+
+    result = _search(
+        fake_tmdb, interpret_model=fake_interpret, rank_model=_rank_reversed
+    )
+
+    assert [p["tmdb_id"] for p in result.picks] == list(
+        range(101, 101 + RESULT_CEILING)
+    )
 
 
 def test_paging_reads_toward_the_ceiling_not_merely_the_floor() -> None:
@@ -3121,6 +3163,34 @@ def test_the_rank_call_reads_the_candidate_list_last() -> None:
     assert json.loads(candidates) == json.loads(_format_candidates(found.candidates))
 
 
+def test_a_newest_search_tells_the_rank_call_to_prefer_the_newest() -> None:
+    """Told nothing, the rank call picks the best fits, which can pass over the
+    newest titles; finish_search() can only reorder what it picked. Asked of
+    every count, one pick included, after the count and before the list."""
+    fake_tmdb = FakeTMDB()
+    for _ in range(3):
+        fake_tmdb.ok("/discover/movie", _page(*range(101, 121)))
+
+    def request_for(**intent: Any) -> str:
+        found = run(
+            find_candidates(
+                make_intent(**intent),
+                client=fake_tmdb.client(),
+                watch_region="US",
+                watch_providers=[8],
+                verdicts=[],
+                shown=[],
+            )
+        )
+        return _rank_content("the newest", found).split("\n\nCandidates:\n")[0]
+
+    clause = "listed newest first"
+    for limit in (10, 1):
+        request = request_for(sort_by="newest", limit=limit)
+        assert request.index("Return") < request.index(clause)
+    assert clause not in request_for()
+
+
 def test_rank_is_told_how_many_picks_to_return() -> None:
     """Never told a number, the rank call answers a broad query with whatever it
     feels like — five picks where twenty candidates were available."""
@@ -3442,13 +3512,18 @@ def test_a_title_cannot_open_a_second_labelled_line() -> None:
     assert "\nReason: all_shown" not in content
 
 
-def test_the_interpret_prompt_has_one_slot() -> None:
+def test_the_interpret_prompt_has_two_slots() -> None:
     """Any other brace in its prose would be read as a slot."""
-    assert _INTERPRET_SYSTEM_PROMPT.input_variables == ["services"]
+    assert _INTERPRET_SYSTEM_PROMPT.input_variables == ["services", "today"]
+
+
+def test_the_interpret_prompt_carries_the_date_it_was_given() -> None:
+    sent = _interpret_system_message([], today=date(2026, 10, 20)).text
+    assert "Today's date: 2026-10-20" in sent
 
 
 def test_provider_names_cannot_forge_a_section_break() -> None:
-    sent = _interpret_system_message(["Net\nflix "]).text
+    sent = _interpret_system_message(["Net\nflix "], today=date(2026, 10, 20)).text
     names = sent[sent.rindex(PROVIDERS_HEADER) :]
     assert "\n" not in names[names.index("[") : names.index("]")]
 
@@ -3457,7 +3532,7 @@ def test_uncached_names_still_send_a_real_empty_list() -> None:
     """watch_providers non-empty with names not yet cached is reachable — the
     gateway's per-country name cache may be cold. The list is still sent,
     empty, which the prompt reads as names that could not be looked up."""
-    sent = _interpret_system_message([]).text
+    sent = _interpret_system_message([], today=date(2026, 10, 20)).text
     assert sent.endswith(f"{PROVIDERS_HEADER}\n[]")
 
 

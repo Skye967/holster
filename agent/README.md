@@ -85,7 +85,9 @@ here otherwise.
 service, region, runtime, year, genre, cast, crew, keywords), "more like this", and
 per-title streaming availability. Callers pass names — "Tilda Swinton", "heist" — and
 the client resolves them to TMDB IDs and caches the mapping. Results are ordered by
-`vote_count` — most watched — by default, or by rating when the user asks for the best;
+`vote_count` — most watched — by default, by rating when the user asks for the best,
+or newest first when they ask for the newest (`newest`, which `discover` translates to
+the release date for a movie and the premiere date for a show);
 TMDB's own `popularity` is deliberately not offered, being a rolling trend metric that
 ranked a 4.0-rated title above The Dark Knight. A `vote_count` floor is always applied
 to `discover` and no caller can set it: it is derived from the sort, and is higher for
@@ -111,6 +113,8 @@ chat or off-topic reply. The tool runs; a search then gets the second call — t
 and `RankResult` as its only answer. A lookup or an answer ends the turn at one call. A
 lookup answers with every title carrying that name — the film itself, and anything
 carrying it on, so "Star Wars" reaches the sequels too.
+The interpret call's system prompt carries today's date, the server's, so "this year"
+and "new" resolve against it rather than against the year the model believes it is.
 `search_catalog`'s arguments (`SearchArgs`) are `tmdb.discover()`'s creative
 parameters, with no `watch_region`/`watch_providers` field, so which services results
 come from is never the model's choice. What it can choose is whether the turn asks about
@@ -151,7 +155,10 @@ substituted for them, so the titles that matched exactly survive being widened p
 Surviving is not the same as being picked, though: the rank call's candidate list carries
 no rung marker, so it can name only widened titles. `finish_search()` therefore guarantees every
 exact match a place itself, tops the picks up to the floor, stable-sorts by the rung
-they came from, and only then cuts to the limit — in that order, because cutting in
+they came from — on a `newest` search, by rung and then candidate position, since the
+rank call orders by fit and TMDB's order is the one asked for; the rank call is also
+told the list is newest first, because no reordering brings back a title it passed
+over — and only then cuts to the limit — in that order, because cutting in
 the model's own fit order could discard every exact match a widened query found. Both
 the guarantee and the floor carry no blurb, being properties of this code rather than
 requests made of the model, for the same reason `finish_search()` validates ids rather

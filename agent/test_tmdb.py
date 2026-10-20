@@ -737,6 +737,7 @@ def test_ordering_by_rating_raises_the_vote_floor() -> None:
         )
     )
     params = fake.params_for("/discover/tv")
+    assert params["sort_by"] == "vote_average.desc"
     assert params["vote_count.gte"] == str(MIN_VOTE_COUNT_TOP_RATED)
     assert MIN_VOTE_COUNT_TOP_RATED > MIN_VOTE_COUNT
 
@@ -751,6 +752,20 @@ def test_the_raised_floor_is_scoped_to_the_rating_sort() -> None:
         )
     )
     assert fake.params_for("/discover/movie")["vote_count.gte"] == str(MIN_VOTE_COUNT)
+
+
+def test_newest_sorts_by_the_media_types_own_release_date() -> None:
+    """At the default floor: the newest titles people have actually watched,
+    not last week's unknowns."""
+    fake = FakeTMDB()
+    client = fake.client()
+    run(client.discover(media_type="movie", watch_region="US", sort_by="newest"))
+    run(client.discover(media_type="tv", watch_region="US", sort_by="newest"))
+    movie = fake.params_for("/discover/movie")
+    tv = fake.params_for("/discover/tv")
+    assert movie["sort_by"] == "primary_release_date.desc"
+    assert tv["sort_by"] == "first_air_date.desc"
+    assert movie["vote_count.gte"] == tv["vote_count.gte"] == str(MIN_VOTE_COUNT)
 
 
 def test_mood_keywords_are_ored_so_a_mood_does_not_zero_the_query() -> None:

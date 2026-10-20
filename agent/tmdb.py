@@ -80,11 +80,13 @@ MAX_RETRIES = 2
 MAX_RETRY_WAIT = 10.0
 
 MediaType = Literal["movie", "tv"]
-# "Most watched" and "best reviewed". TMDB's `popularity.desc` is deliberately
-# not offered: it is a rolling trend metric, not a quality one, and there is no
-# request it answers better — even "what's new" reads better by vote count. A
-# real "what's new" would be a release-date window on top of vote_count.desc.
-DiscoverSort = Literal["vote_count.desc", "vote_average.desc"]
+# "Most watched", "best reviewed" and "newest". TMDB's `popularity.desc` is
+# deliberately not offered: it is a rolling trend metric, not a quality one, and
+# there is no request it answers better — even "what's new" reads better by vote
+# count.
+# "newest" is not a TMDB string: discover() translates it to the media type's
+# own release-date sort.
+DiscoverSort = Literal["vote_count.desc", "vote_average.desc", "newest"]
 # How a discover query is asked to treat availability. "subscription" pairs
 # with a provider list and filters to what those services include; on its own
 # it filters nothing, following the same "omit for none" convention as
@@ -657,9 +659,12 @@ class TMDBClient:
         _validate_region(watch_region)
         _validate_page(page)
 
+        date_field = (
+            "primary_release_date" if media_type == "movie" else "first_air_date"
+        )
         params: dict[str, Any] = {
             "watch_region": watch_region,
-            "sort_by": sort_by,
+            "sort_by": f"{date_field}.desc" if sort_by == "newest" else sort_by,
             "include_adult": "false",
             "language": LANGUAGE,
             "page": page,
@@ -740,9 +745,6 @@ class TMDBClient:
                 )
             params["with_runtime.lte"] = max_runtime_minutes
 
-        date_field = (
-            "primary_release_date" if media_type == "movie" else "first_air_date"
-        )
         if release_year_gte is not None:
             _validate_year(release_year_gte)
             params[f"{date_field}.gte"] = f"{release_year_gte}-01-01"
