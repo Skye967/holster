@@ -84,7 +84,15 @@ survivable.
   set; the destination may not. A *search term* is the one exception, and it is a
   narrow one: the model may name a person, a keyword, or a title, and that name
   reaches TMDB as a `query` value inside a path built here. It chooses what to look
-  for, never where to look, and every row that comes back is a real TMDB row.
+  for, never where to look, and every row that comes back is a real TMDB row. The
+  agent's loop is bounded to two model calls, and only the first is offered tools, so
+  nothing read within a turn after the user's message — TMDB overviews included —
+  can pick an action. History from earlier turns reaches both calls, and the first can
+  act on it; there the declared list is the bound. History is text only — each turn's
+  words, never its tool results — so an earlier turn's overviews never reach that
+  choice. `HistoryTurn` in `agent/chat.py` and `historyTurn` in `gateway/chat.go` hold
+  that shape. `TwoCallTurn` in `agent/catalog_tool.py` enforces the two-call bound and
+  the first-call-only rule; `MODEL_CALLS_PER_TURN` sets the limit.
 - **The agent holds no credential belonging to a user or a third-party account.** It
   may hold app-level API keys — TMDB, the LLM provider — whose compromise costs a key
   rotation, not a user. If a change would give it a credential that reaches a user's
