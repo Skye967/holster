@@ -797,6 +797,15 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
 					continue
 				}
+				// Web's chat-panel.tsx submit drops text that JS's trim()
+				// leaves empty, but TrimSpace also strips U+0085, which trim()
+				// keeps, so a NEL-only message from the web lands here too.
+				// Stored, blank text would become a blank user turn in later
+				// turns' history (agent/chat.py's _turn_messages).
+				if strings.TrimSpace(msg.Text) == "" {
+					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
+					continue
+				}
 				if utf8.RuneCountInString(msg.Text) > maxMessageLength {
 					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: "That message is too long — try something shorter."})
 					continue
@@ -1591,8 +1600,8 @@ type agentChatRequest struct {
 	// Same values as chatContext.ProviderNames, already resolved for
 	// interpretingLine below — reused here so a capability-question answer
 	// can name the caller's services without the agent needing its own TMDB
-	// lookup. The agent folds them into its interpret call's message, which
-	// is what lets that answer cost no model call of its own.
+	// lookup. The agent writes them into its interpret call's system prompt,
+	// which is what lets that answer cost no model call of its own.
 	WatchProviderNames []string      `json:"watch_provider_names,omitempty"`
 	History            []historyTurn `json:"history,omitempty"`
 	// The caller's whole verdict set; agent/catalog_tool.py's find_candidates()

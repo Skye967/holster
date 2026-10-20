@@ -70,7 +70,7 @@ import logging
 from collections.abc import AsyncGenerator, Sequence
 from typing import Any, Literal, cast
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from catalog_tool import (
@@ -180,22 +180,14 @@ class ChatRequest(BaseModel):
     shown: list[TitleRef] = Field(default_factory=list)
 
 
-def _with_history(message: str, history: list[HistoryTurn]) -> str:
-    """Fold recent turns into the one human message the agent is given, which
-    TwoCallTurn builds both calls' messages from.
-
-    Leaves "Current message: ..." last, which is why catalog_tool's _with_taste
-    prepends its liked-title hint. _with_target_count then appends one line
-    after it — the only thing that comes between the current message and the
-    candidate list."""
-    if not history:
-        return message
-    lines = [
-        f"{'User' if t.role == 'user' else 'Assistant'}: {t.text}" for t in history
+def _turn_messages(message: str, history: list[HistoryTurn]) -> list[AnyMessage]:
+    """The agent's input: each recent turn as its own message, oldest first,
+    then the current message last. TwoCallTurn reads the last HumanMessage as
+    the current one and hands both calls the turns before it."""
+    turns: list[AnyMessage] = [
+        HumanMessage(t.text) if t.role == "user" else AIMessage(t.text) for t in history
     ]
-    return (
-        "Recent conversation:\n" + "\n".join(lines) + f"\n\nCurrent message: {message}"
-    )
+    return [*turns, HumanMessage(message)]
 
 
 def _human_join(items: Sequence[str]) -> str:
@@ -317,7 +309,7 @@ def _capability_message(provider_names: Sequence[str]) -> str:
     resolved — provider_names can be empty while the per-country name
     cache warms up) plus example phrasing, never a feature list. No concrete
     numbers in the example: this text becomes conversation history and feeds
-    the next turn's interpret call (_with_history, above).
+    the next turn's interpret call (_turn_messages, above).
     """
     where = f" on {_human_join(provider_names)}" if provider_names else ""
     return (
@@ -418,7 +410,7 @@ async def stream_chat(
         yield {"type": "done"}
         return
 
-    message = _with_history(req.message, req.history[-MAX_HISTORY_TURNS:])
+    messages = _turn_messages(req.message, req.history[-MAX_HISTORY_TURNS:])
     # Logged where the history backstop above is not: that one sits at twice a
     # window the gateway enforces, so only a gateway bug reaches it, while this
     # one has no window behind it at all — see MAX_SHOWN.
@@ -447,7 +439,7 @@ async def stream_chat(
         stream = cast(
             AsyncGenerator[tuple[str, Any]],
             agent.astream(
-                {"messages": [HumanMessage(message)]},
+                {"messages": [*messages]},
                 context=context,
                 stream_mode=["custom", "values"],
             ),
@@ -468,10 +460,10 @@ async def stream_chat(
         # or more, and TwoCallTurn skips the rank call on no candidates.
         if state is not None and "answer_kind" in state:
             # The model's own answer, written with the caller's services in
-            # front of it (catalog_tool's _with_providers) — no second call,
-            # and no template unless it came back blank. The template serves
-            # a blank clarifying question too: it already asks what they are
-            # in the mood for.
+            # its system prompt (catalog_tool's _interpret_system_message) — no
+            # second call, and no template unless it came back blank. The
+            # template serves a blank clarifying question too: it already asks
+            # what they are in the mood for.
             yield {
                 "type": "message",
                 "text": state["answer_text"]

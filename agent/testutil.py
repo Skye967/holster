@@ -249,6 +249,13 @@ def rank_reply(*tmdb_ids: int, blurb: str = "fits") -> AIMessage:
     return AIMessage(content=RankResult(picks=picks).model_dump_json())
 
 
+def composed_reply(text: str) -> AIMessage:
+    """The composer's one call: ComposedReply as a tool call. ScriptedChatModel
+    inherits BaseChatModel.with_structured_output, which parses tool calls;
+    Gemini's parses JSON text."""
+    return _tool_call("ComposedReply", {"text": text})
+
+
 def make_intent(**overrides: Any) -> SearchArgs:
     return SearchArgs(media_type="movie", **overrides)
 

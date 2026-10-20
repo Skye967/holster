@@ -195,8 +195,8 @@ this side.
 `history` in the request body is the last few exchanges only, windowed by the gateway
 from a `messages` table that persists the full conversation — this
 agent still never reads that table itself, only the windowed slice handed to it per
-call. It is folded into the one human message the agent is given, which both model
-calls' messages are built from.
+call. Each stored turn becomes its own message ahead of the current one, and both
+model calls are sent that history.
 
 `shown` in the request body is what the gateway has already put on screen for this
 conversation — read back from `messages.title_refs` for an account, kept on the
@@ -284,9 +284,9 @@ detail — `TitleVerdict` carries no timestamp, so the agent cannot re-sort, or 
 notice if the order is lost. `gateway/verdicts.go` explains where that
 ordering is itself only a proxy.
 
-**Cold start:** a brand-new account has `verdicts == []` and
-`history == []`. Both are no-ops at that length — `_with_taste`/`_with_history` return
-the message unchanged — so neither model call gets taste or history folded in. There
+**Cold start:** a brand-new account has `verdicts == []` and `history == []`. Both are
+no-ops at that length — `_with_taste` returns the message unchanged and the agent's
+input is the current message alone — so neither model call gets taste or history. There
 is no special-cased "new user" code path; the cold-start answer comes entirely from
 how well the interpret prompt extracts mood signal from a short, colloquial first
 message, which is why `SearchArgs.keywords`'s field description in
