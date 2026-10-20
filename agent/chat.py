@@ -41,8 +41,9 @@ Event shapes on the wire (one JSON object per line):
     {"type": "message", "text": str}   -- a plain reply with no candidates
                                            (no subscriptions, capability
                                            question, clarifying question, a
-                                           named title that didn't resolve,
-                                           or nothing found)
+                                           chat or off-topic reply, a named
+                                           title that didn't resolve, or
+                                           nothing found)
     {"type": "error", "reason": str}   -- one of a fixed set, see _error_reason
     {"type": "done"}
 
@@ -473,8 +474,8 @@ async def stream_chat(
             # The model's own answer, written with the caller's services in
             # its system prompt (catalog_tool's _interpret_system_message) — no
             # second call, and no template unless it came back blank. The
-            # template serves a blank clarifying question too: it already asks
-            # what they are in the mood for.
+            # template serves a blank reply of any kind: it says what the
+            # assistant is for and asks what they are in the mood for.
             yield {
                 "type": "message",
                 "text": state["answer_text"]

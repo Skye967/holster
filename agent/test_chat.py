@@ -202,6 +202,68 @@ def test_clarifying_question_short_circuits_with_the_models_question() -> None:
     assert fake_tmdb.requests == []
 
 
+def test_a_chat_turn_is_the_models_own_words_and_no_search() -> None:
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="is Heat any good?", watch_region="US", watch_providers=[8]
+    )
+    model = scripted(
+        answer_call("A two-hander that earns its three hours. Want more?", "chat")
+    )
+    composer = RecordingComposer()
+
+    events = asyncio.run(_collect(req, fake_tmdb.client(), model, composer()))
+
+    assert [e["type"] for e in events] == ["message", "done"]
+    assert events[0]["text"] == "A two-hander that earns its three hours. Want more?"
+    assert (len(model.calls), len(composer.calls)) == (1, 0)
+    assert fake_tmdb.requests == []
+
+
+def test_a_blank_chat_reply_still_answers() -> None:
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="is Heat any good?", watch_region="US", watch_providers=[8]
+    )
+
+    events = asyncio.run(
+        _collect(req, fake_tmdb.client(), scripted(answer_call(" \n", "chat")))
+    )
+
+    assert [e["type"] for e in events] == ["message", "done"]
+    assert "in the mood for" in events[0]["text"]
+
+
+def test_an_off_topic_turn_is_the_models_own_words_and_no_search() -> None:
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="what's the weather in Paris?", watch_region="US", watch_providers=[8]
+    )
+    model = scripted(answer_call("I'm all film and TV, no help there.", "off_topic"))
+    composer = RecordingComposer()
+
+    events = asyncio.run(_collect(req, fake_tmdb.client(), model, composer()))
+
+    assert [e["type"] for e in events] == ["message", "done"]
+    assert events[0]["text"] == "I'm all film and TV, no help there."
+    assert (len(model.calls), len(composer.calls)) == (1, 0)
+    assert fake_tmdb.requests == []
+
+
+def test_a_blank_off_topic_reply_still_answers() -> None:
+    fake_tmdb = FakeTMDB()
+    req = ChatRequest(
+        message="what's the weather in Paris?", watch_region="US", watch_providers=[8]
+    )
+
+    events = asyncio.run(
+        _collect(req, fake_tmdb.client(), scripted(answer_call(" \n", "off_topic")))
+    )
+
+    assert [e["type"] for e in events] == ["message", "done"]
+    assert "in the mood for" in events[0]["text"]
+
+
 def test_successful_search_emits_intent_then_results_then_done() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # MOVIE_A is id 101

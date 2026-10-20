@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock
 
 import httpx2
@@ -35,6 +35,7 @@ from catalog_tool import (
     RESULT_CEILING,
     RESULT_FLOOR,
     TASTE_HEADER,
+    AnswerKind,
     CatalogResult,
     ComposedReply,
     LookUpArgs,
@@ -1489,6 +1490,7 @@ def test_format_candidates_escapes_third_party_text() -> None:
     last part is what fails if the escaping is ever loosened."""
     hostile = _title(101)
     hostile["overview"] = 'A\u2028B"C \ud83d'
+    hostile["genre_ids"] = [80]
     out = _format_candidates([hostile, _title(102)])
 
     # On the raw string, not a json.loads round trip - decoding reproduces
@@ -1500,7 +1502,15 @@ def test_format_candidates_escapes_third_party_text() -> None:
 
     rows = json.loads(out)
     assert [r["tmdb_id"] for r in rows] == [101, 102]
-    assert set(rows[0]) == {"tmdb_id", "media_type", "title", "year", "overview"}
+    assert set(rows[0]) == {
+        "tmdb_id",
+        "media_type",
+        "title",
+        "year",
+        "genres",
+        "overview",
+    }
+    assert rows[0]["genres"] == ["Crime"]
 
 
 def test_search_drops_only_the_bad_taste_line_not_the_whole_hint() -> None:
@@ -3483,11 +3493,21 @@ def test_the_shared_tone_reaches_all_three_prompts() -> None:
 def test_the_answer_rules_reach_the_two_prompts_that_write_stored_text() -> None:
     """Both of these produce text the gateway stores as the turn's assistant
     text, which chat.py's _turn_messages replays into the next turn's interpret
-    call — where a film this turn invented reads as a title request. The rank call
+    call — where a film this turn invented reads as a title request. In the
+    interpret prompt the rules frame every answer kind, not one. The rank call
     is excluded: its job is a list of per-title blurbs, and none of them is stored."""
     assert _ANSWER_RULES in _INTERPRET_SYSTEM_PROMPT.template
     assert _ANSWER_RULES in _OUTCOME_SYSTEM_PROMPT
     assert _ANSWER_RULES not in _RANK_SYSTEM_PROMPT
+
+
+def test_the_interpret_prompt_names_every_answer_kind() -> None:
+    """The kind is a schema Literal the model fills from the prompt's routing
+    rules; a kind the prompt never names is one the model has no rule for."""
+    for kind in get_args(AnswerKind):
+        # The labelled form, not a bare substring: "chat" also occurs in
+        # ordinary prose.
+        assert f"kind '{kind}'" in _INTERPRET_SYSTEM_PROMPT.template
 
 
 def test_a_count_past_the_schema_bound_clamps_instead_of_failing() -> None:
