@@ -1913,8 +1913,7 @@ class TurnState(AgentState[RankResult]):
     A history turn in `messages` is text only, never a replayed tool call:
     chat.py's HistoryTurn has no tool fields. Giving it some would let an
     earlier turn's tool results, TMDB overviews included, reach the
-    interpret call, which picks the action: the third-party text
-    TwoCallTurn keeps away from that choice."""
+    interpret call, which picks the action."""
 
     # search_catalog
     found: NotRequired[Candidates]
@@ -2092,8 +2091,8 @@ MODEL_CALLS_PER_TURN = 2
 
 class TwoCallTurn(AgentMiddleware[TurnState, TurnContext, RankResult]):
     """The two-call rule, in one place. Only the first call is offered tools
-    and there is no third, so nothing read after the user's message — TMDB
-    overviews included — can pick an action.
+    and there is no third, so nothing read within a turn after the user's
+    message — TMDB overviews included — can pick an action.
 
     Call one is the interpret call: the interpret prompt, the three tools,
     tool_choice="any", and no response format; a reply with anything but
@@ -2212,10 +2211,12 @@ CatalogAgent = CompiledStateGraph[
 
 def catalog_agent(model: BaseChatModel) -> CatalogAgent:
     """The turn's agent around ``model``. ProviderStrategy is named rather than
-    left to the library, which picks a strategy by model name — so the test
-    fake and a GOOGLE_MODEL override would otherwise run a different path from
-    production. Provider-native structured output is also what fails a bad
-    ranking at once, where the tool strategy's default retry spends a call."""
+    left to the library, which picks a strategy from the model's profile and
+    then its name — so the test fake, which declares no profile, and a
+    GOOGLE_MODEL the provider ships no profile for would otherwise run a
+    different path from production. Provider-native structured output is also
+    what fails a bad ranking at once, where the tool strategy's default retry
+    spends a call."""
     return create_agent(
         model,
         tools=CATALOG_TOOLS,
