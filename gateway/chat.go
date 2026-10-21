@@ -1163,10 +1163,12 @@ func summarizePicks(picks []agentPick, isLookup bool) string {
 // must still be dropped). connCtx gates the deferred send's escape hatch
 // below and every *terminal* write via sendTerminalEvent (done, error, and
 // the post-loop fallback) — turnCtx being Done is exactly the condition a
-// terminal frame exists to report, so gating those on turnCtx instead is
-// what let a cancelled/superseded/timed-out turn end with no terminal frame
-// at all and the composer stuck disabled. See sendTerminalEvent's own
-// doc comment for the same split from the other side.
+// terminal frame exists to report, so gating those on turnCtx would end a
+// cancelled/superseded/timed-out turn with no terminal frame at all. The web
+// client never cancels and can't supersede while a turn is in flight, but a
+// timed-out turn would leave it unable to send again until the socket drops
+// or the page reloads. See sendTerminalEvent's own doc comment for the same
+// split from the other side.
 func (h *Handler) runTurn(
 	turnCtx context.Context,
 	connCtx context.Context,

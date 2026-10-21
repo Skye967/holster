@@ -125,7 +125,7 @@ export const MAX_MESSAGE_LENGTH = 4000
 // large and `[...text].length` would walk all of it just to reject it. Drives
 // the iterator directly rather than `for...of` because an unused loop binding
 // trips this project's lint config.
-function exceedsCodePointLength(text: string, max: number): boolean {
+export function exceedsCodePointLength(text: string, max: number): boolean {
   let count = 0
   const iter = text[Symbol.iterator]()
   while (!iter.next().done) {
@@ -312,8 +312,8 @@ export function useChatSocket(
       if (exceedsCodePointLength(text, MAX_MESSAGE_LENGTH)) {
         // Deferred, not fired synchronously: chat-session-provider.tsx marks
         // the turn active *after* this call returns, so an error dispatched
-        // before that would clear nothing and leave the composer disabled
-        // forever. This matches the "fires after send() returns" timing
+        // before that would clear nothing and leave sending blocked.
+        // This matches the "fires after send() returns" timing
         // every other failure path here has, without opening a connection.
         queueMicrotask(() => {
           onEventRef.current({

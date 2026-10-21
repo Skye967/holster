@@ -981,10 +981,9 @@ async def enrich_watchlist(
 
 # What one liked-title lookup gets. tmdb._get retries a transient failure
 # twice with backoff, so an unbounded one can burn ~50s -- well past the
-# gateway's 30s turnDeadline, which would take the whole turn down (and the
-# browser sees nothing at all: every sendEvent after the deadline is dropped,
-# leaving the composer disabled until reload). The lookups run concurrently,
-# so this bounds the fan-out's wall clock too.
+# gateway's 30s turnDeadline, which fails the whole turn: the user waits
+# 30s and gets an error, not picks. The lookups run concurrently, so this
+# bounds the fan-out's wall clock too.
 TASTE_TIMEOUT_SECONDS = 5.0
 
 # How many liked titles feed the rank call's taste hint. A real per-turn cost, not
