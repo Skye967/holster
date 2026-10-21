@@ -66,6 +66,7 @@ import re
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Literal, NotRequired, cast
 
 from langchain.agents import AgentState, create_agent
@@ -196,7 +197,13 @@ class SearchArgs(BaseModel):
         default="vote_count.desc",
         description=(
             "'vote_average.desc' only when the user asks for the best, the "
-            "highest rated, or the critically acclaimed. "
+            "highest rated, or the critically acclaimed — but not of new or "
+            "this year's titles, which have not had time to collect the votes "
+            "a rating needs: 'the best new …' is 'vote_count.desc' with a "
+            "current-year range. "
+            "'newest' only when the user asks for the newest, the latest, or "
+            "what just came out. 'recent', 'this year' and 'new' alone are a "
+            "year range on the default sort. "
             "'vote_count.desc' — the most watched — for everything else, "
             "including 'popular', 'famous' and 'what's good'."
         ),
@@ -1119,6 +1126,9 @@ class Candidates:
     floor: int
     # Liked titles of this search's media type, as the rank call's hint lines.
     taste: list[str]
+    # Ordered newest first, so within each rung `candidates` order is the
+    # order asked for.
+    newest_first: bool
     all_judged: bool
     all_shown: bool
 
@@ -1189,7 +1199,8 @@ async def find_candidates(
     survive being widened past. Surviving is not being picked, though: the
     rank call's candidate list carries no rung marker, so it can name only
     widened titles. finish_search() therefore reserves every exact match a
-    place itself, stable-sorts by rung, and only then cuts to ``limit``.
+    place itself, stable-sorts by rung — on a newest search, by rung and then
+    candidate position — and only then cuts to ``limit``.
     Accumulation also makes the long tail rare — the floor is usually met by
     the first rung that fires, because one widened page is twenty rows.
     (agent/README.md walks the whole ladder.)
@@ -1510,6 +1521,7 @@ async def find_candidates(
         limit=limit,
         floor=floor,
         taste=taste,
+        newest_first=args.sort_by == "newest",
         all_judged=all_judged,
         all_shown=all_shown,
     )
@@ -1576,7 +1588,9 @@ async def finish_search(
     # request made of the model — same reason _valid_picks validates ids rather
     # than asking for valid ones. Topped-up picks carry no blurb (the shape
     # lookup_title() returns and title-card.tsx renders) and come in candidate
-    # order, so the closest unused match is reached for first.
+    # order, so the closest unused match is reached for first. They trail the
+    # blurbed picks of their rung, except on a newest search, where the order
+    # below places them by date among them.
     #
     # An exact candidate is admitted whether or not the floor is already met,
     # which is what holds the "what was asked for leads" promise: the rank call
@@ -1601,10 +1615,20 @@ async def finish_search(
     # constraint was dropped. A stable sort on the rung keeps the model's own
     # ordering inside each rung and puts the titles that actually matched the
     # request at the head of the carousel, with the widening behind them.
-    ranked_picks.sort(key=rung)
+    #
+    # Except on a newest search, where the user asked for an order the rank
+    # call cannot see: TMDB's, which `candidates` keeps. One key, so the rung
+    # grouping holds and each rung reads newest first; a date sort after the
+    # rung sort would undo the grouping.
+    if found.newest_first:
+        position = {c["tmdb_id"]: i for i, c in enumerate(candidates)}
+        ranked_picks.sort(key=lambda p: (rung(p), position[p.tmdb_id]))
+    else:
+        ranked_picks.sort(key=rung)
     # Cut last, so it falls on the least exact picks: cutting before the sort
     # would cut in the model's fit order and can discard every exact match a
-    # widened query found.
+    # widened query found. On a newest search it falls on the oldest picks of
+    # the least exact rung.
     del ranked_picks[limit:]
     exact_matches = sum(1 for p in ranked_picks if rung(p) == 0)
     # Built from the filtered list, which is what _valid_picks validated
@@ -1708,7 +1732,7 @@ _ANSWER_RULES = (
 # The 'Suggested:' and 'Looked up:' this prompt quotes are the prefixes
 # gateway/chat.go's summarizePicks writes; a change to either belongs in both.
 #
-# A template for the {services} slot alone, filled per call by
+# A template for the {today} and {services} slots alone, filled per call by
 # _interpret_system_message; any other brace in this prose is read as a slot.
 _INTERPRET_SYSTEM_PROMPT = PromptTemplate.from_template(
     _TONE
@@ -1716,7 +1740,13 @@ _INTERPRET_SYSTEM_PROMPT = PromptTemplate.from_template(
         "You turn a request for a movie or TV show into search parameters for a "
         "streaming catalog. Extract media type, mood/theme keywords, genres, "
         "exclusions, a runtime ceiling, a year range, cast/crew names, and how "
-        "many results to return. Never name a specific film or show yourself — "
+        "many results to return. 'This year', 'last year', 'recent' and 'new' "
+        "each set a year range, read against today's date, given after these "
+        "instructions: 'new' and 'this year' are the current year alone. "
+        "Asked for the best of those, sort by 'vote_count.desc', never "
+        "'vote_average.desc': a title that new has not had time to collect "
+        "the votes a rating needs. "
+        "Never name a specific film or show yourself — "
         "you are describing what to search for, not recalling titles from "
         "memory. Leave a field empty when the message does not mention it, "
         "except keywords. "
@@ -1781,6 +1811,7 @@ _INTERPRET_SYSTEM_PROMPT = PromptTemplate.from_template(
         "they have none: answer without naming any service rather than telling "
         "them they have not picked any. " + _GENRE_VOCABULARY
     )
+    + "\n\nToday's date: {today}"
     + f"\n\n{PROVIDERS_HEADER}\n"
     + "{services}"
 )
@@ -1807,7 +1838,9 @@ _RANK_SYSTEM_PROMPT = _TONE + (
 )
 
 
-def _interpret_system_message(provider_names: list[str]) -> SystemMessage:
+def _interpret_system_message(
+    provider_names: list[str], *, today: date
+) -> SystemMessage:
     """The interpret call's system prompt, with the caller's own service names
     in it, so the model can name them when it answers a question about what it
     can do. That answer rides on a call the turn was making anyway.
@@ -1838,9 +1871,18 @@ def _interpret_system_message(provider_names: list[str]) -> SystemMessage:
 
     json.dumps, like _with_taste: a provider *name* cannot forge a section
     break here.
+
+    ``today`` is what "this year" and "new" resolve against, where the model
+    would otherwise use the year it believes it is. In the system message for
+    the same reason as the names. The server's date, not the user's: the
+    gateway sends no timezone, so around New Year a turn can resolve to the
+    year before or after the user's. Not in the rank or outcome prompts —
+    neither picks a year.
     """
     names = json.dumps(provider_names)
-    return SystemMessage(_INTERPRET_SYSTEM_PROMPT.format(services=names))
+    return SystemMessage(
+        _INTERPRET_SYSTEM_PROMPT.format(services=names, today=today.isoformat())
+    )
 
 
 # Each cause's duty is spelled out because they are mutually exclusive and only
@@ -1906,10 +1948,20 @@ def _format_candidates(candidates: list[Title]) -> str:
 
 def _rank_content(message: str, found: Candidates) -> str:
     """The rank call's human message: the request, the taste hint before it,
-    the target count after it, then the candidate list last."""
+    the target count after it, then the candidate list last.
+
+    On a newest search the rank call still chooses which candidates fit, and
+    told nothing it would choose the best fits, which can pass over the newest
+    titles entirely; finish_search() can only reorder what it chose. Folded in
+    per call, like the count."""
     request = _with_target_count(
         _with_taste(message, found.taste), limit=found.limit, floor=found.floor
     )
+    if found.newest_first:
+        request += (
+            "\n\nThese are listed newest first and the user asked for the "
+            "newest: prefer the earliest that fit."
+        )
     return f"{request}\n\nCandidates:\n{_format_candidates(found.candidates)}"
 
 
@@ -2217,7 +2269,7 @@ class TwoCallTurn(AgentMiddleware[TurnState, TurnContext, RankResult]):
             response = await _model_call(
                 handler,
                 request.override(
-                    system_message=_interpret_system_message(names),
+                    system_message=_interpret_system_message(names, today=date.today()),
                     tool_choice="any",
                     response_format=None,
                 ),

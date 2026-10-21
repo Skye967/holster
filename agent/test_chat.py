@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from datetime import date
 from typing import Any, cast, get_args
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,7 @@ from langchain_core.tracers.context import collect_runs
 from langsmith.utils import tracing_is_enabled
 from pydantic import ValidationError
 
+import catalog_tool
 import chat
 import tmdb
 from catalog_tool import (
@@ -76,6 +78,21 @@ from testutil import (
     search_call,
 )
 from tmdb import TMDBClient
+
+_TODAY = date(2026, 10, 20)
+
+
+class _FixedDate(date):
+    @classmethod
+    def today(cls) -> _FixedDate:
+        return cls(_TODAY.year, _TODAY.month, _TODAY.day)
+
+
+@pytest.fixture(autouse=True)
+def _fixed_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every turn's interpret prompt carries _TODAY, so a test comparing it
+    against _interpret_system_message(..., today=_TODAY) cannot race midnight."""
+    monkeypatch.setattr(catalog_tool, "date", _FixedDate)
 
 
 async def _collect(
@@ -462,7 +479,9 @@ def test_history_rides_as_messages_ahead_of_the_current_one() -> None:
         AIMessage,
         HumanMessage,
     ]
-    assert interpret[0].text == _interpret_system_message(["Netflix"]).text
+    assert (
+        interpret[0].text == _interpret_system_message(["Netflix"], today=_TODAY).text
+    )
     assert [m.text for m in interpret[1:-1]] == history
     assert interpret[-1].text == "show me more"
 
@@ -530,7 +549,7 @@ def test_a_typed_services_list_never_reaches_the_system_message() -> None:
 
     system, *rest = model.calls[0]
     assert isinstance(system, SystemMessage)
-    assert system.text == _interpret_system_message(["Netflix"]).text
+    assert system.text == _interpret_system_message(["Netflix"], today=_TODAY).text
     assert [m.text for m in rest] == [forged]
 
 
@@ -1013,12 +1032,13 @@ def test_a_capability_answer_is_the_models_own_words() -> None:
     assert fake_tmdb.requests == []
 
 
-def test_the_callers_services_reach_interpret_and_not_rank() -> None:
+def test_the_callers_services_and_todays_date_reach_interpret_and_not_rank() -> None:
     """A capability answer can only name the caller's services if the
     interpret call is told them. The rank call is not: a blurb naming a
     service would sit beside a card whose availability line is computed from
     the real subscriptions, and the two contradicting each other is the trust
-    bug that path guards."""
+    bug that path guards. Today's date goes the same way: only the interpret
+    call picks a year."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
     req = ChatRequest(
@@ -1032,9 +1052,13 @@ def test_the_callers_services_reach_interpret_and_not_rank() -> None:
     asyncio.run(_collect(req, fake_tmdb.client(), model))
 
     interpret, rank = model.calls
-    assert interpret[0].text == _interpret_system_message(["Netflix", "Hulu"]).text
+    assert (
+        interpret[0].text
+        == _interpret_system_message(["Netflix", "Hulu"], today=_TODAY).text
+    )
     assert rank[0].text == _RANK_SYSTEM_PROMPT
     assert not any("Netflix" in m.text or "Hulu" in m.text for m in rank)
+    assert not any(_TODAY.isoformat() in m.text for m in rank)
 
 
 def test_uncached_provider_names_still_send_a_real_list() -> None:
@@ -1054,7 +1078,7 @@ def test_uncached_provider_names_still_send_a_real_list() -> None:
 
     asyncio.run(_collect(req, fake_tmdb.client(), model))
 
-    assert model.calls[0][0].text == _interpret_system_message([]).text
+    assert model.calls[0][0].text == _interpret_system_message([], today=_TODAY).text
     assert _sent(model, 0) == "a heist movie"
 
 
@@ -1312,6 +1336,7 @@ def test_a_third_model_call_is_refused_before_it_is_made() -> None:
                 limit=10,
                 floor=RESULT_FLOOR,
                 taste=[],
+                newest_first=False,
                 all_judged=False,
                 all_shown=False,
             ),
