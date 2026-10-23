@@ -91,7 +91,7 @@ future chats" and must never promise to keep the current one.
 
 **One socket per session.** A chat session holds a single WebSocket, shared across
 conversation switches and reconnects, carrying messages up and curated events down. One
-turn is *current* at a time, which is why the composer disables while streaming and why
+turn is *current* at a time, which is why the composer won't send while streaming and why
 turn ids — not connections — are what a reply is matched against; a superseded turn's
 goroutine keeps running until it reports, so more than one can be outstanding.
 

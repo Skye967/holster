@@ -1432,8 +1432,8 @@ def test_search_drops_the_taste_hint_when_it_overruns_its_budget(
 ) -> None:
     """A slow liked-title lookup must not take the turn with it. tmdb._get
     retries transients with backoff, so one rate-limited call can outlast the
-    gateway's turn deadline — past which the browser is sent nothing at all
-    and the composer stays disabled. The hint is dropped instead."""
+    gateway's turn deadline, which fails the whole turn with an error and no
+    picks. The hint is dropped instead."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})
     rank_saw: list[str] = []

@@ -1,10 +1,10 @@
 "use client"
 
 import { useAuth } from "@clerk/nextjs"
-import { Send } from "lucide-react"
+import { LoaderCircle, Send } from "lucide-react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useId, useRef, useState } from "react"
 
 import { useChatSession } from "@/components/chat/chat-session-provider"
 import { TitleCard } from "@/components/chat/title-card"
@@ -12,7 +12,12 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useRowStatus, type RowStatus } from "@/hooks/use-row-status"
 import { fetchChatHistory } from "@/lib/chat-history"
-import { type AgentPick, type ChatEvent } from "@/lib/chat-socket"
+import {
+  MAX_MESSAGE_LENGTH,
+  exceedsCodePointLength,
+  type AgentPick,
+  type ChatEvent,
+} from "@/lib/chat-socket"
 import {
   GATEWAY_CALL_TIMEOUT_MS,
   gatewayErrorText,
@@ -77,45 +82,102 @@ function ChatInput({
   value,
   onChange,
   onSubmit,
-  disabled,
-  autoFocus,
+  busy,
+  turnOnScreen,
 }: {
   value: string
   onChange: (value: string) => void
   onSubmit: () => void
-  disabled: boolean
-  autoFocus?: boolean
+  busy: boolean
+  turnOnScreen: boolean
 }) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const hintId = useId()
+  // Trimmed because that's what submit sends. Checked as you type so an
+  // over-long message never becomes a turn whose Retry could only fail
+  // again; send() keeps its own check as the backstop.
+  const tooLong = exceedsCodePointLength(value.trim(), MAX_MESSAGE_LENGTH)
+
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault()
-        onSubmit()
-      }}
-      className="flex gap-2"
-    >
-      <Input
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder="What do you feel like watching?"
-        disabled={disabled}
-        autoFocus={autoFocus}
-      />
-      <Button
-        type="submit"
-        size="icon"
-        disabled={disabled || !value.trim()}
-        aria-label="Send"
+    <>
+      {/* preventDefault on mousedown keeps a click or tap anywhere in the
+          form but the input from moving focus out of it; on a phone that
+          would close the keyboard, and the focus() below would open it
+          again. On the form, not the Send button: while Send is disabled
+          base-ui skips its onMouseDown and `disabled:pointer-events-none`
+          passes the press through to the form. */}
+      <form
+        onMouseDown={(e) => {
+          if (e.target !== inputRef.current) e.preventDefault()
+        }}
+        onSubmit={(e) => {
+          e.preventDefault()
+          // Only when focus is already in the form: sending from the Send
+          // button by keyboard leaves focus on it, and it's disabled a render
+          // later. A tap on Send after the phone keyboard was dismissed
+          // leaves focus outside, and pulling it back would reopen the
+          // keyboard.
+          const inForm = e.currentTarget.contains(document.activeElement)
+          onSubmit()
+          if (inForm) inputRef.current?.focus()
+        }}
+        className="flex gap-2"
       >
-        <Send />
-      </Button>
-    </form>
+        {/* Never disabled, even while busy: a browser drops focus from a
+            disabled control and doesn't give it back when it's re-enabled. */}
+        <Input
+          ref={inputRef}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="What do you feel like watching?"
+          aria-describedby={hintId}
+          aria-invalid={tooLong}
+          autoFocus
+        />
+        {/* The spinner is the visible busy cue: it sits where a user looks
+            before sending, takes no layout space, and shows even when the
+            running turn isn't on this screen (another conversation's, or
+            this one's before it's saved). Under reduced motion it stops
+            spinning but still isn't the Send arrow. */}
+        <Button
+          type="submit"
+          size="icon"
+          disabled={busy || !value.trim() || tooLong}
+          aria-label="Send"
+        >
+          {busy ? (
+            <LoaderCircle className="animate-spin motion-reduce:animate-none" />
+          ) : (
+            <Send />
+          )}
+        </Button>
+      </form>
+      {/* Rendered empty rather than mounted on demand: a live region that
+          appears already holding text is often not announced, and the
+          input's aria-describedby reads it on focus for that case. The busy
+          hint is for screen readers only: a disabled Send leaves the tab
+          order, so this tells them why it does nothing.
+          The too-long error is shown, and grows the composer once, when the
+          text goes over. */}
+      <p
+        id={hintId}
+        aria-live="polite"
+        className={tooLong ? "mt-2 text-xs text-destructive" : "sr-only"}
+      >
+        {tooLong
+          ? "That message is too long — try something shorter."
+          : busy &&
+            (!turnOnScreen || value.trim()) &&
+            "Still answering — you can send when I'm done."}
+      </p>
+    </>
   )
 }
 
 function TurnView({
   turn,
   onRetry,
+  busy,
   verdicts,
   verdictStatus,
   onSetVerdict,
@@ -123,6 +185,7 @@ function TurnView({
 }: {
   turn: Turn
   onRetry: () => void
+  busy: boolean
   verdicts: Record<string, Verdict>
   verdictStatus: Record<string, RowStatus>
   onSetVerdict: (
@@ -183,7 +246,20 @@ function TurnView({
       {turn.error && (
         <div className="flex items-center gap-2">
           <p className="text-sm text-destructive">{turn.error}</p>
-          <Button variant="outline" size="sm" onClick={onRetry}>
+          {/* Disabled, not hidden, while busy: submit refuses mid-turn, and
+              hiding it would shift the thread. focusableWhenDisabled because
+              pressing Retry starts the turn that disables it, and a natively
+              disabled button would drop focus to the page; that swaps the
+              native `disabled` for aria-disabled, so the dimming is restated
+              for it. */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onRetry}
+            disabled={busy}
+            focusableWhenDisabled
+            className="aria-disabled:opacity-50"
+          >
             Retry
           </Button>
         </div>
@@ -430,7 +506,7 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
   // Only renders the event into the turn it belongs to; tracking which turn
   // is active is chat-session-provider.tsx's job. A superseded turn's
   // terminal event still lands here and still renders — it just doesn't
-  // touch the composer's disabled state.
+  // unblock sending.
   const handleEvent = useCallback((ev: ChatEvent) => {
     setTurns((prev) =>
       prev.map((t) => (t.id === ev.turn ? applyEvent(t, ev) : t)),
@@ -456,16 +532,16 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
   const submit = useCallback(
     (text: string) => {
       const trimmed = text.trim()
-      if (!trimmed || activeTurn) return
+      if (!trimmed || activeTurn) return false
       const turnId = send(trimmed, conversationId)
       setTurns((prev) => [...prev, { id: turnId, userText: trimmed }])
+      return true
     },
     [activeTurn, send, conversationId],
   )
 
   const handleSubmit = useCallback(() => {
-    submit(inputValue)
-    setInputValue("")
+    if (submit(inputValue)) setInputValue("")
   }, [submit, inputValue])
 
   useEffect(() => {
@@ -475,7 +551,8 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
     })
   }, [turns])
 
-  const disabled = activeTurn !== null
+  const empty = turns.length === 0
+  const busy = activeTurn !== null
 
   // One line, not a banner or a modal: the only thing a guest gives up in
   // chat is persistence, and this says so where the input is.
@@ -518,47 +595,46 @@ export function ChatPanel({ conversationId }: { conversationId: string }) {
           self-explanatory (a bare input, then a message thread), but the
           page otherwise has no heading or landmark identifying it. */}
       <h1 className="sr-only">Chat</h1>
-      {turns.length === 0 ? (
-        <div className="flex min-h-0 flex-1 flex-col items-center justify-center p-6">
-          <div className="w-full max-w-md">
-            <ChatInput
-              value={inputValue}
-              onChange={setInputValue}
-              onSubmit={handleSubmit}
-              disabled={disabled}
-              autoFocus
-            />
-            {guestNotice}
+      {!empty && (
+        <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
+          <div className="mx-auto max-w-2xl space-y-6 p-4">
+            {turns.map((turn) => (
+              <TurnView
+                key={turn.id}
+                turn={turn}
+                onRetry={() => submit(turn.userText)}
+                busy={busy}
+                verdicts={verdicts}
+                verdictStatus={verdictStatus}
+                onSetVerdict={handleSetVerdict}
+                onClearVerdict={handleClearVerdict}
+              />
+            ))}
           </div>
         </div>
-      ) : (
-        <>
-          <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
-            <div className="mx-auto max-w-2xl space-y-6 p-4">
-              {turns.map((turn) => (
-                <TurnView
-                  key={turn.id}
-                  turn={turn}
-                  onRetry={() => submit(turn.userText)}
-                  verdicts={verdicts}
-                  verdictStatus={verdictStatus}
-                  onSetVerdict={handleSetVerdict}
-                  onClearVerdict={handleClearVerdict}
-                />
-              ))}
-            </div>
-          </div>
-          <div className="border-t p-4">
-            <ChatInput
-              value={inputValue}
-              onChange={setInputValue}
-              onSubmit={handleSubmit}
-              disabled={disabled}
-            />
-            {guestNotice}
-          </div>
-        </>
       )}
+      {/* One composer for both layouts; only the classes change, so the
+          input keeps its DOM node, and with it focus, when the first turn
+          or loaded history fills the list. That holds while the list stays
+          the single `{!empty && …}` slot before this one. */}
+      <div
+        className={
+          empty
+            ? "flex min-h-0 flex-1 flex-col items-center justify-center p-6"
+            : "border-t p-4"
+        }
+      >
+        <div className={empty ? "w-full max-w-md" : undefined}>
+          <ChatInput
+            value={inputValue}
+            onChange={setInputValue}
+            onSubmit={handleSubmit}
+            busy={busy}
+            turnOnScreen={turns.some((t) => t.id === activeTurn)}
+          />
+          {guestNotice}
+        </div>
+      </div>
     </div>
   )
 }
