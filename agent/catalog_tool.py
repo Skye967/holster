@@ -947,9 +947,9 @@ class TitleVerdict(BaseModel):
 
 class TitlesRequest(BaseModel):
     """POST /titles' request body — a caller-supplied list of already-known
-    ids to enrich, plus the real user context every catalog call needs
-    (CLAUDE.md: "every catalog query whose answer depends on country
-    carries watch_region")."""
+    ids to enrich, plus the real user context the catalog calls need
+    (CLAUDE.md: "Every catalog query carries `watch_region`, except
+    `/search/multi`.")."""
 
     watch_region: str
     watch_providers: list[int] = Field(default_factory=list)
