@@ -51,6 +51,8 @@ uv run uvicorn main:asgi_app --port 8000 --reload   # or: uv run python main.py
 curl -s localhost:8000/health                        # {"status": "ok"}
 ```
 
+uv 0.13.7 is the version `Dockerfile` and CI pin.
+
 The container runs `python main.py`, which configures logging and serves; the uvicorn
 CLI above is the same thing with reload for local work.
 
@@ -82,8 +84,8 @@ here otherwise.
 ## TMDB client
 
 `tmdb.py` wraps the catalog API: title search, `discover` (filter by streaming
-service, region, runtime, year, genre, cast, crew, keywords), "more like this", and
-per-title streaming availability. Callers pass names — "Tilda Swinton", "heist" — and
+service, region, runtime, year, genre, cast, crew, keywords), and per-title
+streaming availability. Callers pass names — "Tilda Swinton", "heist" — and
 the client resolves them to TMDB IDs and caches the mapping. Results are ordered by
 `vote_count` — most watched — by default, by rating when the user asks for the best,
 or newest first when they ask for the newest (`newest`, which `discover` translates to
@@ -95,7 +97,8 @@ the rating sort, which is the only one a low floor actually misorders. (`find_ca
 last rung drops the rating sort for a query too narrow to fill under it, which lowers
 the floor as a consequence — the sort is the only thing it sets.) Multiple cast or
 crew names mean *all* of them; multiple mood keywords mean *any*, because TMDB's tag
-data is far too sparse to survive an AND. Subscription matches are `flatrate` only; a
+data is far too sparse to survive an AND. Subscription queries ask for `flatrate` only,
+which TMDB does not hold a rental store's id to (see the comment in `discover()`); a
 caller wanting rentals asks for them by name (`monetization="rent"`), which filters on
 `rent|buy` and carries no provider list — passing one raises. No
 results is an empty list; only TMDB being unreachable or 429/5xx

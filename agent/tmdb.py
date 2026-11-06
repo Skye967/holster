@@ -2,8 +2,8 @@
 
 A thin async wrapper over the parts of the TMDB API the agent needs: title
 search, ``discover`` (the workhorse — filter by streaming service, region,
-runtime, year, genre, cast, crew, keywords), "more like this", and per-title
-streaming availability.
+runtime, year, genre, cast, crew, keywords), and per-title streaming
+availability.
 
 What this module holds onto that the rest of the agent must not have to think
 about:
@@ -710,7 +710,10 @@ class TMDBClient:
             # both.
             params["with_watch_monetization_types"] = "rent|buy"
         elif watch_providers is not None:
-            # Subscription means included, not rentable. Paired with the
+            # Subscription means included, not rentable, but TMDB does not hold
+            # a rental store's id to that: Apple TV Store returned US movies it
+            # has no flatrate entry for, and OR-joined with Netflix it left no
+            # Netflix title on the first vote_count page. Paired with the
             # provider list rather than set unconditionally: a query with
             # neither asked for no availability filter at all, and adding one
             # here would silently drop every title the region streams nowhere.
@@ -753,20 +756,6 @@ class TMDBClient:
             params[f"{date_field}.lte"] = f"{release_year_lte}-12-31"
 
         data = await self._get(f"/discover/{media_type}", params)
-        return [_trim_title(r, media_type) for r in data.get("results", [])]
-
-    async def recommendations(
-        self, *, media_type: MediaType, tmdb_id: int
-    ) -> list[Title]:
-        """ "More like this" for a known title. Does not filter by service — the
-        caller cross-references availability.
-
-        Nothing calls this yet. Kept because "more like this" is in this
-        module's brief; delete it if that stops being true."""
-        _validate_media_type(media_type)
-        data = await self._get(
-            f"/{media_type}/{int(tmdb_id)}/recommendations", {"language": LANGUAGE}
-        )
         return [_trim_title(r, media_type) for r in data.get("results", [])]
 
     async def title_details(
@@ -882,6 +871,13 @@ class TMDBClient:
         for movies," and the major platforms share one ID across media types.
         Powers the /connections picker; this call has no cache
         of its own, the caller (streaming_providers, gateway-side) owns that.
+
+        TMDB's list mixes subscriptions with rental stores (Apple TV Store,
+        Amazon Video, Google Play Movies, YouTube) and nothing filters them, so
+        a store can be ticked, and discover()'s flatrate filter does not hold
+        for one. DEFAULT_PROVIDER_IDS in
+        web/src/components/streaming-picker.tsx lists no store, so one has to be
+        searched for.
         """
         _validate_region(watch_region)
         movie_data, tv_data = await gather_all(
