@@ -1,7 +1,7 @@
-"""Shared test doubles for the offline test suites.
+"""Shared test doubles for the offline test suites of this package and the service.
 
-Not named test_*.py so pytest never collects it as a test module — it's a plain
-module the test files import, the same way each imports tmdb.py/catalog_tool.py.
+Shipped because both need them, and outside the package's version: any release may
+change this module.
 
 FakeTMDB is the union of what those suites need; each uses a subset.
 """
@@ -21,7 +21,7 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
 from pydantic import Field
 
-from catalog_tool import (
+from holster_catalog.catalog_tool import (
     CatalogToolError,
     ComposedReply,
     Composer,
@@ -30,11 +30,7 @@ from catalog_tool import (
     RankResult,
     SearchArgs,
 )
-from tmdb import TMDBClient
-
-# gateway's constant, hand-copied -- the two services share no code.
-# Nothing enforces the copy: update it by hand when chat.go changes.
-GATEWAY_MAX_HISTORY_EXCHANGES = 5
+from holster_catalog.tmdb import TMDBClient
 
 
 def raw_movie(tmdb_id: int) -> dict[str, Any]:

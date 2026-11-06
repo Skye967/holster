@@ -26,10 +26,19 @@ from langchain_core.tracers.context import collect_runs
 from langsmith.utils import tracing_is_enabled
 from pydantic import ValidationError
 
-import catalog_tool
 import chat
-import tmdb
-from catalog_tool import (
+from chat import (
+    _RELAXED_LABELS,
+    MAX_HISTORY_TURNS,
+    ChatRequest,
+    HistoryTurn,
+    _nothing_found_message,
+    _relaxed_note,
+    _title_not_found_message,
+    stream_chat,
+)
+from holster_catalog import catalog_tool, tmdb
+from holster_catalog.catalog_tool import (
     _OUTCOME_SYSTEM_PROMPT,
     _RANK_SYSTEM_PROMPT,
     PROVIDERS_HEADER,
@@ -48,19 +57,8 @@ from catalog_tool import (
     catalog_agent,
     google_composer,
 )
-from chat import (
-    _RELAXED_LABELS,
-    MAX_HISTORY_TURNS,
-    ChatRequest,
-    HistoryTurn,
-    _nothing_found_message,
-    _relaxed_note,
-    _title_not_found_message,
-    stream_chat,
-)
-from testutil import (
+from holster_catalog.testing import (
     COMPOSED_TEXT,
-    GATEWAY_MAX_HISTORY_EXCHANGES,
     MOVIE_A,
     FailingChatModel,
     FakeTMDB,
@@ -77,7 +75,11 @@ from testutil import (
     scripted,
     search_call,
 )
-from tmdb import TMDBClient
+from holster_catalog.tmdb import TMDBClient
+
+# gateway's constant, hand-copied -- the two services share no code.
+# Nothing enforces the copy: update it by hand when chat.go changes.
+GATEWAY_MAX_HISTORY_EXCHANGES = 5
 
 _TODAY = date(2026, 10, 20)
 

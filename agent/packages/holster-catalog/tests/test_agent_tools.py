@@ -11,14 +11,14 @@ import pytest
 from langchain_core.messages import AIMessage
 from pydantic import BaseModel, ValidationError
 
-from catalog_tool import (
+from holster_catalog.catalog_tool import (
     LookUpArgs,
     RankResult,
     answer,
     look_up_title,
     search_catalog,
 )
-from testutil import ScriptedChatModel
+from holster_catalog.testing import ScriptedChatModel
 
 TOOLS = [search_catalog, look_up_title, answer]
 

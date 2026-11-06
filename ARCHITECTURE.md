@@ -62,8 +62,9 @@ history reaches both calls, carrying the titles each turn showed and the assista
 earlier replies, and the first can act on it. History is text only, never a turn's tool
 results, so an earlier turn's overviews do not come back. There the fixed menu above is
 the bound: history can choose which declared tool runs and with what arguments or reply
-text, never where a request goes. `TwoCallTurn` in `agent/catalog_tool.py` enforces the
-bound and the first-call-only rule; `agent/README.md` *Catalog tool* walks each call.
+text, never where a request goes. `TwoCallTurn` in `holster_catalog/catalog_tool.py`
+enforces the bound and the first-call-only rule; `agent/README.md` *Catalog tool* walks
+each call.
 
 ## Trust boundaries
 

@@ -120,7 +120,8 @@ jobs:
       UV_LOCKED: 1
     steps:
       - uses: actions/checkout@v7
-      # Bump together with agent/Dockerfile's uv image and agent/README.md.
+      # Bump together with the catalog job, agent/Dockerfile's uv image,
+      # agent/README.md and uv_build in holster-catalog's pyproject.toml.
       - uses: astral-sh/setup-uv@v10.1.0
         with:
           version: 0.13.7
@@ -131,9 +132,34 @@ jobs:
       - name: ruff format
         run: uv run ruff format --check .
       - name: mypy
-        run: uv run mypy .
+        run: uv run mypy main.py chat.py tests
       - name: pytest
         run: uv run pytest
+
+  # The library alone: fastapi, uvicorn and the Google provider are not installed,
+  # so a stray import of one fails here.
+  catalog:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent/packages/holster-catalog
+    env:
+      UV_LOCKED: 1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: 0.13.7
+      - name: uv sync
+        run: uv sync --package holster-catalog
+      - name: ruff check
+        run: uv run --package holster-catalog ruff check .
+      - name: ruff format
+        run: uv run --package holster-catalog ruff format --check .
+      - name: mypy
+        run: uv run --package holster-catalog mypy src tests
+      - name: pytest
+        run: uv run --package holster-catalog pytest
 
   web:
     runs-on: ubuntu-latest

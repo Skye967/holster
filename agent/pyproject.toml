@@ -1,14 +1,12 @@
 [project]
 name = "holster-agent"
 version = "0.1.0"
-description = "Holster agent — LangChain orchestration and TMDB catalog tools"
+description = "Holster agent — the FastAPI service over holster-catalog"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115",
+    "holster-catalog",
     "uvicorn[standard]>=0.34",
-    # The TMDB client, and Starlette's TestClient. A runtime dep since the
-    # container runs `uv sync --no-dev`.
-    "httpx2>=2.12.0",
     "langchain>=1.4",
     # Not imported: init_chat_model loads it from the "google_genai:" prefix.
     "langchain-google-genai>=4.4.0",
@@ -16,6 +14,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    # Starlette's TestClient, and the transport test_chat.py builds.
+    "httpx2>=2.12.0",
     "mypy>=1.14",
     "pytest>=8.3",
     "ruff>=0.9",
@@ -25,8 +25,17 @@ dev = [
 [tool.uv]
 package = false
 
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+holster-catalog = { workspace = true }
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["holster_catalog"]
 
 # FastAPI's Depends(...) as a parameter default is the framework's own
 # idiom, not the mutable-default footgun B008 exists to catch.
@@ -37,4 +46,7 @@ extend-immutable-calls = ["fastapi.Depends"]
 strict = true
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests", "packages/holster-catalog/tests"]
+addopts = "--import-mode=importlib"
+# importlib mode leaves sys.path alone, and main.py and chat.py are not installed.
+pythonpath = ["."]

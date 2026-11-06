@@ -337,7 +337,7 @@ func TestVerdictRoutesRequireAuth(t *testing.T) {
 
 // TestVerdictJSONTagsAreTheCrossServiceContract pins the wire names, which
 // three things decode independently: web/src/lib/verdicts.ts's VerdictEntry,
-// the agent's TitleVerdict (agent/catalog_tool.py), and this package's own
+// the agent's TitleVerdict (holster_catalog/catalog_tool.py), and this package's own
 // round trip. Every other test here decodes back into Verdict, so it would
 // stay green through a rename — and so would the agent's Python-side test,
 // which hardcodes these same strings without ever seeing Go. Renaming a tag
@@ -356,7 +356,7 @@ func TestVerdictJSONTagsAreTheCrossServiceContract(t *testing.T) {
 
 	// The values are as much of the contract as the field names. The agent
 	// decides what to exclude with a bare string compare against
-	// "want_to_watch" (agent/catalog_tool.py's find_candidates()), so renaming that
+	// "want_to_watch" (holster_catalog/catalog_tool.py's find_candidates()), so renaming that
 	// value here for the browser's sake would silently invert the meaning of
 	// every bookmarked title — they would start being excluded from
 	// recommendations instead of staying eligible — with the Go, Python and

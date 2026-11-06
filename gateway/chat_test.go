@@ -3018,9 +3018,9 @@ func TestTheAgentDoesNotSilentlyRetruncateOurHistoryWindow(t *testing.T) {
 // query that still has rows. Guarding the numbers against each other because
 // they live in different services and nothing else ties them together.
 func TestAGuestsShownSetStaysInsideTheAgentsPagingReach(t *testing.T) {
-	// agent/catalog_tool.py's MAX_DISCOVER_PAGES times tmdb.py's PAGE_SIZE.
+	// holster_catalog/catalog_tool.py's MAX_DISCOVER_PAGES times tmdb.py's PAGE_SIZE.
 	const agentPagingReach = 25 * 20
-	// agent/catalog_tool.py's RESULT_CEILING: the most one turn can show.
+	// holster_catalog/catalog_tool.py's RESULT_CEILING: the most one turn can show.
 	const agentResultCeiling = 10
 	shown := defaultGuestTurnCap * agentResultCeiling
 	if shown+agentResultCeiling > agentPagingReach {

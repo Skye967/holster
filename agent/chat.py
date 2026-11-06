@@ -75,7 +75,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from catalog_tool import (
+from holster_catalog.catalog_tool import (
     CatalogAgent,
     CatalogToolError,
     Composer,
@@ -87,7 +87,7 @@ from catalog_tool import (
     compose,
     finish_search,
 )
-from tmdb import TMDBClient, TMDBUnavailable
+from holster_catalog.tmdb import TMDBClient, TMDBUnavailable
 
 logger = logging.getLogger("holster.chat")
 

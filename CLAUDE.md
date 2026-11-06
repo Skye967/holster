@@ -91,8 +91,8 @@ survivable.
   act on it; there the declared list is the bound. History is text only — each turn's
   words, never its tool results — so an earlier turn's overviews never reach that
   choice. `HistoryTurn` in `agent/chat.py` and `historyTurn` in `gateway/chat.go` hold
-  that shape. `TwoCallTurn` in `agent/catalog_tool.py` enforces the two-call bound and
-  the first-call-only rule; `MODEL_CALLS_PER_TURN` sets the limit.
+  that shape. `TwoCallTurn` in `holster_catalog/catalog_tool.py` enforces the two-call
+  bound and the first-call-only rule; `MODEL_CALLS_PER_TURN` sets the limit.
 - **The agent holds no credential belonging to a user or a third-party account.** It
   may hold app-level API keys — TMDB, the LLM provider — whose compromise costs a key
   rotation, not a user. If a change would give it a credential that reaches a user's
@@ -139,6 +139,7 @@ features: connection management, and one chat. Resist additions.
 | `web/` | Next.js, TypeScript, Tailwind, shadcn/ui, Clerk |
 | `gateway/` | Go |
 | `agent/` | Python, FastAPI, LangChain |
+| `agent/packages/holster-catalog/` | The agent's catalog library; `holster_catalog/` paths mean its `src/holster_catalog/` |
 | `db/` | Supabase (PostgreSQL) |
 
 **Package manager is `bun`.** Never run `npm`/`pnpm`/`yarn` in `web/` — it creates a

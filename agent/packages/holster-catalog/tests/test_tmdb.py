@@ -13,9 +13,9 @@ from unittest.mock import AsyncMock
 import httpx2
 import pytest
 
-import tmdb
-from testutil import FakeTMDB
-from tmdb import (
+from holster_catalog import tmdb
+from holster_catalog.testing import FakeTMDB
+from holster_catalog.tmdb import (
     MIN_VOTE_COUNT,
     MIN_VOTE_COUNT_TOP_RATED,
     TMDBError,

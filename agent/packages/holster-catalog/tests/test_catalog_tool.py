@@ -19,9 +19,8 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import ValidationError
 
-import catalog_tool
-import tmdb
-from catalog_tool import (
+from holster_catalog import catalog_tool, tmdb
+from holster_catalog.catalog_tool import (
     _ANSWER_RULES,
     _INTERPRET_SYSTEM_PROMPT,
     _OUTCOME_SYSTEM_PROMPT,
@@ -61,7 +60,7 @@ from catalog_tool import (
     google_composer,
     lookup_title,
 )
-from testutil import (
+from holster_catalog.testing import (
     COMPOSED_TEXT,
     MOVIE_A,
     FakeTMDB,
@@ -72,7 +71,7 @@ from testutil import (
     raw_named,
     scripted,
 )
-from tmdb import PAGE_SIZE, Title, TMDBClient, TMDBUnavailable
+from holster_catalog.tmdb import PAGE_SIZE, Title, TMDBClient, TMDBUnavailable
 
 
 def run[T](coro: Coroutine[Any, Any, T]) -> T:

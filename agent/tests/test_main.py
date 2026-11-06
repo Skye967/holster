@@ -8,7 +8,15 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from catalog_tool import catalog_agent
+from holster_catalog.catalog_tool import catalog_agent
+from holster_catalog.testing import (
+    MOVIE_A,
+    FakeTMDB,
+    ok_compose,
+    rank_reply,
+    scripted,
+    search_call,
+)
 from main import (
     CORRELATION_ID_HEADER,
     CorrelationIdMiddleware,
@@ -19,7 +27,6 @@ from main import (
     get_tmdb_client,
     lifespan,
 )
-from testutil import MOVIE_A, FakeTMDB, ok_compose, rank_reply, scripted, search_call
 
 client = TestClient(asgi_app)
 
