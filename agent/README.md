@@ -53,6 +53,12 @@ curl -s localhost:8000/health                        # {"status": "ok"}
 
 uv 0.13.7 is the version `Dockerfile` and CI pin.
 
+`agent/` is a uv workspace with one lockfile and one `.venv`. The service is `main.py`
+and `chat.py` at its root, run and never built; the catalog core is the
+[`holster-catalog`](packages/holster-catalog/README.md) library under `packages/`, which
+`uv sync` installs as an editable dependency and the image installs as a package. This
+file's `tmdb.py` and `catalog_tool.py` are in its `src/holster_catalog/`.
+
 The container runs `python main.py`, which configures logging and serves; the uvicorn
 CLI above is the same thing with reload for local work.
 
@@ -341,13 +347,25 @@ out the first results entirely. The `genres` field's own description carries a s
 ## Tests
 
 ```sh
-uv run pytest
-uv run ruff check . && uv run ruff format --check . && uv run mypy .
+uv run pytest                                                       # both packages
+uv run ruff check . && uv run ruff format --check .
+uv run mypy main.py chat.py tests
+(cd packages/holster-catalog && uv run mypy src tests)
 ```
 
-The suite runs offline: `test_tmdb.py` against a mock transport, `test_catalog_tool.py`
-against that plus plain async functions in place of the two model calls, and
-`test_chat.py`, `test_main.py` and `test_agent_tools.py` against the real agent driven by
-`testutil.ScriptedChatModel`, a chat model that answers each call with the next scripted
-message and records what each call was sent. Nothing here calls TMDB or the model —
-prompt behaviour is checked by running the app, not by asserting on a model's output.
+Mypy runs once per package, because each has a `conftest.py` and one strict run cannot
+own two modules of that name. `uv run` leaves extra packages installed and the workspace
+shares one `.venv`, so a local run does not prove the library stands
+alone. CI's `catalog` job does, from a `uv sync --package holster-catalog` of its own.
+Run locally, that command leaves the library and its dependencies in `.venv` and removes
+the service's; a `uv sync` at this root restores them.
+
+The suite runs offline. The library's tests are in `packages/holster-catalog/tests/`:
+`test_tmdb.py` against a mock transport, `test_catalog_tool.py` against that plus plain
+async functions in place of the two model calls, and `test_agent_tools.py` against the
+real agent. The service's are in `tests/`: `test_chat.py` and `test_main.py`, also
+against the real agent. The agent is driven by
+`holster_catalog.testing.ScriptedChatModel`, a chat model that answers each call with
+the next scripted message and records what each call was sent. Nothing here calls TMDB
+or the model — prompt behaviour is checked by running the app, not by asserting on a
+model's output.

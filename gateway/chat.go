@@ -486,7 +486,7 @@ type turnRecord struct {
 //
 // Five, not two, because the interpret prompt carries a follow-up's parameters
 // forward out of this history ("show me more" repeats the previous request —
-// agent/catalog_tool.py's _INTERPRET_SYSTEM_PROMPT). At two, the original
+// holster_catalog/catalog_tool.py's _INTERPRET_SYSTEM_PROMPT). At two, the original
 // request fell out of the window on the third exchange and "show me more"
 // became "show me anything".
 const maxHistoryExchanges = 5
@@ -662,7 +662,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 	// Uncapped, unlike guestHistory: re-offering a title is the bug this set
 	// exists to prevent, so nothing in it may age out. What bounds it is
 	// h.guestTurnCap — that many turns of at most ten cards each
-	// (agent/catalog_tool.py's RESULT_CEILING).
+	// (holster_catalog/catalog_tool.py's RESULT_CEILING).
 	var shownRefs []agentTitleRef
 	// The one place a finished turn is handled, so the guest branch can't be
 	// missed at any of the three sites below: an account persists via
@@ -1606,7 +1606,7 @@ type agentChatRequest struct {
 	// which is what lets that answer cost no model call of its own.
 	WatchProviderNames []string      `json:"watch_provider_names,omitempty"`
 	History            []historyTurn `json:"history,omitempty"`
-	// The caller's whole verdict set; agent/catalog_tool.py's find_candidates()
+	// The caller's whole verdict set; holster_catalog/catalog_tool.py's find_candidates()
 	// decides what each value means.
 	Verdicts []Verdict `json:"verdicts,omitempty"`
 	// Everything already put on screen for this conversation, so
@@ -1619,7 +1619,7 @@ type agentChatRequest struct {
 	Shown []agentTitleRef `json:"shown,omitempty"`
 }
 
-// agentIntent mirrors the agent's "intent" event — see agent/catalog_tool.py's
+// agentIntent mirrors the agent's "intent" event — see holster_catalog/catalog_tool.py's
 // search_catalog and look_up_title. A search sends
 // SearchArgs.model_dump(exclude_none=True) without reply; a lookup sends
 // {"title": ...} alone. Pointers on the fields Pydantic can leave unset.
@@ -1725,7 +1725,7 @@ type agentEvent struct {
 	// what the turn did rather than what its intent looked like.
 	// interpretingLine cannot use it and reads intent.Title instead: the
 	// interpreting line is built from the "intent" event, which the tool
-	// writes before any result exists (agent/catalog_tool.py's _narrate).
+	// writes before any result exists (holster_catalog/catalog_tool.py's _narrate).
 	Kind    string          `json:"kind,omitempty"`
 	Intent  json.RawMessage `json:"intent,omitempty"`
 	Picks   []agentPick     `json:"picks,omitempty"`

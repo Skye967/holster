@@ -10,9 +10,14 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
-# Resolve against the lockfile only, so this layer caches until it changes.
+# Dependencies only, so this layer caches until a manifest or the lockfile changes.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+COPY packages/holster-catalog/pyproject.toml packages/holster-catalog/
+RUN uv sync --frozen --no-dev --no-install-workspace
+
+# Installed, not linked: the runtime image carries the library in the venv alone.
+COPY packages packages
+RUN uv sync --frozen --no-dev --no-editable
 
 FROM python:3.13-slim
 
@@ -22,7 +27,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
-COPY . .
+COPY *.py ./
 
 # nobody: the process listens on 8000 and writes nothing, so it never needs root.
 USER 65534:65534

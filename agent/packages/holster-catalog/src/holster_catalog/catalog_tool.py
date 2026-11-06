@@ -89,7 +89,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
-from tmdb import (
+from holster_catalog.tmdb import (
     MIN_VOTE_COUNT,
     MOVIE_GENRES,
     PAGE_SIZE,
@@ -1668,8 +1668,6 @@ async def finish_search(
 # ---------------------------------------------------------------------------
 # LangChain wiring — the only part of this module that knows LangChain exists.
 # ---------------------------------------------------------------------------
-
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 # Given to the model so genres/without_genres land on names tmdb.py's frozen
 # tables actually recognize — the two tables use different vocabularies

@@ -25,8 +25,8 @@ from fastapi.responses import StreamingResponse
 from langchain.chat_models import init_chat_model
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from catalog_tool import (
-    DEFAULT_MODEL,
+from chat import ChatRequest, stream_chat
+from holster_catalog.catalog_tool import (
     CatalogAgent,
     Composer,
     TitlesRequest,
@@ -34,12 +34,12 @@ from catalog_tool import (
     enrich_watchlist,
     google_composer,
 )
-from chat import ChatRequest, stream_chat
-from tmdb import RegionProvider, TMDBClient
+from holster_catalog.tmdb import RegionProvider, TMDBClient
 
 # Lower-case because the ASGI server lower-cases header names in scope, so the
 # byte-exact lookup in CorrelationIdMiddleware matches a sender's X-Correlation-ID.
 CORRELATION_ID_HEADER = "x-correlation-id"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 # Set per request by CorrelationIdMiddleware, read by JsonFormatter so every line
 # emitted while handling a request carries the same id.

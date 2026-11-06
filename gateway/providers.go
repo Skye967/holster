@@ -22,7 +22,7 @@ import (
 // stay open — so this plain JSON call bounds itself instead, the same pattern
 // provisionTimeout uses for the upsertUser path.
 //
-// 15s, not the ~20s the agent can spend sleeping (agent/tmdb.py retries twice,
+// 15s, not the ~20s the agent can spend sleeping (holster_catalog/tmdb.py retries twice,
 // each wait capped at MAX_RETRY_WAIT; the movie and tv calls run concurrently,
 // so it's 20s not 40s): it covers one such wait without making every
 // /connections load block that long. The rarer double wait times out here and
@@ -42,7 +42,7 @@ const providerCacheTTL = 24 * time.Hour
 //
 // LogoURL holds a full image URL, not the raw logo_path that
 // 20260831230634_streaming.sql's comment describes: that comment is the stale
-// one — agent/tmdb.py pre-builds the URL via _image_url(). jsonb enforces no key
+// one — holster_catalog/tmdb.py pre-builds the URL via _image_url(). jsonb enforces no key
 // schema, so the two can disagree and only the comment is wrong: correct it
 // there, never by editing an applied migration or renaming the key here.
 type Provider struct {

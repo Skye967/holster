@@ -60,7 +60,7 @@ func loadWatchlistItems(db *pgxpool.Pool) func(ctx context.Context, userID strin
 	}
 }
 
-// agentTitleRef/agentTitlesRequest mirror agent/catalog_tool.py's
+// agentTitleRef/agentTitlesRequest mirror holster_catalog/catalog_tool.py's
 // TitleRef/TitlesRequest — the POST /titles request body.
 type agentTitleRef struct {
 	TMDBID    int    `json:"tmdb_id"`

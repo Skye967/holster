@@ -30,7 +30,7 @@ var (
 // agent with each message (chat.go's runTurn fills agentChatRequest.Verdicts
 // straight from loadVerdicts below; deliberately not via chatContext — see
 // that type's comment). One type rather than two: same table, same three
-// columns, and the agent's TitleVerdict (agent/catalog_tool.py) decodes
+// columns, and the agent's TitleVerdict (holster_catalog/catalog_tool.py) decodes
 // these exact JSON names.
 type Verdict struct {
 	TMDBID    int    `json:"tmdb_id"`
@@ -215,7 +215,7 @@ type setVerdictBody struct {
 // given verdict (body: {"verdict": "..."}); DELETE clears it, but only when
 // it still matches the caller's required ?expect=<verdict> — both idempotent,
 // mirroring setSubscription (providers.go). mediaType comes first in the path
-// to match TMDB's own convention (agent/tmdb.py's /{media_type}/{id} calls),
+// to match TMDB's own convention (holster_catalog/tmdb.py's /{media_type}/{id} calls),
 // not the primary key's column order.
 //
 // ?expect is required on DELETE, not optional: every real caller
