@@ -1,8 +1,8 @@
 """Chat pipeline — turns one message into a stream of NDJSON events.
 
-Runs catalog_tool's agent and passes on what its tools write as they start
-(the opener and the intent, streamed as LangChain "custom" events) the moment
-each arrives, then answers from the agent's final state. That is what lets an
+Runs the catalog graph and passes on what its interpret node writes (the opener
+and the intent, streamed as LangGraph "custom" events) the moment each arrives,
+then answers from the graph's final state. That is what lets an
 "intent" event reach the caller in ~1-2s while the full turn (a deep search is
 several TMDB round trips, plus the rank call) is still running.
 
@@ -25,7 +25,7 @@ Event shapes on the wire (one JSON object per line):
            catalog_tool.py's _merge_enrichment. watch_link is the region's
            watch page, None on that same failure or when TMDB gave no usable
            one
-        -- kind is which tool answered the turn, read from the agent's
+        -- kind is which node answered the turn, read from the graph's
            state rather than inferred from intent fields; the gateway
            writes it into stored history (chat.go's summarizePicks)
         -- note is the one-line explanation of a widened search, empty
@@ -53,14 +53,18 @@ templates it from these — see chat.go's outboundEvent for the vocabulary the
 browser actually sees. Nothing here assumes anything about WebSockets; this
 module has no transport opinion beyond "an async stream of dicts."
 
-Cancellation is plain asyncio cancellation, nothing bespoke: the caller
-(main.py's StreamingResponse) closes this generator when the client
-disconnects, and closing it closes the agent's stream, which cancels the step
-in flight — so an in-flight TMDB or model call unwinds the same way any
-cancelled asyncio call does. contextlib.aclosing is what makes that happen
-before the close returns rather than whenever the stream is finalized. See
-ARCHITECTURE.md's "One socket per session" for why the agent needs no cancel
-protocol of its own.
+Cancellation is plain asyncio cancellation, nothing bespoke, and it stops the
+turn rather than the graph step in flight. When the client disconnects, the
+caller (main.py's StreamingResponse) cancels the task this generator is running
+in: the response ends at once, no later step starts, and work awaited here,
+finish_search or a compose call, is cancelled. A graph step in flight is not.
+StreamingResponse's anyio task group redelivers the cancel until the task ends,
+and that lands on LangGraph's cleanup before it can cancel the step, so the
+step runs to its end under its own timeouts, TMDB calls it has yet to make
+included, and its result goes nowhere. contextlib.aclosing is what closes the
+graph's stream before a close at a yield here returns, rather than whenever the
+stream is finalized. See ARCHITECTURE.md's "One socket per session" for why the
+agent needs no cancel protocol of its own.
 """
 
 from __future__ import annotations
@@ -76,17 +80,15 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from holster_catalog.catalog_tool import (
-    CatalogAgent,
     CatalogToolError,
     Composer,
     OutcomeCause,
     TitleRef,
     TitleVerdict,
-    TurnContext,
-    TurnState,
     compose,
     finish_search,
 )
+from holster_catalog.graph import CatalogGraph, TurnContext, TurnState
 from holster_catalog.tmdb import TMDBClient, TMDBUnavailable
 
 logger = logging.getLogger("holster.chat")
@@ -183,9 +185,9 @@ class ChatRequest(BaseModel):
 
 
 def _turn_messages(message: str, history: list[HistoryTurn]) -> list[AnyMessage]:
-    """The agent's input: each recent turn as its own message, oldest first,
-    then the current message last. TwoCallTurn reads the last HumanMessage as
-    the current one and hands both calls the turns before it."""
+    """The graph's input: each recent turn as its own message, oldest first,
+    then the current message last. The interpret call is sent all of it; the
+    rank call rebuilds the last message and takes the turns before it."""
     turns: list[AnyMessage] = [
         HumanMessage(t.text) if t.role == "user" else AIMessage(t.text) for t in history
     ]
@@ -401,7 +403,7 @@ async def stream_chat(
     req: ChatRequest,
     *,
     client: TMDBClient,
-    agent: CatalogAgent,
+    agent: CatalogGraph,
     compose_model: Composer,
     correlation_id: str | None,
 ) -> AsyncGenerator[dict[str, Any]]:
@@ -433,7 +435,7 @@ async def stream_chat(
         verdicts=req.verdicts,
         shown=shown,
     )
-    # One config for every run the turn starts — the agent's and the outcome
+    # One config for every run the turn starts — the graph's and the outcome
     # composer's — so both carry the request's correlation id, the one this
     # service's log lines for it carry. LangSmith receives these runs only when
     # tracing is switched on; see README.md.
@@ -442,7 +444,7 @@ async def stream_chat(
     )
 
     try:
-        # "custom" is what the tools write as they start — the opener and the
+        # "custom" is what the interpret node writes — the opener and the
         # intent — passed through as they arrive. "values" is the whole state
         # after each step; the last one is the turn's result.
         state: TurnState | None = None
@@ -469,7 +471,7 @@ async def stream_chat(
         # pick list means an empty candidate list, since finish_search()'s
         # top-up otherwise fills the list to `floor`, which
         # min(RESULT_FLOOR, limit) and SearchArgs.limit's `ge=1` hold at one
-        # or more, and TwoCallTurn skips the rank call on no candidates.
+        # or more, and the graph skips the rank call on no candidates.
         if state is not None and "answer_kind" in state:
             # The model's own answer, written with the caller's services in
             # its system prompt (catalog_tool's _interpret_system_message) — no
@@ -505,7 +507,7 @@ async def stream_chat(
         elif state is not None and "found" in state:
             result = await finish_search(
                 state["found"],
-                state.get("structured_response"),
+                state.get("ranked"),
                 client=client,
                 watch_region=req.watch_region,
                 watch_providers=req.watch_providers,
@@ -540,10 +542,10 @@ async def stream_chat(
                     "text": _nothing_found_message("nothing_matched", []),
                 }
         else:
-            # Unreachable by construction — TwoCallTurn ends every turn with
-            # exactly one tool run. Total anyway: a turn that emitted only
-            # "done" would leave the gateway nothing to persist and the user a
-            # blank answer.
+            # Unreachable by construction — every path through the graph
+            # passes through search, lookup or answer. Total anyway: a turn that
+            # emitted only "done" would leave the gateway nothing to persist and
+            # the user a blank answer.
             yield {
                 "type": "message",
                 "text": _nothing_found_message("nothing_matched", []),
@@ -554,7 +556,7 @@ async def stream_chat(
         # and a closed stream (GeneratorExit) must propagate, not be reported
         # as an error.
         #
-        # Spans the whole body, not just the agent: the outcome branch awaits
+        # Spans the whole body, not just the graph: the outcome branch awaits
         # a model call of its own, and an exception escaping it would
         # otherwise end the turn with no event at all, which the gateway would
         # see as a stream that stopped rather than an error frame.

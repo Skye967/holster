@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from holster_catalog.catalog_tool import catalog_agent
+from holster_catalog.graph import build_turn
 from holster_catalog.testing import (
     MOVIE_A,
     FakeTMDB,
@@ -81,7 +81,7 @@ def test_chat_streams_ndjson_events() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
 
-    agent = catalog_agent(scripted(search_call(keywords=["heist"]), rank_reply(101)))
+    agent = build_turn(scripted(search_call(keywords=["heist"]), rank_reply(101)))
 
     app.dependency_overrides[get_tmdb_client] = fake_tmdb.client
     app.dependency_overrides[get_agent] = lambda: agent
@@ -104,7 +104,7 @@ def test_chat_requires_a_message() -> None:
     # on a request this test expects to fail on the body — see main.py's
     # get_tmdb_client/get_agent/get_compose_model.
     app.dependency_overrides[get_tmdb_client] = FakeTMDB().client
-    app.dependency_overrides[get_agent] = lambda: catalog_agent(scripted())
+    app.dependency_overrides[get_agent] = lambda: build_turn(scripted())
     app.dependency_overrides[get_compose_model] = lambda: _must_not_be_called
 
     resp = client.post("/chat", json={"watch_region": "US", "watch_providers": [8]})
