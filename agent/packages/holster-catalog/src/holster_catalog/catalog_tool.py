@@ -1,12 +1,12 @@
 """Catalog tool — turns a message into ranked, real TMDB titles.
 
-A LangChain agent bounded to two model calls around one deterministic TMDB
-step (TwoCallTurn holds the bound):
+Two model calls around one deterministic TMDB step, which graph.py runs as a
+LangGraph graph whose edges hold the bound:
 
     interpret call   message     -> one tool call   (search_catalog's
                                                      arguments: what to
                                                      search for)
-    search_catalog   find_candidates() -> list[Title]  (TMDB applies every
+    search node      SearchArgs  -> Candidates      (TMDB applies every
                                                      hard constraint: service,
                                                      region, runtime, year,
                                                      genre, exclusions)
@@ -23,7 +23,7 @@ soft constraints; see find_candidates().)
 
 A message naming a film or show takes a shorter path — the interpret call
 picks look_up_title, which answers with the titles carrying that name rather
-than a discover() query, one model call instead of two (see lookup_title()).
+than a discover() query, with no rank call (see lookup_title()).
 A question about the assistant, one asked back, film talk that wants no
 search, or an off-topic message is the answer tool: one call, no TMDB.
 
@@ -42,7 +42,7 @@ TMDB row fetched by id. finish_search()'s id-validation doesn't apply on that
 path since no rank call runs there; lookup_title() only ever enriches rows
 TMDB returned.
 
-watch_region and watch_providers reach the tools through TurnContext, never
+watch_region and watch_providers reach the nodes through TurnContext, never
 as arguments the model can set, so which services results come from is never
 the model's choice. What it can choose is whether the turn asks about
 subscriptions or about rentals (SearchArgs.monetization). A subscription query
@@ -52,9 +52,10 @@ what "where can I rent this" asks. What a card claims about streaming is cut
 to that list either way, by _merge_enrichment, whichever query produced the
 row.
 
-LangChain lives at the bottom of this file — the agent, its tools, the
-TwoCallTurn middleware and the composer's model binding. Everything above it
-is plain TMDB and Python, tested without a model.
+LangChain lives at the bottom of this file — the prompts and the composer's
+model binding — and in graph.py. Everything above it is plain TMDB and Python,
+tested without a model. The one LangChain type up there is the RunnableConfig
+compose() passes on unread.
 """
 
 from __future__ import annotations
@@ -67,27 +68,13 @@ import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Literal, NotRequired, cast
+from typing import Any, Literal, cast
 
-from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
-from langchain.agents.middleware.types import InputAgentState, OutputAgentState
-from langchain.agents.structured_output import ProviderStrategy
-from langchain.tools import ToolRuntime, tool
-from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolCall,
-    ToolMessage,
-)
+from langchain_core.messages import SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import Command
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from holster_catalog.tmdb import (
     MIN_VOTE_COUNT,
@@ -116,13 +103,19 @@ logger = logging.getLogger("holster.catalog_tool")
 LIMIT_MAX = 20
 
 
+# search_catalog's arguments and find_candidates()' input — tmdb.discover()'s
+# creative parameters, none of its identity parameters, plus limit, which sizes
+# the pick list, and reply, what the assistant says while the search runs.
+# watch_region and watch_providers are deliberately absent: which services a
+# query filters on is never the model's to set. The search node reads them from
+# TurnContext, which no tool schema shows.
 class SearchArgs(BaseModel):
-    """search_catalog's arguments and find_candidates()' input —
-    tmdb.discover()'s creative parameters, none of its identity parameters,
-    plus limit, which sizes the pick list, and reply, what the assistant says
-    while the search runs. watch_region and watch_providers are deliberately
-    absent: which services a query filters on is never the model's to set. The
-    search tool reads them from TurnContext, which no tool schema shows."""
+    """Find films or shows to recommend from a description — a mood, a genre,
+    a person, a decade, or a title to compare to ('something like Heat'). Use
+    it for every request for titles that does not name one specific film or
+    show the user is asking about, including a blind 'surprise me'."""
+
+    model_config = ConfigDict(title="search_catalog")
 
     media_type: MediaType = Field(description="'movie' for films, 'tv' for series.")
     keywords: list[str] = Field(
@@ -242,8 +235,8 @@ class SearchArgs(BaseModel):
     # Defaulted, like every other free-text field here: a response this field
     # is missing from still carries a usable search, and failing the turn over
     # a one-line pleasantry trades a whole answer for a cosmetic one.
-    # _INTERPRET_SYSTEM_PROMPT asks for it instead, and search_catalog treats
-    # "" as "no opener".
+    # _INTERPRET_SYSTEM_PROMPT asks for it instead, and graph.py's _narrate
+    # treats "" as "no opener".
     reply: str = Field(
         default="",
         description=(
@@ -316,13 +309,13 @@ class RankResult(BaseModel):
 
 class CatalogToolError(Exception):
     """A model step of the turn failed: a network/API error talking to the
-    model, a response that didn't satisfy the structured-output schema, or a
-    call that broke TwoCallTurn's rule. Not transient in the sense that
-    retrying the exact same call is unlikely to help without a different
-    message.
+    model, a response that didn't satisfy the structured-output schema, or an
+    interpret call that did not pick exactly one declared tool with arguments
+    its schema accepts. Not transient in the sense that retrying the exact same
+    call is unlikely to help without a different message.
 
     tmdb.TMDBError/TMDBUnavailable are a different failure class (the TMDB
-    step) and propagate out of the agent unwrapped, same as calling
+    step) and propagate out of the graph unwrapped, same as calling
     tmdb.discover() directly would. A bare ValueError means the *caller*
     passed something invalid (e.g. a malformed watch_region) — a bug to fix,
     not a case to handle here.
@@ -462,20 +455,20 @@ async def compose(
 ) -> ComposedReply:
     """Write the sentence for a turn that found nothing to show.
 
-    Wraps any failure from ``model`` as CatalogToolError, the way TwoCallTurn
-    wraps the agent's own calls. ``except Exception``, not BaseException, so
+    Wraps any failure from ``model`` as CatalogToolError, the way graph.py's
+    _model_call wraps the graph's own calls. ``except Exception``, not BaseException, so
     the caller's own timeout still cancels this.
     """
     try:
         reply = await model(message, cause, detail, config)
     except Exception as exc:
         raise CatalogToolError(str(exc)) from exc
-    # Validated where the agent's calls are not. Their shape faults land
-    # inside stream_chat's own except and become an error frame, which is the
-    # right answer when the turn has no other; this turn already has its answer
-    # in the template beside it, so a fault here has to degrade to that instead.
-    # with_structured_output can hand back something else entirely, and the
-    # cast in google_composer is erased at runtime.
+    # Shape faults in the graph's calls land inside stream_chat's own except and
+    # become an error frame, which is the right answer when the turn has no
+    # other; this turn already has its answer in the template beside it, so a
+    # fault here has to degrade to that instead. with_structured_output can hand
+    # back something else entirely, and the cast in google_composer is erased at
+    # runtime.
     if not isinstance(reply, ComposedReply):
         raise CatalogToolError(f"composer returned {type(reply).__name__}")
     return reply
@@ -851,8 +844,8 @@ async def lookup_title(
     watch_region: str,
     watch_providers: list[int],
 ) -> list[dict[str, Any]]:
-    """Answer about a named film or show — the look_up_title tool's body,
-    taken instead of a search when the interpret call picks that tool.
+    """Answer about a named film or show — what the lookup node runs, instead
+    of a search, when the interpret call picks look_up_title.
 
     Selection is _matching_titles() for *which* rows carry the name, then one
     judgement here: of those, keep the ones prominent enough to believe.
@@ -895,9 +888,8 @@ async def lookup_title(
     web/src/lib/chat-socket.ts's AgentPick document `unavailable` as absent on
     every /chat pick.
 
-    No rank call runs: there is nothing to rank, so this path costs one model
-    call rather than two. Picks carry no blurb for the same reason — nothing
-    here is explaining a fit — and title-card.tsx already omits the line when
+    No rank call runs: there is nothing to rank. Picks carry no blurb either,
+    since nothing here is explaining a fit; title-card.tsx omits the line when
     it is empty.
 
     Returns [] when nothing carried the name, TMDB returning nothing at all
@@ -1143,7 +1135,7 @@ async def find_candidates(
 ) -> Candidates:
     """The deterministic TMDB step of a search: page the query, widen it
     below the floor, exclude what the user judged or was shown, and resolve
-    the taste hint. No model call; the search_catalog tool runs it.
+    the taste hint. No model call; the search node runs it.
 
     ``watch_region``/``watch_providers`` come only from the caller — the real
     user's subscriptions and country. ``watch_region`` reaches discover()
@@ -1503,7 +1495,7 @@ async def find_candidates(
 
     # This search's media type only — liked TV shows are no hint for "find me
     # a movie", and each costs a round trip. Guarded on candidates because
-    # TwoCallTurn skips the rank call on an empty list anyway.
+    # the graph skips the rank call on an empty list anyway.
     taste: list[str] = []
     if candidates:
         liked = [
@@ -1666,7 +1658,7 @@ async def finish_search(
 
 
 # ---------------------------------------------------------------------------
-# LangChain wiring — the only part of this module that knows LangChain exists.
+# The prompts, the rest of the declared tools and the composer's model binding.
 # ---------------------------------------------------------------------------
 
 # Given to the model so genres/without_genres land on names tmdb.py's frozen
@@ -1987,12 +1979,12 @@ def google_composer(model: BaseChatModel) -> Composer:
         # ensure_ascii=False where _format_candidates needs True: the prompt
         # asks for the detail quoted back exactly, and an escaped
         # "Am\u00e9lie" is not the name the user typed. The separators
-        # escaping would otherwise catch are gone before this runs — the tools
-        # pass the title through _one_line. The accepted cost is the other
-        # half of _format_candidates' reason: a lone surrogate, which the
-        # model's own JSON can carry, raises when the request body is encoded,
-        # which compose() turns into a CatalogToolError the turn answers from
-        # its template.
+        # escaping would otherwise catch are gone before this runs —
+        # LookUpArgs' validator passes the title through _one_line. The accepted
+        # cost is the other half of _format_candidates' reason: a lone surrogate,
+        # which the model's own JSON can carry, raises when the request body is
+        # encoded, which compose() turns into a CatalogToolError the turn answers
+        # from its template.
         result = await chain.ainvoke(
             {
                 "message": message,
@@ -2006,101 +1998,16 @@ def google_composer(model: BaseChatModel) -> Composer:
     return call
 
 
-@dataclass
-class TurnContext:
-    """What the tools and TwoCallTurn read from the run rather than from the
-    model: the caller's own TMDB client, country, ticked services and their
-    names, verdicts and shown titles. A ToolRuntime parameter is left out of a
-    tool's schema, so none of these is a field the model can fill."""
-
-    client: TMDBClient
-    watch_region: str
-    # Never empty: chat.py answers a caller with no ticked services before the
-    # agent runs, and discover() raises on an empty list.
-    watch_providers: list[int]
-    # Read by the interpret call alone, never the rank call — see
-    # _interpret_system_message.
-    watch_provider_names: list[str]
-    verdicts: list[TitleVerdict]
-    shown: list[TitleRef]
-
-
-class TurnState(AgentState[RankResult]):
-    """The agent's state, plus what each tool found, typed for chat.py to
-    read. At most one tool runs a turn, so at most one group is set.
-
-    A history turn in `messages` is text only, never a replayed tool call:
-    chat.py's HistoryTurn has no tool fields. Giving it some would let an
-    earlier turn's tool results, TMDB overviews included, reach the
-    interpret call, which picks the action."""
-
-    # search_catalog
-    found: NotRequired[Candidates]
-    # look_up_title: the enriched rows, and the name asked about, which the
-    # composer quotes back when nothing carries it.
-    lookup_picks: NotRequired[list[dict[str, Any]]]
-    lookup_title: NotRequired[str]
-    # answer
-    answer_kind: NotRequired[AnswerKind]
-    answer_text: NotRequired[str]
-
-
-def _tool_result(
-    runtime: ToolRuntime[TurnContext], content: str, **fields: Any
-) -> Command[Any]:
-    """Write `fields` onto TurnState beside the tool message every tool call
-    must answer with."""
-    message = ToolMessage(content, tool_call_id=runtime.tool_call_id)
-    return Command(update={"messages": [message], **fields})
-
-
-def _narrate(
-    runtime: ToolRuntime[TurnContext], reply: str, intent: dict[str, Any]
-) -> None:
-    """The opener, then the intent the gateway templates its interpreting line
-    from, both before any TMDB call. The opener goes first because it is prose
-    above the interpreting line and the gateway forwards in arrival order.
-    The opener is cut to one line, and skipped when blank rather than sent
-    empty — reply is defaulted, so a response can leave it out."""
-    reply = _one_line(reply)
-    if reply:
-        runtime.stream_writer({"type": "reply", "text": reply})
-    runtime.stream_writer({"type": "intent", "intent": intent})
-
-
-@tool(args_schema=SearchArgs)
-async def search_catalog(
-    runtime: ToolRuntime[TurnContext], **fields: Any
-) -> Command[Any]:
-    """Find films or shows to recommend from a description — a mood, a genre,
-    a person, a decade, or a title to compare to ('something like Heat'). Use
-    it for every request for titles that does not name one specific film or
-    show the user is asking about, including a blind 'surprise me'."""
-    # fields arrive already validated against SearchArgs, defaults filled in;
-    # rebuilding the model is what gives find_candidates() a typed argument.
-    args = SearchArgs(**fields)
-    # The intent event is SearchArgs by JSON name, which gateway/chat.go's
-    # agentIntent mirrors. reply leaves it because it has its own event.
-    _narrate(
-        runtime,
-        args.reply,
-        args.model_dump(exclude_none=True, exclude={"reply"}),
-    )
-    context = runtime.context
-    found = await find_candidates(
-        args,
-        client=context.client,
-        watch_region=context.watch_region,
-        watch_providers=context.watch_providers,
-        verdicts=context.verdicts,
-        shown=context.shown,
-    )
-    return _tool_result(runtime, _format_candidates(found.candidates), found=found)
-
-
-# LookUpArgs, AnswerArgs and the tool docstrings carry the routing rules
+# LookUpArgs, AnswerArgs and SearchArgs' docstring carry the routing rules
 # _INTERPRET_SYSTEM_PROMPT also states. A wording change belongs in both.
 class LookUpArgs(BaseModel):
+    """Look up one specific film or show the user asks about by name — 'is The
+    Matrix on Netflix', 'do you have Fargo' — and where it is streaming. Not
+    for a title named only as a comparison ('something like Heat'): that is a
+    search for other titles."""
+
+    model_config = ConfigDict(title="look_up_title")
+
     title: str = Field(
         description=(
             "The name of the one film or show the user is asking about — 'is "
@@ -2132,30 +2039,21 @@ class LookUpArgs(BaseModel):
         return value
 
 
-@tool(args_schema=LookUpArgs, return_direct=True)
-async def look_up_title(
-    runtime: ToolRuntime[TurnContext], title: str, reply: str = ""
-) -> Command[Any]:
-    """Look up one specific film or show the user asks about by name — 'is The
-    Matrix on Netflix', 'do you have Fargo' — and where it is streaming. Not
-    for a title named only as a comparison ('something like Heat'): that is a
-    search for other titles."""
-    # The gateway templates a lookup's interpreting line off title alone
-    # (gateway/chat.go's interpretingLine).
-    _narrate(runtime, reply, {"title": title})
-    context = runtime.context
-    picks = await lookup_title(
-        title,
-        client=context.client,
-        watch_region=context.watch_region,
-        watch_providers=context.watch_providers,
-    )
-    return _tool_result(
-        runtime, json.dumps(picks), lookup_picks=picks, lookup_title=title
-    )
-
-
 class AnswerArgs(BaseModel):
+    """Reply without searching: when the user asks about the assistant itself
+    ('what can you do', a bare 'help'); when nothing in the conversation says
+    what they want to watch yet — no genre, mood, person, decade, or title to
+    compare to; when they talk about film or TV without asking for something to
+    watch ('is Heat any good?'); or when the message is not about film or TV
+    at all. Never ask a clarifying question twice in a row: if the assistant's
+    last message asked what they want to watch, search on whatever the user
+    said next, however vague, unless it is not about film or TV at all, which
+    is off_topic. A chat reply or a decline that ends by offering to find
+    something has not asked, whatever its punctuation, so a second off-topic
+    message gets a second decline."""
+
+    model_config = ConfigDict(title="answer")
+
     text: str = Field(
         description=(
             "The whole reply, in the assistant's own words. For a capability "
@@ -2182,179 +2080,6 @@ class AnswerArgs(BaseModel):
     )
 
 
-@tool(args_schema=AnswerArgs, return_direct=True)
-async def answer(
-    runtime: ToolRuntime[TurnContext],
-    text: str,
-    kind: AnswerKind,
-) -> Command[Any]:
-    """Reply without searching: when the user asks about the assistant itself
-    ('what can you do', a bare 'help'); when nothing in the conversation says
-    what they want to watch yet — no genre, mood, person, decade, or title to
-    compare to; when they talk about film or TV without asking for something to
-    watch ('is Heat any good?'); or when the message is not about film or TV
-    at all. Never ask a clarifying question twice in a row: if the assistant's
-    last message asked what they want to watch, search on whatever the user
-    said next, however vague, unless it is not about film or TV at all, which
-    is off_topic. A chat reply or a decline that ends by offering to find
-    something has not asked, whatever its punctuation, so a second off-topic
-    message gets a second decline."""
-    # No intent event: this reply is the answer itself, and an interpreting
-    # line above it would announce a search that never runs. _one_line turns
-    # whitespace-only text into "", which chat.py answers with its
-    # capability template instead; a plain line break it flattens would
-    # render as a space in the web's <p> anyway.
-    text = _one_line(text)
-    return _tool_result(runtime, text, answer_kind=kind, answer_text=text)
-
-
-CATALOG_TOOLS = [search_catalog, look_up_title, answer]
-
-# Two because the step a third call would take — try again, looser — is what
-# find_candidates()'s ladder does without one, and a third would follow the
-# rank call's reading of the overviews (see TwoCallTurn). main.py gives the
-# agent's model a 15s timeout per attempt and one retry, so a single slow call
-# can already spend gateway/chat.go's 30s turnDeadline; and gateway/chat.go's
-# defaultGuestRateLimit is sized on a turn costing two calls of the free
-# tier's 15 requests a minute. Raising it takes a step the ladder cannot do, a
-# call that reads no third-party text, and room under turnDeadline and
-# defaultGuestRateLimit.
-MODEL_CALLS_PER_TURN = 2
-
-
-class TwoCallTurn(AgentMiddleware[TurnState, TurnContext, RankResult]):
-    """The two-call rule, in one place. Only the first call is offered tools
-    and there is no third, so nothing read within a turn after the user's
-    message — TMDB overviews included — can pick an action.
-
-    Call one is the interpret call: the interpret prompt, the three tools,
-    tool_choice="any", and no response format; a reply with anything but
-    exactly one tool call ends the turn. Call two is the rank call: the rank
-    prompt, no tools, and RankResult as the provider-native response format,
-    so its only answer is a ranking. look_up_title and answer are
-    return_direct, so those turns end at one call. A search that left no
-    candidates ends the agent without call two; chat.py composes that turn's
-    sentence outside the agent.
-
-    The call index is counted from the messages after the last HumanMessage
-    rather than kept on the instance, which every concurrent turn shares;
-    the messages before it are history. That holds only while nothing adds a
-    HumanMessage mid-turn: one would be read as the user's message, the calls
-    before it would stop counting, and the next could go out as an interpret
-    call, tools and all.
-    """
-
-    async def awrap_model_call(
-        self,
-        request: ModelRequest[TurnContext],
-        handler: Callable[
-            [ModelRequest[TurnContext]], Awaitable[ModelResponse[RankResult]]
-        ],
-    ) -> ModelResponse[RankResult] | AIMessage:
-        current = max(
-            i for i, m in enumerate(request.messages) if isinstance(m, HumanMessage)
-        )
-        history = request.messages[:current]
-        message = request.messages[current].text
-        made = sum(isinstance(m, AIMessage) for m in request.messages[current + 1 :])
-        if made >= MODEL_CALLS_PER_TURN:
-            raise CatalogToolError("model call budget spent")
-        if made == 0:
-            # chat.py's messages go through as sent, history included —
-            # unlike the rank call below, which rebuilds the current message.
-            names = request.runtime.context.watch_provider_names
-            response = await _model_call(
-                handler,
-                request.override(
-                    system_message=_interpret_system_message(names, today=date.today()),
-                    tool_choice="any",
-                    response_format=None,
-                ),
-            )
-            # Never the first of several: a message asking two things at once
-            # can draw two tool calls, and taking one would answer half of it.
-            if len(_tool_calls(response)) != 1:
-                raise CatalogToolError("interpret call did not pick exactly one tool")
-            return response
-        found = cast(TurnState, request.state)["found"]
-        if not found.candidates:
-            return AIMessage(content="")
-        response = await _model_call(
-            handler,
-            request.override(
-                system_message=SystemMessage(_RANK_SYSTEM_PROMPT),
-                messages=[*history, HumanMessage(_rank_content(message, found))],
-                tools=[],
-            ),
-        )
-        # Nothing in a provider-native binding stops a reply carrying a tool
-        # call, which would skip the parse and route to the tool node.
-        if _tool_calls(response):
-            raise CatalogToolError("rank call asked for a tool")
-        return response
-
-    async def awrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
-    ) -> ToolMessage | Command[Any]:
-        # The tool node answers an argument the schema rejected, or a tool that
-        # does not exist, with an error ToolMessage instead of raising. Without
-        # this check neither ends cleanly: look_up_title and answer are
-        # return_direct, so the graph ends on the error and chat.py's last
-        # branch answers _nothing_found_message("nothing_matched"); after
-        # search_catalog or an unknown tool, the agent's next model call takes
-        # the rank branch with no `found` set and fails as internal. Raising
-        # here ends both as a model failure. Any other exception a tool raises
-        # propagates unchanged.
-        result = await handler(request)
-        if isinstance(result, ToolMessage) and result.status == "error":
-            raise CatalogToolError(f"tool call rejected: {request.tool_call['name']}")
-        return result
-
-
-async def _model_call(
-    handler: Callable[
-        [ModelRequest[TurnContext]], Awaitable[ModelResponse[RankResult]]
-    ],
-    request: ModelRequest[TurnContext],
-) -> ModelResponse[RankResult]:
-    """Run the call, wrapping any failure — a network/API error, or a ranking
-    that doesn't satisfy RankResult's schema — as CatalogToolError, which
-    chat.py's _error_reason maps to model_unavailable. ``except Exception``,
-    not ``BaseException``, so a cancelled turn still propagates."""
-    try:
-        return await handler(request)
-    except Exception as exc:
-        raise CatalogToolError(str(exc)) from exc
-
-
-def _tool_calls(response: ModelResponse[RankResult]) -> list[ToolCall]:
-    message = response.result[-1]
-    return message.tool_calls if isinstance(message, AIMessage) else []
-
-
-CatalogAgent = CompiledStateGraph[
-    AgentState[RankResult],
-    TurnContext,
-    InputAgentState,
-    OutputAgentState[RankResult],
-]
-
-
-def catalog_agent(model: BaseChatModel) -> CatalogAgent:
-    """The turn's agent around ``model``. ProviderStrategy is named rather than
-    left to the library, which picks a strategy from the model's profile and
-    then its name — so the test fake, which declares no profile, and a
-    GOOGLE_MODEL the provider ships no profile for would otherwise run a
-    different path from production. Provider-native structured output is also
-    what fails a bad ranking at once, where the tool strategy's default retry
-    spends a call."""
-    return create_agent(
-        model,
-        tools=CATALOG_TOOLS,
-        response_format=ProviderStrategy(RankResult),
-        context_schema=TurnContext,
-        state_schema=TurnState,
-        middleware=[TwoCallTurn()],
-    )
+# Bound to a model as a class, a schema's title is the tool's name and its
+# docstring the tool's description.
+CATALOG_TOOLS: list[type[BaseModel]] = [SearchArgs, LookUpArgs, AnswerArgs]

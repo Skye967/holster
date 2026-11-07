@@ -57,7 +57,7 @@ uv 0.13.7 is the version `Dockerfile` and CI pin.
 and `chat.py` at its root, run and never built; the catalog core is the
 [`holster-catalog`](packages/holster-catalog/README.md) library under `packages/`, which
 `uv sync` installs as an editable dependency and the image installs as a package. This
-file's `tmdb.py` and `catalog_tool.py` are in its `src/holster_catalog/`.
+file's `tmdb.py`, `catalog_tool.py` and `graph.py` are in its `src/holster_catalog/`.
 
 The container runs `python main.py`, which configures logging and serves; the uvicorn
 CLI above is the same thing with reload for local work.
@@ -114,28 +114,29 @@ environment — the token is passed to `TMDBClient(...)`.
 
 ## Catalog tool
 
-`catalog_tool.py` puts a model in front of `tmdb.py`: a LangChain agent
-(`create_agent`) bounded to two model calls by one middleware class, `TwoCallTurn`. The
+`catalog_tool.py` puts a model in front of `tmdb.py`, and `graph.py` runs the turn: a
+LangGraph `StateGraph` with no cycle, whose edges allow two model calls at most. The
 first call — the interpret call — is offered three declared tools and must pick exactly
 one: `search_catalog`, `look_up_title`, or `answer`, for a capability, clarifying,
-chat or off-topic reply. The tool runs; a search then gets the second call — the rank call — with no tools
-and `RankResult` as its only answer. A lookup or an answer ends the turn at one call. A
-lookup answers with every title carrying that name — the film itself, and anything
-carrying it on, so "Star Wars" reaches the sequels too.
-The interpret call's system prompt carries today's date, the server's, so "this year"
-and "new" resolve against it rather than against the year the model believes it is.
-`search_catalog`'s arguments (`SearchArgs`) are `tmdb.discover()`'s creative
+chat or off-topic reply. Nothing executes a tool: the model fills that tool's schema
+and the graph routes on which one it filled. A search that found candidates then gets
+the second call — the rank call — with no tools and `RankResult` as its only answer. A
+lookup or an answer makes no rank call. A lookup answers with every title carrying that
+name — the film itself, and anything carrying it on, so "Star Wars" reaches the sequels
+too. The interpret call's system prompt carries today's date, the server's, so "this
+year" and "new" resolve against it rather than against the year the model believes it
+is. `search_catalog`'s arguments (`SearchArgs`) are `tmdb.discover()`'s creative
 parameters, with no `watch_region`/`watch_providers` field, so which services results
 come from is never the model's choice. What it can choose is whether the turn asks about
-subscriptions or about rentals (`monetization`). The tool calls `discover()` with
-those parameters plus the caller's real region, and the caller's real providers unless
-the message asked to rent — a rent turn has no provider list to filter on, and what a
-card claims about streaming is cut to the caller's subscriptions either way, when
-availability is merged in. The rank call has the
-model pick and explain the *real* candidates that came back — its output schema carries
-no title metadata, only a selected id and a blurb, so a manipulated overview can win a
-bad blurb at worst, never assert a fake title. The rank call says nothing about how
-many picks a turn shows; `finish_search()` owns the whole size band.
+subscriptions or about rentals (`monetization`). The search node runs
+`find_candidates()`, which calls `discover()` with those parameters plus the caller's
+real region, and the caller's real providers unless the message asked to rent — a rent
+turn has no provider list to filter on, and what a card claims about streaming is cut to
+the caller's subscriptions either way, when availability is merged in. The rank call has
+the model pick and explain the *real* candidates that came back — its output schema
+carries no title metadata, only a selected id and a blurb, so a manipulated overview can
+win a bad blurb at worst, never assert a fake title. The rank call says nothing about
+how many picks a turn shows; `finish_search()` owns the whole size band.
 A recommendation list aims for `RESULT_FLOOR`..`RESULT_CEILING` titles. Paging reads
 toward the ceiling until TMDB has no next page — a thin page usually means exclusion ate
 it, and the answer to that is more of what the user asked for, never a looser question.
@@ -183,30 +184,30 @@ in flight is cancelled rather than left to finish its own retries; page 1 sits o
 it, being the answer rather than the widening. What accumulated is then the reply —
 which makes it a real answer rather than a truncated one.
 That deterministic part — paging, the rungs, exclusion and the taste hint — is
-`find_candidates()`, which `search_catalog` runs and which takes no model.
+`find_candidates()`, which the search node runs and which takes no model.
 
-The caller's region, services, verdicts and shown titles reach a tool through its run
-context (`TurnContext`), which LangChain leaves out of the schema the model is sent — so
-no argument lets the model choose them. A `limit` past its schema bound is clamped to
-it, so "show me 25" asks for 20, and a runtime ceiling under a minute reads as no
-ceiling. An argument the clamp cannot fix ends the turn rather than going back to the
-model, which would be a third call. Each tool writes what it found onto the agent's
-state (`TurnState`) beside the text the model reads, and `chat.py` answers from that
-state.
+The caller's region, services, verdicts and shown titles reach the nodes through the
+run's context (`TurnContext`), which is in no schema the model is sent — so no argument
+lets the model choose them. A `limit` past its schema bound is clamped to it, so "show
+me 25" asks for 20, and a runtime ceiling under a minute reads as no ceiling. An
+argument the clamp cannot fix ends the turn rather than going back to the model, which
+would be another call. Each node writes what it found onto the graph's state
+(`TurnState`), and `chat.py` answers from that state.
 
-LangChain lives at the bottom of `catalog_tool.py` — the agent, its tools, `TwoCallTurn`
-and the composer's model binding; everything above it is plain TMDB and Python.
+LangChain lives in `graph.py` and at the bottom of `catalog_tool.py`, which holds the
+prompts and the composer's model binding. The rest of that file is plain TMDB and
+Python; its one LangChain type is the `RunnableConfig` that `compose()` passes on unread.
 
 ## Chat pipeline
 
-`chat.py`'s `stream_chat()` runs the catalog agent for `POST /chat`: a plain
+`chat.py`'s `stream_chat()` runs the catalog graph for `POST /chat`: a plain
 chunked HTTP response (`application/x-ndjson`), not a second WebSocket — the browser's
 socket belongs to the gateway alone (`../ARCHITECTURE.md`). Each line is one event:
 `reply` (the model's one-line opener, ahead of `intent` on a turn that searches or looks
-up), `intent` (as soon as the tool starts — well before the full turn finishes, written
-by the tool through LangChain's stream writer), `results` or `message` (candidates, or a plain reply
-when there are none — no subscriptions, nothing survived the relaxation ladder, or
-everything found was already rated),
+up), `intent` (as soon as the interpret call answers — well before the full turn
+finishes, written by the interpret node through LangGraph's stream writer), `results` or
+`message` (candidates, or a plain reply when there are none — no subscriptions, nothing
+survived the relaxation ladder, or everything found was already rated),
 `error` (one of a fixed, closed set of reason codes — never raw exception text), and
 `done`. `error` is terminal on its own; a turn ends with exactly one of `done` or
 `error`, never both.
@@ -214,9 +215,10 @@ everything found was already rated),
 This is the agent-internal protocol, not the browser-facing one — the gateway owns the
 public event vocabulary (`reply`/`interpreting`/`results`/`token`/`done`/`error`) and
 templates it from these. Cancellation is plain `asyncio` cancellation: the gateway
-aborting its HTTP call closes the response body, which stops `stream_chat()` iterating,
-which closes the agent's stream and cancels the step in flight — nothing bespoke on
-this side.
+aborting its HTTP call cancels the task running `stream_chat()`, which ends the response
+and starts no further step. A graph step already in flight is not cancelled; it runs
+until it finishes or hits its own timeout, and its result goes nowhere (`chat.py`'s
+module docstring has why). Nothing bespoke on this side.
 
 `history` in the request body is the last few exchanges only, windowed by the gateway
 from a `messages` table that persists the full conversation — this
@@ -281,16 +283,16 @@ a number as a limit. A blurb is exempt: only its title reaches history, in the g
 wants no search ("is Heat any good?"), and `off_topic` for a decline. The kind never
 leaves the agent: `chat.py` emits every one as the same `message` event.
 
-**A turn makes at most two model calls** (`MODEL_CALLS_PER_TURN`, whose comment says
-why two and what raising it takes), which `TwoCallTurn` enforces. The opener rides
-on the interpret call as the tool's `reply` argument, so it is free; a turn with results
-spends the interpret call and the rank call. A turn that ends with nothing to show
-spends the interpret call and one `Composer` call instead, the rank call never having
-been made — `chat.py` states why that spare call is always there. Calls are not
-requests: the agent's model is built with one
-retry (`main.py`), so a results turn can cost three of the free tier's fifteen requests
-a minute. The composer is built with none — its answer already exists in the template
-beside it.
+**A turn makes at most two model calls.** The graph's edges hold that for the calls
+inside it: no path passes through more than two of `MODEL_NODES`, whose comment says why
+two and what raising it takes, and `test_graph.py` walks `get_graph()` to assert it. The
+opener rides on the interpret call as the tool's `reply` argument, so it is free; a turn
+with results spends the interpret call and the rank call. A turn that ends with nothing
+to show spends the interpret call and one `Composer` call instead, the rank call never
+having been made — `chat.py` states why that spare call is always there. Calls are not
+requests: the graph's model is built with one retry (`main.py`), so a results turn can
+cost three of the free tier's fifteen requests a minute. The composer is built with none
+— its answer already exists in the template beside it.
 
 The composer is fed the cause (`nothing_matched`, `all_shown`, `all_judged`,
 `title_not_found`), never asked to infer it: each owes the user a different sentence,
@@ -362,9 +364,10 @@ the service's; a `uv sync` at this root restores them.
 
 The suite runs offline. The library's tests are in `packages/holster-catalog/tests/`:
 `test_tmdb.py` against a mock transport, `test_catalog_tool.py` against that plus plain
-async functions in place of the two model calls, and `test_agent_tools.py` against the
-real agent. The service's are in `tests/`: `test_chat.py` and `test_main.py`, also
-against the real agent. The agent is driven by
+async functions in place of the two model calls, `test_agent_tools.py` on the declared
+schemas and the fake model, and `test_graph.py` on the graph's edges, what its bindings
+carried and each node alone. The service's are in `tests/`: `test_chat.py` and
+`test_main.py`, against the real graph. The graph is driven by
 `holster_catalog.testing.ScriptedChatModel`, a chat model that answers each call with
 the next scripted message and records what each call was sent. Nothing here calls TMDB
 or the model — prompt behaviour is checked by running the app, not by asserting on a

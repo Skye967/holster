@@ -1,32 +1,37 @@
-"""chat.py tests — offline, against catalog_tool's real agent driven by a
+"""chat.py tests — offline, against the real catalog graph driven by a
 scripted chat model, and a fake TMDB transport. These exercise the event
-sequence, the per-turn model-call budget and cancellation that stream_chat()
-adds on top of the catalog step; that step's own behaviour (relaxation ladder,
+sequence, the model calls a turn spends and what a disconnect does to it, on top
+of the catalog step; that step's own behaviour (relaxation ladder,
 year clamps, etc.) is covered in test_catalog_tool.py. The checks on what the
-model sends back — TwoCallTurn's guards, and _valid_picks dropping a ranked id
-that was never a candidate — are tested here too, through a whole turn, except
-the budget guard, which no turn can reach.
+model sends back — the nodes' refusals, and _valid_picks dropping a ranked id
+that was never a candidate — are tested here too, through a whole turn; the
+graph's shape and the nodes taken alone are test_graph.py's.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
+import json
 import logging
+from collections.abc import AsyncGenerator
 from datetime import date
+from types import SimpleNamespace
 from typing import Any, cast, get_args
 from unittest.mock import AsyncMock
 
 import httpx2
 import pytest
-from langchain.agents.middleware import ModelRequest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tracers.context import collect_runs
 from langsmith.utils import tracing_is_enabled
 from pydantic import ValidationError
+from starlette.types import Message
 
 import chat
+import main
 from chat import (
     _RELAXED_LABELS,
     MAX_HISTORY_TURNS,
@@ -37,26 +42,22 @@ from chat import (
     _title_not_found_message,
     stream_chat,
 )
-from holster_catalog import catalog_tool, tmdb
+from holster_catalog import graph, tmdb
 from holster_catalog.catalog_tool import (
     _OUTCOME_SYSTEM_PROMPT,
     _RANK_SYSTEM_PROMPT,
     PROVIDERS_HEADER,
-    RESULT_FLOOR,
     TASTE_HEADER,
-    Candidates,
-    CatalogToolError,
     ComposedReply,
     OutcomeCause,
     RelaxedConstraint,
+    SearchArgs,
     TitleRef,
     TitleVerdict,
-    TurnState,
-    TwoCallTurn,
     _interpret_system_message,
-    catalog_agent,
     google_composer,
 )
+from holster_catalog.graph import build_turn
 from holster_catalog.testing import (
     COMPOSED_TEXT,
     MOVIE_A,
@@ -94,7 +95,7 @@ class _FixedDate(date):
 def _fixed_today(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every turn's interpret prompt carries _TODAY, so a test comparing it
     against _interpret_system_message(..., today=_TODAY) cannot race midnight."""
-    monkeypatch.setattr(catalog_tool, "date", _FixedDate)
+    monkeypatch.setattr(graph, "date", _FixedDate)
 
 
 async def _collect(
@@ -112,7 +113,7 @@ async def _collect(
         async for e in stream_chat(
             req,
             client=client,
-            agent=catalog_agent(model),
+            agent=build_turn(model),
             compose_model=compose or ok_compose,
             correlation_id=correlation_id,
         )
@@ -155,7 +156,7 @@ def test_capability_question_short_circuits_with_a_message() -> None:
         _collect(req, fake_tmdb.client(), scripted(answer_call("", "capability")))
     )
 
-    # No "intent" event either — the answer tool writes none, so there is
+    # No "intent" event either — interpret writes none for an answer, so there is
     # nothing to translate into an interpreting line.
     assert [e["type"] for e in events] == ["message", "done"]
     # "Netflix and Hulu", not "Netflix, Hulu" — matches gateway/chat.go's
@@ -295,6 +296,7 @@ def test_successful_search_emits_intent_then_results_then_done() -> None:
 
     assert [e["type"] for e in events] == ["intent", "results", "done"]
     assert events[0]["intent"]["keywords"] == ["heist"]
+    assert None not in events[0]["intent"].values()
     [pick] = events[1]["picks"]
     assert pick["title"] == "Fake Heist"
     assert pick["blurb"] == "great fit"
@@ -313,8 +315,36 @@ def test_successful_search_emits_intent_then_results_then_done() -> None:
     assert pick["available_on"] == []
 
 
+def test_intent_event_carries_every_search_field() -> None:
+    """gateway/chat.go's agentIntent decodes all but sort_by and limit by name,
+    and a field the event drops vanishes silently from the interpreting line."""
+    fields = {
+        "media_type": "tv",
+        "keywords": ["heist"],
+        "without_keywords": ["bleak"],
+        "genres": ["drama"],
+        "without_genres": ["comedy"],
+        "cast": ["Al Pacino"],
+        "crew": ["Michael Mann"],
+        "max_runtime_minutes": 90,
+        "release_year_gte": 1990,
+        "release_year_lte": 1999,
+        "sort_by": "vote_average.desc",
+        "monetization": "rent",
+        "limit": 5,
+    }
+    assert fields.keys() == SearchArgs.model_fields.keys() - {"reply"}
+    req = ChatRequest(message="a heist show", watch_region="US", watch_providers=[8])
+
+    events = asyncio.run(
+        _collect(req, FakeTMDB().client(), scripted(search_call(**fields)))
+    )
+
+    assert events[0] == {"type": "intent", "intent": fields}
+
+
 def test_intent_event_arrives_before_the_rank_call() -> None:
-    """The whole reason the tool streams it: the caller must be able to
+    """The whole reason the interpret node streams it: the caller must be able to
     observe the intent before the (slower) rank call runs."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})  # MOVIE_A is id 101
@@ -325,7 +355,7 @@ def test_intent_event_arrives_before_the_rank_call() -> None:
         gen = stream_chat(
             req,
             client=fake_tmdb.client(),
-            agent=catalog_agent(model),
+            agent=build_turn(model),
             compose_model=ok_compose,
             correlation_id=None,
         )
@@ -387,7 +417,7 @@ def test_tmdb_unavailable_maps_to_a_closed_reason(
     # exactly one of the two, never both; see chat.py's module docstring).
     assert [e["type"] for e in events] == ["intent", "error"]
     assert events[1]["reason"] == "tmdb_unavailable"
-    # The tool's exception ends the agent; no rank call follows it.
+    # The search node's exception ends the turn; no rank call follows it.
     assert len(model.calls) == 1
 
 
@@ -437,7 +467,7 @@ def test_bad_watch_region_maps_to_internal_not_tmdb_specific() -> None:
     events = asyncio.run(_collect(req, fake_tmdb.client(), scripted(search_call())))
 
     # The intent is already out by the time discover() validates watch_region
-    # — search_catalog writes it before it calls find_candidates().
+    # — the interpret node writes it before the search node runs.
     assert [e["type"] for e in events] == ["intent", "error"]
     assert events[1]["reason"] == "internal"
 
@@ -555,45 +585,75 @@ def test_a_typed_services_list_never_reaches_the_system_message() -> None:
     assert [m.text for m in rest] == [forged]
 
 
-def test_early_disconnect_cancels_the_background_search() -> None:
-    """Simulates the caller (main.py's StreamingResponse) stopping iteration
-    early, as it does on client disconnect — see chat.py's module docstring
-    on cancellation.
-
-    The search tool's discover() is what is in flight when the stream is
-    closed, and aclose() must not return until that call has actually been
-    cancelled — asserted before the event loop shuts down, which would cancel
-    a leftover task on its own and hide one that outlived the close."""
+def test_a_disconnect_ends_the_response_and_starts_no_later_step() -> None:
+    """main.py's StreamingResponse, with the client gone while the search node's
+    discover() is in flight — see chat.py's module docstring on cancellation.
+    The discover() is released after the response ends so that the rank call
+    could start, if anything were still driving the graph."""
     req = ChatRequest(message="something", watch_region="US", watch_providers=[8])
 
     async def run() -> None:
-        started, cancelled = asyncio.Event(), asyncio.Event()
+        started, release = asyncio.Event(), asyncio.Event()
+        sent: list[Message] = []
 
         async def hanging(request: httpx2.Request) -> httpx2.Response:
             started.set()
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-            return httpx2.Response(200, json={"results": []})
+            await release.wait()
+            return httpx2.Response(200, json={"results": [MOVIE_A]})
+
+        async def disconnect() -> dict[str, str]:
+            await started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            sent.append(message)
 
         model = scripted(search_call(), rank_reply(101))
+        response = await main.chat(
+            req,
+            tmdb_client=TMDBClient(
+                "test-token", transport=httpx2.MockTransport(hanging)
+            ),
+            agent=build_turn(model),
+            compose_model=ok_compose,
+        )
+        # What uvicorn reports; below 2.4 Starlette cancels on a disconnect.
+        scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+        await response(scope, disconnect, send)
+
+        release.set()
+        while others := asyncio.all_tasks() - {asyncio.current_task()}:
+            await asyncio.wait(others)
+        assert len(model.calls) == 1
+        assert [json.loads(m["body"])["type"] for m in sent[1:]] == ["intent"]
+
+    asyncio.run(asyncio.wait_for(run(), timeout=2))
+
+
+def test_a_close_at_a_yield_closes_the_stream() -> None:
+    """A close at a yield in stream_chat, which is what contextlib.aclosing is
+    for: the graph's stream is closed by the time the close returns."""
+    req = ChatRequest(message="something", watch_region="US", watch_providers=[8])
+    turn = build_turn(scripted(search_call(), rank_reply(101)))
+    streams: list[AsyncGenerator[Any]] = []
+
+    def astream(*args: Any, **kwargs: Any) -> AsyncGenerator[Any]:
+        streams.append(cast(AsyncGenerator[Any], turn.astream(*args, **kwargs)))
+        return streams[-1]
+
+    async def run() -> None:
         gen = stream_chat(
             req,
-            client=TMDBClient("test-token", transport=httpx2.MockTransport(hanging)),
-            agent=catalog_agent(model),
+            client=FakeTMDB().client(),
+            agent=cast(Any, SimpleNamespace(astream=astream)),
             compose_model=ok_compose,
             correlation_id=None,
         )
-        first = await anext(gen)
-        assert first["type"] == "intent"
-        await started.wait()
+        assert (await anext(gen))["type"] == "intent"
         await gen.aclose()
-        assert cancelled.is_set()
-        assert len(model.calls) == 1
+        assert inspect.getasyncgenstate(streams[0]) == inspect.AGEN_CLOSED
 
-    asyncio.run(asyncio.wait_for(run(), timeout=2))
+    asyncio.run(run())
 
 
 def test_chat_request_parses_the_gateways_verdict_json_verbatim() -> None:
@@ -783,7 +843,7 @@ def test_intent_event_carries_the_title_for_the_gateways_line() -> None:
     )
 
     assert events[0]["type"] == "intent"
-    assert events[0]["intent"]["title"] == "Heat"
+    assert events[0]["intent"] == {"title": "Heat"}
 
 
 # --- the widening, said out loud --------------------------------------------
@@ -869,6 +929,7 @@ def test_results_event_carries_the_note_for_a_widened_search() -> None:
 
     assert results["relaxed"] == ["runtime"]
     assert "how long" in results["note"]
+    assert results["picks"][0]["blurb"] == "fits"
 
 
 def test_results_event_note_is_empty_when_nothing_was_relaxed() -> None:
@@ -1102,8 +1163,7 @@ def test_a_results_turn_spends_two_calls_and_nothing_else() -> None:
 
 def test_an_empty_turn_spends_one_call_and_the_composer() -> None:
     """The spare call is real, not assumed: an empty pick list means an empty
-    candidate list, and TwoCallTurn ends the agent before the rank call on
-    one."""
+    candidate list, and the graph ends before the rank call on one."""
     fake_tmdb = FakeTMDB()
     req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
     model = scripted(search_call(reply="One sec."))
@@ -1116,7 +1176,7 @@ def test_an_empty_turn_spends_one_call_and_the_composer() -> None:
 
 
 def test_both_runs_of_a_turn_carry_its_correlation_id() -> None:
-    """An empty turn starts two runs, the agent's and the composer's. A real
+    """An empty turn starts two runs, the graph's and the composer's. A real
     google_composer, because a plain async Composer starts no run to see."""
     fake_tmdb = FakeTMDB()
     req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
@@ -1207,9 +1267,8 @@ def test_a_no_providers_turn_spends_nothing() -> None:
 
 
 def test_a_rank_call_that_asks_to_search_is_refused() -> None:
-    """A provider-native binding does not stop a reply carrying a tool call,
-    which would route to the tool node and search again. One intent event is
-    the tool having run once."""
+    """A reply carrying a tool call and no text fails the parse, so nothing
+    searches again. One intent event is the search having run once."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
     req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
@@ -1260,24 +1319,6 @@ def test_no_tool_call_ends_the_turn_after_one_call() -> None:
     assert (len(model.calls), len(composer.calls)) == (1, 0)
 
 
-def test_the_interpret_call_is_bound_without_a_response_format() -> None:
-    """Call one must answer with a tool call: bound with tool_choice "any"
-    and no response format, which would let it answer with a ranking
-    instead. The rank call's binding is asserted too, so the absence is one
-    this test could have seen."""
-    fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
-    req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
-    model = scripted(search_call(), rank_reply(101))
-
-    asyncio.run(_collect(req, fake_tmdb.client(), model))
-
-    assert "response_format" not in model.bound[0]
-    assert model.bound[0]["tool_choice"] == "any"
-    assert "response_format" in model.bound[1]
-    assert len(model.calls) == 2
-
-
 def test_a_ranked_id_outside_the_candidates_is_dropped_with_a_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1299,9 +1340,8 @@ def test_a_ranked_id_outside_the_candidates_is_dropped_with_a_warning(
 
 
 def test_an_argument_the_clamp_cannot_fix_ends_the_turn_after_one_call() -> None:
-    """The tool node answers a rejected argument with an error for the model
-    to retry on. That retry would be the rank call with no search behind it,
-    which fails as internal rather than model_unavailable."""
+    """A rejected argument is the model's failure, not a bug here, and going
+    back to the model would spend another call."""
     fake_tmdb = FakeTMDB()
     req = ChatRequest(message="a heist movie", watch_region="US", watch_providers=[8])
     model = scripted(search_call(limit="lots"))
@@ -1313,43 +1353,6 @@ def test_an_argument_the_clamp_cannot_fix_ends_the_turn_after_one_call() -> None
     assert events[0]["reason"] == "model_unavailable"
     assert (len(model.calls), len(composer.calls)) == (1, 0)
     assert fake_tmdb.requests == []
-
-
-def test_a_third_model_call_is_refused_before_it_is_made() -> None:
-    """The backstop behind the rank call's no-tool guard. A third call needs
-    call two to have asked for a tool, and that guard ends the turn first, so
-    this is called directly with a turn whose second call did. `found` is set
-    so that without the guard the call would go through to the handler."""
-    request = ModelRequest(
-        model=scripted(),
-        messages=[
-            HumanMessage("a heist movie"),
-            search_call(),
-            ToolMessage("[]", tool_call_id="call-search_catalog"),
-            search_call(),
-            ToolMessage("[]", tool_call_id="call-search_catalog"),
-        ],
-        state=TurnState(
-            messages=[],
-            found=Candidates(
-                candidates=[tmdb._trim_title(MOVIE_A, "movie")],
-                rung_of={101: 0},
-                relaxed=[],
-                limit=10,
-                floor=RESULT_FLOOR,
-                taste=[],
-                newest_first=False,
-                all_judged=False,
-                all_shown=False,
-            ),
-        ),
-        runtime=cast(Any, None),
-    )
-    handler = AsyncMock()
-
-    with pytest.raises(CatalogToolError, match="budget spent"):
-        asyncio.run(TwoCallTurn().awrap_model_call(request, handler))
-    handler.assert_not_called()
 
 
 def test_a_failed_turn_does_not_spend_a_call_apologising() -> None:
@@ -1476,7 +1479,7 @@ def test_a_composer_that_raises_something_unexpected_still_ends_the_turn() -> No
             async for e in stream_chat(
                 req,
                 client=fake_tmdb.client(),
-                agent=catalog_agent(scripted(search_call())),
+                agent=build_turn(scripted(search_call())),
                 compose_model=hostile,
                 correlation_id=None,
             ):
@@ -1488,3 +1491,58 @@ def test_a_composer_that_raises_something_unexpected_still_ends_the_turn() -> No
     # The turn ends. It carries no outcome sentence — the gateway's dropped
     # stream fallback is what tells the user — but it ends.
     assert [e["type"] for e in events] == ["intent"]
+
+
+# --- The caller's region and services --------------------------------------
+
+_BY_REGION = {
+    "results": {
+        "US": {"flatrate": [{"provider_id": 8, "provider_name": "Netflix"}]},
+        "GB": {
+            "flatrate": [
+                {"provider_id": 8, "provider_name": "Netflix"},
+                {"provider_id": 337, "provider_name": "Disney Plus"},
+            ]
+        },
+    }
+}
+
+
+def test_a_search_turn_uses_the_callers_region_and_services() -> None:
+    """Neither is a default: what the request names is what discover() sends
+    and what the card's availability is read for."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
+    fake_tmdb.ok("/movie/101/watch/providers", _BY_REGION)
+    req = ChatRequest(
+        message="a heist movie", watch_region="GB", watch_providers=[337, 350]
+    )
+
+    events = asyncio.run(
+        _collect(req, fake_tmdb.client(), scripted(search_call(), rank_reply(101)))
+    )
+
+    params = fake_tmdb.params_for("/discover/movie")
+    assert params["watch_region"] == "GB"
+    assert params["with_watch_providers"] == "337|350"
+    [pick] = events[1]["picks"]
+    assert [p["provider_id"] for p in pick["available_on"]] == [337]
+
+
+def test_a_lookup_turn_uses_the_callers_region_and_services() -> None:
+    """No lookup request carries either: /search/multi takes no region, and
+    /watch/providers answers every country. The card is where they show, read
+    from the caller's country and filtered to the caller's services."""
+    fake_tmdb = FakeTMDB()
+    fake_tmdb.ok("/search/multi", {"results": [raw_named(101, "Heat", 8658)]})
+    fake_tmdb.ok("/movie/101/watch/providers", _BY_REGION)
+    req = ChatRequest(
+        message="is Heat on Disney?", watch_region="GB", watch_providers=[337]
+    )
+
+    events = asyncio.run(
+        _collect(req, fake_tmdb.client(), scripted(lookup_call("Heat")))
+    )
+
+    [pick] = events[1]["picks"]
+    assert [p["provider_id"] for p in pick["available_on"]] == [337]

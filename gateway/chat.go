@@ -1619,8 +1619,8 @@ type agentChatRequest struct {
 	Shown []agentTitleRef `json:"shown,omitempty"`
 }
 
-// agentIntent mirrors the agent's "intent" event — see holster_catalog/catalog_tool.py's
-// search_catalog and look_up_title. A search sends
+// agentIntent mirrors the agent's "intent" event — see holster_catalog/graph.py's
+// interpret_node. A search sends
 // SearchArgs.model_dump(exclude_none=True) without reply; a lookup sends
 // {"title": ...} alone. Pointers on the fields Pydantic can leave unset.
 //
@@ -1720,12 +1720,12 @@ type agentProvider struct {
 // agent/chat.py's module docstring for the full shape of each type.
 type agentEvent struct {
 	Type string `json:"type"`
-	// Which tool answered the turn, on "results" only: "search" or "lookup".
-	// The agent reads it from which tool ran, so stored history reflects
+	// Which path answered the turn, on "results" only: "search" or "lookup".
+	// The agent reads it from which node ran, so stored history reflects
 	// what the turn did rather than what its intent looked like.
 	// interpretingLine cannot use it and reads intent.Title instead: the
-	// interpreting line is built from the "intent" event, which the tool
-	// writes before any result exists (holster_catalog/catalog_tool.py's _narrate).
+	// interpreting line is built from the "intent" event, which the interpret
+	// node writes before any result exists (holster_catalog/graph.py's _narrate).
 	Kind    string          `json:"kind,omitempty"`
 	Intent  json.RawMessage `json:"intent,omitempty"`
 	Picks   []agentPick     `json:"picks,omitempty"`

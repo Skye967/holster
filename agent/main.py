@@ -3,7 +3,7 @@
 Turns a message plus the caller's streaming subscriptions into TMDB catalog
 queries and an answer. This module is the HTTP surface — POST /chat, GET
 /providers, POST /titles and /health — plus structured logging and
-correlation-ID propagation; the pipeline itself lives in catalog_tool.py
+correlation-ID propagation; the pipeline itself lives in holster_catalog
 and chat.py.
 """
 
@@ -27,13 +27,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from chat import ChatRequest, stream_chat
 from holster_catalog.catalog_tool import (
-    CatalogAgent,
     Composer,
     TitlesRequest,
-    catalog_agent,
     enrich_watchlist,
     google_composer,
 )
+from holster_catalog.graph import CatalogGraph, build_turn
 from holster_catalog.tmdb import RegionProvider, TMDBClient
 
 # Lower-case because the ASGI server lower-cases header names in scope, so the
@@ -164,8 +163,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # exponential and ignores the Retry-After the response carries, so the one
     # retry fires too soon to land.
     model = init_chat_model(model_id, timeout=15.0, max_retries=2)
-    app.state.agent = catalog_agent(model)
-    # One attempt where the agent's two calls get a retry: this call's answer already
+    app.state.agent = build_turn(model)
+    # One attempt where the graph's two calls get a retry: this call's answer already
     # exists in the template beside it (chat.py's _outcome_text), so a retry
     # against a free-tier refusal spends a second request of the same minute to
     # arrive at the sentence that was already there.
@@ -190,8 +189,8 @@ def get_tmdb_client(request: Request) -> TMDBClient:
     return cast(TMDBClient, request.app.state.tmdb_client)
 
 
-def get_agent(request: Request) -> CatalogAgent:
-    return cast(CatalogAgent, request.app.state.agent)
+def get_agent(request: Request) -> CatalogGraph:
+    return cast(CatalogGraph, request.app.state.agent)
 
 
 def get_compose_model(request: Request) -> Composer:
@@ -207,7 +206,7 @@ async def health() -> dict[str, str]:
 async def chat(
     req: ChatRequest,
     tmdb_client: TMDBClient = Depends(get_tmdb_client),
-    agent: CatalogAgent = Depends(get_agent),
+    agent: CatalogGraph = Depends(get_agent),
     compose_model: Composer = Depends(get_compose_model),
 ) -> StreamingResponse:
     """Streams chat.stream_chat()'s events as newline-delimited JSON. A plain

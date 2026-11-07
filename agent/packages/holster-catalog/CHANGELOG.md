@@ -11,3 +11,15 @@ version and is not listed here.
 
 - The package: `holster_catalog.tmdb` and `holster_catalog.catalog_tool`, moved out of
   the agent service with no change in behaviour.
+- `holster_catalog.graph`: the turn as a LangGraph `StateGraph`, built by `build_turn`
+  as a `CatalogGraph`, with `TurnContext` and `TurnState` moved into it.
+
+### Changed
+
+- `CATALOG_TOOLS` is three Pydantic schemas; nothing executes a tool.
+
+### Removed
+
+- `catalog_tool.catalog_agent`, `CatalogAgent`, `TwoCallTurn`, `MODEL_CALLS_PER_TURN`,
+  the `search_catalog`, `look_up_title` and `answer` tool functions, and the `langchain`
+  dependency.
