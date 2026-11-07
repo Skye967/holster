@@ -1,7 +1,7 @@
 """catalog_tool tests — offline, against a fake TMDB transport (same
 FakeTMDB shape as test_tmdb.py) and plain async functions standing in for the
-agent's two model calls (see search_turn). The agent itself, driven by a
-scripted model, is test_chat.py's.
+turn's two model calls (see search_turn). The graph itself, driven by a
+scripted model, is test_chat.py's, and its shape test_graph.py's.
 """
 
 from __future__ import annotations
@@ -117,10 +117,10 @@ async def search_turn(
     verdicts: list[TitleVerdict] | None = None,
     shown: list[TitleRef] | None = None,
 ) -> CatalogResult:
-    """A turn's catalog path with plain async functions where the agent's two
+    """A turn's catalog path with plain async functions where the graph's two
     model calls go: the interpret call's arguments, then either
     lookup_title(), or find_candidates(), the rank call — skipped on no
-    candidates, as TwoCallTurn skips it — and finish_search(). The rank fake is
+    candidates, as the graph skips it — and finish_search(). The rank fake is
     handed the request as _rank_content builds it, minus the candidate list it
     gets as its own argument."""
     args = await interpret_model(message)
@@ -1346,7 +1346,7 @@ def test_search_ignores_liked_titles_of_another_media_type() -> None:
 
 
 def test_search_skips_taste_lookups_when_nothing_survives_exclusion() -> None:
-    """TwoCallTurn skips the rank call on an empty candidate list anyway, so resolving
+    """The graph skips the rank call on an empty candidate list anyway, so resolving
     liked titles then would spend round trips on a turn that shows nothing."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101)]})

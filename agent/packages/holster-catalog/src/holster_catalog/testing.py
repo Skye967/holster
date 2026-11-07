@@ -9,17 +9,19 @@ FakeTMDB is the union of what those suites need; each uses a subset.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
 import httpx2
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.outputs import ChatResult
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
-from pydantic import Field
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from pydantic import BaseModel, Field
 
 from holster_catalog.catalog_tool import (
     CatalogToolError,
@@ -166,17 +168,17 @@ class FakeTMDB:
 class ScriptedChatModel(GenericFakeChatModel):
     """A chat model that answers each call with the next scripted AIMessage:
     a tool call for call one, or RankResult JSON as text with no tool calls
-    for call two, which is the reply ProviderStrategy parses. Each call's
-    messages are recorded in `calls`, so a test counts a turn's model calls
-    and reads what each one was sent.
+    for call two. Each call's messages are recorded in `calls`, so a test
+    counts a turn's model calls and reads what each one was sent.
 
-    bind_tools records its kwargs in `bound` and returns the model itself, so
-    the script ignores which tools or response format a call binds; the base
-    class raises NotImplementedError there. create_agent goes through
-    bind_tools for every call that has tools or a response format — both of
-    this agent's calls do — so `bound[i]` is call i's binding. The base
-    class's streaming path drops tool_calls, so a scripted tool call survives
-    ainvoke but not a token stream."""
+    Each binding appends to `bound`, in the order it was made, and answers from
+    the same script, so the script ignores which tools or response format a
+    call binds. bind_tools records the tool names and its kwargs and returns
+    the model itself; the base class raises NotImplementedError there.
+    with_structured_output records its schema and kwargs, and parses message
+    text as Gemini's does, where the base class's version would parse a tool
+    call. The base class's streaming path drops tool_calls, so a scripted tool
+    call survives ainvoke but not a token stream."""
 
     calls: list[list[BaseMessage]] = Field(default_factory=list)
     bound: list[dict[str, Any]] = Field(default_factory=list)
@@ -186,8 +188,16 @@ class ScriptedChatModel(GenericFakeChatModel):
         tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, AIMessage]:
-        self.bound.append(kwargs)
+        names = [convert_to_openai_tool(t)["function"]["name"] for t in tools]
+        self.bound.append({"tools": names, **kwargs})
         return self
+
+    def with_structured_output(
+        self, schema: dict[str, Any] | type, **kwargs: Any
+    ) -> Runnable[LanguageModelInput, dict[str, Any] | BaseModel]:
+        self.bound.append({"tools": [], "schema": schema, **kwargs})
+        parser = PydanticOutputParser(pydantic_object=cast(type[BaseModel], schema))
+        return self | parser
 
     async def _agenerate(
         self,
@@ -246,10 +256,8 @@ def rank_reply(*tmdb_ids: int, blurb: str = "fits") -> AIMessage:
 
 
 def composed_reply(text: str) -> AIMessage:
-    """The composer's one call: ComposedReply as a tool call. ScriptedChatModel
-    inherits BaseChatModel.with_structured_output, which parses tool calls;
-    Gemini's parses JSON text."""
-    return _tool_call("ComposedReply", {"text": text})
+    """The composer's one call: ComposedReply as JSON text."""
+    return AIMessage(content=ComposedReply(text=text).model_dump_json())
 
 
 def make_intent(**overrides: Any) -> SearchArgs:
