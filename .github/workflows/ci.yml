@@ -120,8 +120,9 @@ jobs:
       UV_LOCKED: 1
     steps:
       - uses: actions/checkout@v7
-      # Bump together with the catalog job, agent/Dockerfile's uv image,
-      # agent/README.md and uv_build in holster-catalog's pyproject.toml.
+      # Bump together with the catalog job, .github/workflows/release-catalog.yml,
+      # agent/Dockerfile's uv image, agent/README.md and uv_build in
+      # holster-catalog's pyproject.toml.
       - uses: astral-sh/setup-uv@v10.1.0
         with:
           version: 0.13.7
