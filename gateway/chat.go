@@ -430,8 +430,8 @@ type outboundEvent struct {
 	// The agent's one-line explanation of a widened search, empty
 	// whenever nothing was relaxed. Composed there, beside the rest of the
 	// relaxation copy, rather than templated here like interpretingLine:
-	// splitting it from agent/chat.py's _nothing_found_message would
-	// duplicate that file's label table across two services.
+	// splitting it from holster_catalog's _nothing_found_message would
+	// duplicate that package's label table across two services.
 	Note string `json:"note,omitempty"`
 }
 
@@ -801,7 +801,7 @@ func (h *Handler) runChatConnection(ctx context.Context, conn *websocket.Conn, u
 				// leaves empty, but TrimSpace also strips U+0085, which trim()
 				// keeps, so a NEL-only message from the web lands here too.
 				// Stored, blank text would become a blank user turn in later
-				// turns' history (agent/chat.py's _turn_messages).
+				// turns' history (holster_catalog's _history_messages).
 				if strings.TrimSpace(msg.Text) == "" {
 					h.sendTerminalEvent(ctx, conn, msg.Turn, outboundEvent{Type: "error", Text: genericErrorText})
 					continue
@@ -1324,7 +1324,7 @@ func (h *Handler) runTurn(
 			// ok=true left by an earlier event in this same stream. An empty
 			// ev.Text on "message" isn't reachable the same way — the agent
 			// composes that text but falls back to a non-empty template when
-			// the model returns nothing usable (agent/chat.py's _outcome_text
+			// the model returns nothing usable (holster_catalog's compose node
 			// and _capability_message) — so no matching guard is needed there.
 			if summary := summarizePicks(ev.Picks, ev.Kind == "lookup"); summary != "" {
 				rec.ok = true

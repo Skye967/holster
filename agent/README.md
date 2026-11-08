@@ -57,7 +57,8 @@ uv 0.13.7 is the version `Dockerfile` and CI pin.
 and `chat.py` at its root, run and never built; the catalog core is the
 [`holster-catalog`](packages/holster-catalog/README.md) library under `packages/`, which
 `uv sync` installs as an editable dependency and the image installs as a package. This
-file's `tmdb.py`, `catalog_tool.py` and `graph.py` are in its `src/holster_catalog/`.
+file's `tmdb.py`, `catalog_tool.py`, `graph.py` and `turn.py` are in its
+`src/holster_catalog/`.
 
 The container runs `python main.py`, which configures logging and serves; the uvicorn
 CLI above is the same thing with reload for local work.
@@ -79,8 +80,8 @@ Tracing is opt-in because traces carry the turn's prompts and outputs: when it i
 the user's message and recent history, their services and liked titles, and the TMDB
 overviews the rank call reads all leave for LangSmith, a third-party service. A turn
 that reaches the agent is traced as `chat_turn`; if it ends with nothing to show, the
-outcome composer's call is a second `chat_turn` trace. Both carry the request's
-correlation id in their metadata — the id on this service's log lines for that request.
+outcome composer's call is a run inside that trace. Every run carries the request's
+correlation id in its metadata — the id on this service's log lines for that request.
 
 Logs are structured JSON to stdout, nothing else — routing and retention belong to
 whatever runs the container. Lines logged while handling a request carry its
@@ -192,24 +193,28 @@ lets the model choose them. A `limit` past its schema bound is clamped to it, so
 me 25" asks for 20, and a runtime ceiling under a minute reads as no ceiling. An
 argument the clamp cannot fix ends the turn rather than going back to the model, which
 would be another call. Each node writes what it found onto the graph's state
-(`TurnState`), and `chat.py` answers from that state.
+(`TurnState`), and `outcome_of` reads the turn's one outcome from that state.
 
-LangChain lives in `graph.py` and at the bottom of `catalog_tool.py`, which holds the
-prompts and the composer's model binding. The rest of that file is plain TMDB and
-Python; its one LangChain type is the `RunnableConfig` that `compose()` passes on unread.
+LangChain lives in `graph.py`, in `turn.py`'s `RunnableConfig`, and at the bottom of
+`catalog_tool.py`, which holds the prompts and the composer's model binding. The rest of
+that file is plain TMDB and Python.
 
 ## Chat pipeline
 
-`chat.py`'s `stream_chat()` runs the catalog graph for `POST /chat`: a plain
-chunked HTTP response (`application/x-ndjson`), not a second WebSocket — the browser's
-socket belongs to the gateway alone (`../ARCHITECTURE.md`). Each line is one event:
-`reply` (the model's one-line opener, ahead of `intent` on a turn that searches or looks
-up), `intent` (as soon as the interpret call answers — well before the full turn
-finishes, written by the interpret node through LangGraph's stream writer), `results` or
-`message` (candidates, or a plain reply when there are none — no subscriptions, nothing
-survived the relaxation ladder, or everything found was already rated),
-`error` (one of a fixed, closed set of reason codes — never raw exception text), and
-`done`. `error` is terminal on its own; a turn ends with exactly one of `done` or
+The library owns the turn and the service owns the wire. `stream_turn` in
+`holster_catalog/turn.py` runs the graph and yields typed events, `Opener` and `Intent`,
+then one outcome, `Results` or `Message`; a failed turn raises instead. `chat.py`'s
+`stream_chat()` keeps the request's bounds, the no-providers early return, the correlation
+id and the closed set of error reasons, and maps what `stream_turn` yields to NDJSON for
+`POST /chat`: a plain chunked HTTP response (`application/x-ndjson`), not a second
+WebSocket — the browser's socket belongs to the gateway alone (`../ARCHITECTURE.md`). Each
+line is one event: `reply` (the model's one-line opener, ahead of `intent` on a turn that
+searches or looks up), `intent` (as soon as the interpret call answers — well before the
+full turn finishes, written by the interpret node through LangGraph's stream writer),
+`results` or `message` (candidates, or a plain reply when there are none — no
+subscriptions, nothing survived the relaxation ladder, or everything found was already
+rated), `error` (one of a fixed, closed set of reason codes — never raw exception text),
+and `done`. `error` is terminal on its own; a turn ends with exactly one of `done` or
 `error`, never both.
 
 This is the agent-internal protocol, not the browser-facing one — the gateway owns the
@@ -281,25 +286,26 @@ a number as a limit. A blurb is exempt: only its title reaches history, in the g
 
 `answer` has four kinds — `capability`, `clarifying`, `chat` for film and TV talk that
 wants no search ("is Heat any good?"), and `off_topic` for a decline. The kind never
-leaves the agent: `chat.py` emits every one as the same `message` event.
+leaves the agent: every one ends the turn as the same `Message` outcome.
 
-**A turn makes at most two model calls.** The graph's edges hold that for the calls
-inside it: no path passes through more than two of `MODEL_NODES`, whose comment says why
-two and what raising it takes, and `test_graph.py` walks `get_graph()` to assert it. The
-opener rides on the interpret call as the tool's `reply` argument, so it is free; a turn
-with results spends the interpret call and the rank call. A turn that ends with nothing
-to show spends the interpret call and one `Composer` call instead, the rank call never
-having been made — `chat.py` states why that spare call is always there. Calls are not
+**A turn makes at most two model calls.** The graph's edges hold that for the calls inside
+it: no path passes through more than two of `MODEL_NODES`, whose comment says why two and
+what raising it takes, and `test_graph.py` walks `get_graph()` to assert it. The opener
+rides on the interpret call as the tool's `reply` argument, so it is free; a turn with
+results spends the interpret call and the rank call. A turn that ends with nothing to show
+spends the interpret call and one `Composer` call instead, the rank call never having been
+made — `MODEL_NODES`' comment states why that spare call is always there. Calls are not
 requests: the graph's model is built with one retry (`main.py`), so a results turn can
-cost three of the free tier's fifteen requests a minute. The composer is built with none
-— its answer already exists in the template beside it.
+cost three of the free tier's fifteen requests a minute. The composer is built with none —
+its answer already exists in the template beside it.
 
 The composer is fed the cause (`nothing_matched`, `all_shown`, `all_judged`,
-`title_not_found`), never asked to infer it: each owes the user a different sentence,
-and telling someone they rated titles they were only shown is false. `finish_search()` decides
-the cause where it computes the facts behind it, so the sentence and the duty cannot
-disagree. A composer call that fails or outlives `COMPOSE_TIMEOUT_SECONDS` falls back to
-the template beside it rather than costing a turn the answer it already has.
+`title_not_found`), never asked to infer it: each owes the user a different sentence, and
+telling someone they rated titles they were only shown is false. `_empty_cause()` decides
+the cause from the facts the ladder recorded, and the sentence and the duty are chosen
+from that one cause, so they cannot disagree. A composer call that fails or outlives
+`COMPOSE_TIMEOUT_SECONDS` falls back to the template beside it rather than costing a turn
+the answer it already has.
 
 What stays hand-written: `chat.py`'s `NO_PROVIDERS_MESSAGE`, because that turn reaches
 no model at all and is the first message most new visitors see; `gateway/chat.go`'s
@@ -365,8 +371,9 @@ the service's; a `uv sync` at this root restores them.
 The suite runs offline. The library's tests are in `packages/holster-catalog/tests/`:
 `test_tmdb.py` against a mock transport, `test_catalog_tool.py` against that plus plain
 async functions in place of the two model calls, `test_agent_tools.py` on the declared
-schemas and the fake model, and `test_graph.py` on the graph's edges, what its bindings
-carried and each node alone. The service's are in `tests/`: `test_chat.py` and
+schemas and the fake model, `test_graph.py` on the graph's edges, what its bindings
+carried and each node alone, and `test_turn.py` on whole turns through `stream_turn`. The
+service's are in `tests/`: `test_chat.py`, on the NDJSON the gateway reads, and
 `test_main.py`, against the real graph. The graph is driven by
 `holster_catalog.testing.ScriptedChatModel`, a chat model that answers each call with
 the next scripted message and records what each call was sent. Nothing here calls TMDB

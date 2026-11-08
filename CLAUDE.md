@@ -90,10 +90,9 @@ survivable.
   included — can pick an action. History from earlier turns reaches both calls, and the
   first can act on it; there the declared list is the bound. History is text only — each
   turn's words, never its tool results — so an earlier turn's overviews never reach that
-  choice. `HistoryTurn` in `agent/chat.py` and `historyTurn` in `gateway/chat.go` hold
+  choice. `Turn` in `holster_catalog/turn.py` and `historyTurn` in `gateway/chat.go` hold
   that shape. The edges `build_turn` wires in `holster_catalog/graph.py` hold the
-  two-call bound, with the comment in `stream_chat` covering the composer call made
-  after the graph ends; `MODEL_NODES` names the nodes that count. The first-call-only
+  two-call bound; `MODEL_NODES` names the nodes that count. The first-call-only
   rule rests on those edges, which lead nothing back to `interpret`, and on `rank_node`
   and `google_composer`, which bind no tools. `test_graph.py` walks `get_graph()` for
   the edges and reads what the graph's bindings recorded for the tools.

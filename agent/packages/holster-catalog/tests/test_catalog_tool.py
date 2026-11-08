@@ -1,7 +1,7 @@
 """catalog_tool tests — offline, against a fake TMDB transport (same
 FakeTMDB shape as test_tmdb.py) and plain async functions standing in for the
 turn's two model calls (see search_turn). The graph itself, driven by a
-scripted model, is test_chat.py's, and its shape test_graph.py's.
+scripted model, is test_turn.py's, and its shape test_graph.py's.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
 from datetime import date
 from typing import Any, get_args
 from unittest.mock import AsyncMock
@@ -16,7 +17,6 @@ from unittest.mock import AsyncMock
 import httpx2
 import pytest
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_core.runnables import RunnableConfig
 from pydantic import ValidationError
 
 from holster_catalog import catalog_tool, tmdb
@@ -25,6 +25,7 @@ from holster_catalog.catalog_tool import (
     _INTERPRET_SYSTEM_PROMPT,
     _OUTCOME_SYSTEM_PROMPT,
     _RANK_SYSTEM_PROMPT,
+    _RELAXED_LABELS,
     _TONE,
     _UNAVAILABLE_PLACEHOLDER,
     DISCOVER_BATCH_PAGES,
@@ -42,14 +43,19 @@ from holster_catalog.catalog_tool import (
     OutcomeCause,
     RankedPick,
     RankResult,
+    RelaxedConstraint,
     SearchArgs,
     TitleRef,
     TitleVerdict,
+    _empty_cause,
     _format_candidates,
     _interpret_system_message,
     _matching_titles,
+    _nothing_found_message,
     _one_line,
     _rank_content,
+    _relaxed_note,
+    _title_not_found_message,
     _valid_picks,
     _with_target_count,
     _with_taste,
@@ -106,6 +112,14 @@ def rank_must_not_run(reason: str) -> Ranker:
     return fake_rank
 
 
+@dataclass
+class _Outcome(CatalogResult):
+    """A search_turn result plus why it is empty: what the graph hands its compose
+    node."""
+
+    cause: OutcomeCause | None = None
+
+
 async def search_turn(
     message: str,
     *,
@@ -116,7 +130,7 @@ async def search_turn(
     rank_model: Ranker,
     verdicts: list[TitleVerdict] | None = None,
     shown: list[TitleRef] | None = None,
-) -> CatalogResult:
+) -> _Outcome:
     """A turn's catalog path with plain async functions where the graph's two
     model calls go: the interpret call's arguments, then either
     lookup_title(), or find_candidates(), the rank call — skipped on no
@@ -131,7 +145,7 @@ async def search_turn(
             watch_region=watch_region,
             watch_providers=watch_providers,
         )
-        return CatalogResult(
+        return _Outcome(
             picks=picks, relaxed=[], cause=None if picks else "title_not_found"
         )
     found = await find_candidates(
@@ -142,17 +156,18 @@ async def search_turn(
         verdicts=verdicts or [],
         shown=shown or [],
     )
-    ranked = None
-    if found.candidates:
-        request = _rank_content(message, found).split("\n\nCandidates:\n")[0]
-        ranked = await rank_model(request, found.candidates)
-    return await finish_search(
+    if not found.candidates:
+        return _Outcome(picks=[], relaxed=found.relaxed, cause=_empty_cause(found))
+    request = _rank_content(message, found).split("\n\nCandidates:\n")[0]
+    ranked = await rank_model(request, found.candidates)
+    result = await finish_search(
         found,
         ranked,
         client=client,
         watch_region=watch_region,
         watch_providers=watch_providers,
     )
+    return _Outcome(**vars(result))
 
 
 def _title(
@@ -327,7 +342,7 @@ def test_search_lets_tmdb_error_propagate_unwrapped() -> None:
 def test_search_treats_a_malformed_discover_row_as_a_bug_not_an_outage() -> None:
     """A row missing "id" is our parser choking on TMDB's shape, not TMDB
     being transiently down -- it must surface as a bare TMDBError so _safe
-    (and chat.py's _error_reason) log it loudly instead of quietly
+    (and agent/chat.py's _error_reason) log it loudly instead of quietly
     downgrading it as tmdb_unavailable, the "try again later" bucket."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [{"title": "No Id Field"}]})
@@ -1106,7 +1121,7 @@ def _search_with_verdicts(
     verdicts: list[TitleVerdict],
     rank_model: Ranker,
     interpret_model: Interpreter = ok_interpret,
-) -> CatalogResult:
+) -> _Outcome:
     return run(
         search_turn(
             "something good",
@@ -1174,7 +1189,7 @@ def test_search_relaxes_for_a_page_the_user_has_entirely_judged() -> None:
     the user has rated reads as below the floor and the rungs fire. That is
     the useful answer — offering longer heist films beats a dead end — and it
     is safe because rungs accumulate: a rung that finds nothing changes
-    nothing, and chat.py still gives all_judged precedence over `relaxed`, so
+    nothing, and all_judged still takes precedence over `relaxed`, so
     the user is never told nothing matched "even after loosening how long"
     when plenty matched and they had simply seen it all.
 
@@ -1294,7 +1309,6 @@ def test_search_rescues_an_all_excluded_page_from_the_next_one() -> None:
         _capture_rank(seen),
     )
 
-    assert result.cause is None
     assert result.picks
     assert [c["tmdb_id"] for c in seen[0]] == [201]
 
@@ -1452,7 +1466,7 @@ def test_search_drops_the_taste_hint_when_it_overruns_its_budget(
 
 def test_search_reports_when_every_candidate_was_already_judged() -> None:
     """The one empty-picks case with something useful to say. Without this
-    flag chat.py tells the user nothing matched and to loosen the request -
+    flag the turn tells the user nothing matched and to loosen the request -
     both false, and loosening returns the same already-judged titles."""
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [raw_movie(101), raw_movie(102)]})
@@ -2331,7 +2345,7 @@ def _search(
     rank_model: Ranker = _rank_both,
     shown: list[TitleRef] | None = None,
     verdicts: list[TitleVerdict] | None = None,
-) -> CatalogResult:
+) -> _Outcome:
     return run(
         search_turn(
             "something good",
@@ -3110,7 +3124,6 @@ def test_the_next_page_rescues_a_wholly_shown_first_page() -> None:
     )
 
     assert [p["tmdb_id"] for p in result.picks] == [201, 202]
-    assert result.cause is None
     assert result.relaxed == []
 
 
@@ -3465,20 +3478,12 @@ def test_a_fully_shown_page_is_not_reported_as_judged() -> None:
     assert result.cause == "all_shown"
 
 
-def test_a_turn_with_picks_owes_no_explanation() -> None:
-    fake_tmdb = FakeTMDB()
-    fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
-    result = _search(fake_tmdb)
-    assert result.picks
-    assert result.cause is None
-
-
 def _composed(message: str, cause: OutcomeCause, detail: str) -> list[BaseMessage]:
     """What google_composer sends its model for one call."""
     model = scripted(composed_reply(COMPOSED_TEXT))
 
     async def call() -> ComposedReply:
-        return await google_composer(model)(message, cause, detail, RunnableConfig())
+        return await google_composer(model)(message, cause, detail)
 
     reply = run(call())
     assert reply.text == COMPOSED_TEXT
@@ -3566,7 +3571,7 @@ def test_the_shared_tone_reaches_all_three_prompts() -> None:
 
 def test_the_answer_rules_reach_the_two_prompts_that_write_stored_text() -> None:
     """Both of these produce text the gateway stores as the turn's assistant
-    text, which chat.py's _turn_messages replays into the next turn's interpret
+    text, which graph.py's _history_messages replays into the next turn's interpret
     call — where a film this turn invented reads as a title request. In the
     interpret prompt the rules frame every answer kind, not one. The rank call
     is excluded: its job is a list of per-title blurbs, and none of them is stored."""
@@ -3614,3 +3619,104 @@ def test_a_runtime_ceiling_under_a_minute_reads_as_none() -> None:
 def test_a_count_that_is_not_a_number_still_fails() -> None:
     with pytest.raises(ValidationError):
         make_intent(limit="lots")
+
+
+# --- the templates behind the composer, and the note above a widened list ----
+
+
+def test_all_judged_message_replaces_the_loosening_advice() -> None:
+    """all_judged wins over relaxed: if the ladder ran and the survivors were
+    all already rated, "even after loosening how long" names the wrong cause."""
+    assert "rated all of them" in _nothing_found_message("all_judged", [])
+    assert "rated all of them" in _nothing_found_message("all_judged", ["runtime"])
+    assert "loosening" in _nothing_found_message("nothing_matched", [])
+    assert "how long" in _nothing_found_message("nothing_matched", ["runtime"])
+
+
+def test_title_not_found_message_quotes_the_name_back() -> None:
+    """Echoing the name is the point: a misheard or misspelled title is the
+    likeliest reason a lookup found nothing, and the user can only see that
+    if the text shows what was searched for."""
+    text = _title_not_found_message("Nonexistent Film")
+
+    assert '"Nonexistent Film"' in text
+    assert "loosening" not in text
+
+
+def test_all_shown_message_is_not_the_all_judged_one() -> None:
+    """A query run dry by re-asking is not one whose every result the user
+    rated, and saying so would be false."""
+    shown = _nothing_found_message("all_shown", [])
+    assert "rated" not in shown
+    assert "already shown you" in shown
+
+
+def test_all_shown_message_does_not_claim_the_catalog_is_exhausted() -> None:
+    """No search earns "everything there is": the read can stop at the page
+    ceiling, the clock or a failed call, and every query carries a vote floor
+    the user never stated (tmdb.py's MIN_VOTE_COUNT). Claiming the catalog is
+    out is the same class of false statement all_judged and all_shown were
+    split apart to avoid."""
+    shown = _nothing_found_message("all_shown", [])
+    assert "everything I found" in shown
+    # Both readings of the catalog claim, not just the one this branch tried:
+    # "could find" reads as the catalog being out just as "there is" does.
+    assert "everything there is" not in shown
+    assert "everything I could find" not in shown
+
+
+def test_relaxed_note_names_what_was_widened_and_how_far_it_is_exact() -> None:
+    note = _relaxed_note(["genres"], exact_matches=2, total=5)
+    assert "the first 2" in note
+    assert "the genre" in note
+
+
+def test_relaxed_note_reads_naturally_for_a_single_exact_match() -> None:
+    assert "the first matches" in _relaxed_note(["runtime"], exact_matches=1, total=5)
+
+
+def test_relaxed_note_claims_no_count_when_nothing_matched_exactly() -> None:
+    """Counting survivors, not catalog rows: "only two matched" would be false
+    for a page the user had simply already rated."""
+    note = _relaxed_note(["runtime"], exact_matches=0, total=5)
+    # "nothing left", not "nothing matched": the exact matches may simply have
+    # all been shown on an earlier turn, and saying they never existed would
+    # contradict the results still on screen above.
+    assert "Nothing left that matches exactly" in note
+    assert "the first" not in note
+
+
+def test_every_relaxable_constraint_has_a_label() -> None:
+    """The table is hand-synced with catalog_tool.RelaxedConstraint, and an
+    unlabelled rung falls back to its raw code in user-facing copy —
+    "loosening vote_average.desc". Cheap to assert, so the sync is checked
+    rather than remembered."""
+    assert set(get_args(RelaxedConstraint)) <= _RELAXED_LABELS.keys()
+
+
+def test_the_rating_bar_is_spoken_in_both_sentences() -> None:
+    """One rung, two places it can surface: above a widened list, and in the
+    nothing-found reply."""
+    assert "the rating bar" in _relaxed_note(["rating"], exact_matches=1, total=5)
+    assert "the rating bar" in _nothing_found_message("nothing_matched", ["rating"])
+
+
+def test_no_note_when_nothing_was_relaxed() -> None:
+    assert _relaxed_note([], exact_matches=5, total=5) == ""
+
+
+def test_no_note_when_widening_changed_nothing_on_screen() -> None:
+    """A note about a wider search that contributed no pick sends the user
+    looking for results that are not there."""
+    assert _relaxed_note(["runtime"], exact_matches=5, total=5) == ""
+
+
+def test_every_outcome_cause_has_a_duty_in_the_prompt() -> None:
+    """The prompt spells out one duty per cause, and they are mutually
+    exclusive — a cause the prompt never names loses its duty silently, leaving
+    the model to guess which of the others it is in."""
+    for cause in get_args(OutcomeCause):
+        # The labelled form, not a bare substring: a cause whose name happened
+        # to occur in another duty's prose would otherwise pass with no duty
+        # of its own.
+        assert f"{cause}:" in _OUTCOME_SYSTEM_PROMPT
