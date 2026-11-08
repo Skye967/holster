@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /agent
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    # The lockfile is what the image installs; holster-catalog's pyproject.toml
+    # floors are part of a published library's contract.
+    versioning-strategy: lockfile-only
+    # Transitive packages too: they are most of what CI's pip-audit step flags,
+    # and the default covers direct dependencies only.
+    allow:
+      - dependency-type: all
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
