@@ -51,7 +51,7 @@ uv run uvicorn main:asgi_app --port 8000 --reload   # or: uv run python main.py
 curl -s localhost:8000/health                        # {"status": "ok"}
 ```
 
-uv 0.13.7 is the version `Dockerfile` and CI pin.
+uv 0.13.7 is the version `Dockerfile`, CI and the catalog release workflow pin.
 
 `agent/` is a uv workspace with one lockfile and one `.venv`. The service is `main.py`
 and `chat.py` at its root, run and never built; the catalog core is the

@@ -1,0 +1,58 @@
+name: Release holster-catalog
+
+on:
+  push:
+    tags: ['holster-catalog/v*']
+
+permissions:
+  contents: write
+
+jobs:
+  # agent/packages/holster-catalog/README.md's Versioning section describes this
+  # job; change them together.
+  release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      # Full history of every branch: the next step walks main back to the tag's
+      # commit.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Releases come from main: a tag on a commit main does not contain would
+      # publish code main does not have.
+      - name: Tag is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main" >&2
+            exit 1
+          fi
+      # Bump with ci.yml's setup-uv pins.
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: 0.13.7
+      # Before the build: a tag that names another version would publish a
+      # Release whose wheel carries a different version.
+      - name: Tag matches the version
+        run: |
+          version=$(uv version --package holster-catalog --short)
+          if [ "${GITHUB_REF_NAME#holster-catalog/v}" != "$version" ]; then
+            echo "::error::$GITHUB_REF_NAME does not match pyproject.toml's $version" >&2
+            exit 1
+          fi
+      # main is not protected and ci.yml runs on pull requests, so a commit on main
+      # may never have passed CI: the release runs the library's suite on it itself.
+      - name: pytest
+        working-directory: agent/packages/holster-catalog
+        run: uv run --locked --package holster-catalog pytest
+      - name: uv build
+        run: uv build --package holster-catalog --no-sources
+      # uv build --package writes to the workspace root's dist/, this job's
+      # working directory.
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
