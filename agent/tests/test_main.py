@@ -2,13 +2,12 @@ import asyncio
 import json
 import logging
 from collections.abc import Iterator
-from typing import Any
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from holster_catalog.graph import build_turn
+from holster_catalog import build_turn
 from holster_catalog.testing import (
     MOVIE_A,
     FakeTMDB,
@@ -23,7 +22,6 @@ from main import (
     app,
     asgi_app,
     get_agent,
-    get_compose_model,
     get_tmdb_client,
     lifespan,
 )
@@ -81,11 +79,12 @@ def test_chat_streams_ndjson_events() -> None:
     fake_tmdb = FakeTMDB()
     fake_tmdb.ok("/discover/movie", {"results": [MOVIE_A]})
 
-    agent = build_turn(scripted(search_call(keywords=["heist"]), rank_reply(101)))
+    agent = build_turn(
+        scripted(search_call(keywords=["heist"]), rank_reply(101)), ok_compose
+    )
 
     app.dependency_overrides[get_tmdb_client] = fake_tmdb.client
     app.dependency_overrides[get_agent] = lambda: agent
-    app.dependency_overrides[get_compose_model] = lambda: ok_compose
 
     resp = client.post(
         "/chat",
@@ -102,10 +101,9 @@ def test_chat_requires_a_message() -> None:
     # FastAPI resolves Depends() alongside body validation rather than only
     # after it succeeds, so the route's dependencies still need a value even
     # on a request this test expects to fail on the body — see main.py's
-    # get_tmdb_client/get_agent/get_compose_model.
+    # get_tmdb_client/get_agent.
     app.dependency_overrides[get_tmdb_client] = FakeTMDB().client
-    app.dependency_overrides[get_agent] = lambda: build_turn(scripted())
-    app.dependency_overrides[get_compose_model] = lambda: _must_not_be_called
+    app.dependency_overrides[get_agent] = lambda: build_turn(scripted(), ok_compose)
 
     resp = client.post("/chat", json={"watch_region": "US", "watch_providers": [8]})
 
@@ -155,10 +153,6 @@ def test_providers_requires_region() -> None:
     resp = client.get("/providers")
 
     assert resp.status_code == 422
-
-
-async def _must_not_be_called(*_args: Any, **_kwargs: Any) -> Any:
-    raise AssertionError("should not run — body validation must reject first")
 
 
 # --- /titles ---------------------------------------------------------------

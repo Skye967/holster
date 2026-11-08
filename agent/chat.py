@@ -1,10 +1,7 @@
 """Chat pipeline — turns one message into a stream of NDJSON events.
 
-Runs the catalog graph and passes on what its interpret node writes (the opener
-and the intent, streamed as LangGraph "custom" events) the moment each arrives,
-then answers from the graph's final state. That is what lets an
-"intent" event reach the caller in ~1-2s while the full turn (a deep search is
-several TMDB round trips, plus the rank call) is still running.
+Runs one turn through holster_catalog's stream_turn and maps what it yields to
+the wire: the opener and the intent the moment each arrives, then the outcome.
 
 Event shapes on the wire (one JSON object per line):
 
@@ -25,7 +22,7 @@ Event shapes on the wire (one JSON object per line):
            catalog_tool.py's _merge_enrichment. watch_link is the region's
            watch page, None on that same failure or when TMDB gave no usable
            one
-        -- kind is which node answered the turn, read from the graph's
+        -- kind is which path answered the turn, read from the graph's
            state rather than inferred from intent fields; the gateway
            writes it into stored history (chat.go's summarizePicks)
         -- note is the one-line explanation of a widened search, empty
@@ -56,40 +53,44 @@ module has no transport opinion beyond "an async stream of dicts."
 Cancellation is plain asyncio cancellation, nothing bespoke, and it stops the
 turn rather than the graph step in flight. When the client disconnects, the
 caller (main.py's StreamingResponse) cancels the task this generator is running
-in: the response ends at once, no later step starts, and work awaited here,
-finish_search or a compose call, is cancelled. A graph step in flight is not.
-StreamingResponse's anyio task group redelivers the cancel until the task ends,
-and that lands on LangGraph's cleanup before it can cancel the step, so the
-step runs to its end under its own timeouts, TMDB calls it has yet to make
-included, and its result goes nowhere. contextlib.aclosing is what closes the
-graph's stream before a close at a yield here returns, rather than whenever the
-stream is finalized. See ARCHITECTURE.md's "One socket per session" for why the
-agent needs no cancel protocol of its own.
+in: the response ends at once and no later step starts. A step in flight is not
+cancelled, and every step of a turn runs in the graph, finish_search and the
+composer included. StreamingResponse's anyio task group redelivers the cancel
+until the task ends, and that lands on LangGraph's cleanup before it can cancel
+the step, so the step runs to its end under its own timeouts, TMDB calls it has
+yet to make included, and its result goes nowhere. contextlib.aclosing is what
+closes the turn's stream before a close at a yield here returns, rather than
+whenever the stream is finalized. See ARCHITECTURE.md's "One socket per session"
+for why the agent needs no cancel protocol of its own.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncGenerator, Sequence
-from typing import Any, Literal, cast
+from collections.abc import AsyncGenerator
+from typing import Any
 
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from holster_catalog.catalog_tool import (
+from holster_catalog import (
+    CatalogGraph,
     CatalogToolError,
-    Composer,
-    OutcomeCause,
+    Intent,
+    LookUpArgs,
+    Opener,
+    Outcome,
+    Results,
     TitleRef,
     TitleVerdict,
-    compose,
-    finish_search,
+    TMDBClient,
+    TMDBUnavailable,
+    Turn,
+    TurnContext,
+    TurnEvent,
+    stream_turn,
 )
-from holster_catalog.graph import CatalogGraph, TurnContext, TurnState
-from holster_catalog.tmdb import TMDBClient, TMDBUnavailable
 
 logger = logging.getLogger("holster.chat")
 
@@ -98,7 +99,7 @@ logger = logging.getLogger("holster.chat")
 # the agent receives what it needs") — a bug upstream should cost a truncated
 # prompt, not an unbounded one.
 #
-# Counted in messages, not exchanges: HistoryTurn is one row. Deliberately well
+# Counted in messages, not exchanges: a Turn is one row. Deliberately well
 # clear of gateway's windowHistory (maxHistoryExchanges*2 = 10), which
 # is the real policy — a backstop sitting at the operating point stops being a
 # backstop and silently becomes a second, tighter window.
@@ -116,16 +117,6 @@ MAX_HISTORY_TURNS = 20
 # not reach it.
 MAX_SHOWN = 2000
 
-# What the outcome composer gets before the turn answers from its template.
-# The SDK's own envelope is no bound worth resting on: timeout=15.0 (main.py)
-# is three times this cap on its own.
-#
-# It bounds what this call adds, not what the turn has already spent — an empty
-# turn arrives here having run page 1 and the whole ladder — so a turn already
-# near the gateway's 30s turnDeadline still passes it, and the dropped-stream
-# fallback is what the user sees.
-COMPOSE_TIMEOUT_SECONDS = 5.0
-
 # Hand-written, and the one turn that reaches no model at all. Composing it
 # would put the first message most new visitors ever see behind a call on a
 # 15-request-a-minute tier, to rephrase advice that is always the same; it
@@ -136,22 +127,6 @@ NO_PROVIDERS_MESSAGE = (
     "You haven't picked any streaming services yet. Head to Connections to "
     "set them up and I'll be able to find something for you."
 )
-
-# Keep the keys in sync with catalog_tool.RelaxedConstraint by hand — .get()
-# below falls back to the raw code, so a missed label reads oddly rather than
-# raising, the same trade friendlyError() makes against _error_reason().
-_RELAXED_LABELS = {
-    "runtime": "how long",
-    "year": "the year",
-    "keywords": "the mood",
-    "genres": "the genre",
-    "rating": "the rating bar",
-}
-
-
-class HistoryTurn(BaseModel):
-    role: Literal["user", "assistant"]
-    text: str
 
 
 class ChatRequest(BaseModel):
@@ -172,7 +147,7 @@ class ChatRequest(BaseModel):
     # still never reads it directly; it only ever sees this windowed slice,
     # handed to it fresh on every call. Oldest-first, current message not
     # included here.
-    history: list[HistoryTurn] = Field(default_factory=list)
+    history: list[Turn] = Field(default_factory=list)
     # The caller's whole title_verdicts set, loaded by the gateway with the
     # message. Passed straight through; catalog_tool.find_candidates()
     # decides what each value means.
@@ -182,198 +157,6 @@ class ChatRequest(BaseModel):
     # above: a title re-offered is a visible bug where an old turn falling out
     # of the prompt is not. This agent holds nothing between turns.
     shown: list[TitleRef] = Field(default_factory=list)
-
-
-def _turn_messages(message: str, history: list[HistoryTurn]) -> list[AnyMessage]:
-    """The graph's input: each recent turn as its own message, oldest first,
-    then the current message last. The interpret call is sent all of it; the
-    rank call rebuilds the last message and takes the turns before it."""
-    turns: list[AnyMessage] = [
-        HumanMessage(t.text) if t.role == "user" else AIMessage(t.text) for t in history
-    ]
-    return [*turns, HumanMessage(message)]
-
-
-def _human_join(items: Sequence[str]) -> str:
-    """ "Netflix, Hulu and Max" — mirrors gateway/chat.go's
-    humanJoin so the same kind of list reads the same way wherever it
-    reaches the user (the interpreting line, a capability answer, here)."""
-    if not items:
-        return ""
-    if len(items) == 1:
-        return items[0]
-    return ", ".join(items[:-1]) + f" and {items[-1]}"
-
-
-def _relaxed_labels(relaxed: Sequence[str]) -> str:
-    """What the ladder dropped, in the caller's words. The only reader of
-    _RELAXED_LABELS, so the two sentences below can't come to describe the
-    same relaxation differently."""
-    return _human_join([_RELAXED_LABELS.get(r, r) for r in relaxed])
-
-
-def _title_not_found_message(title: str) -> str:
-    """The fallback when the outcome composer cannot write this one — see
-    _outcome_text.
-
-    A named title nothing carried — TMDB returned no rows, or none of the
-    rows it did return actually bear the name. Distinct from
-    _nothing_found_message because the advice differs: there is nothing to
-    loosen, and "try loosening what you're looking for" reads as nonsense in
-    reply to a name. Quotes the name back so a misheard or misspelled one is
-    visible to the user, which is the likeliest cause -- and saying so is
-    honest where a card for the nearest real title would assert an answer
-    about something they never asked about."""
-    return (
-        f'I couldn\'t find anything called "{title}". Check the spelling, or '
-        "tell me what you're in the mood for instead."
-    )
-
-
-def _nothing_found_message(
-    cause: Literal["nothing_matched", "all_shown", "all_judged"],
-    relaxed: Sequence[str],
-) -> str:
-    """The fallback when the outcome composer cannot write this one — see
-    _outcome_text.
-
-    Why nothing came back, in the caller's words. Keyed on the cause
-    finish_search() already decided rather than on the flags behind it, so the
-    sentence the user reads and the duty the composer was given cannot describe
-    the turn differently.
-
-    On nothing_matched the copy names no constraint, deliberately: the ladder
-    may already have dropped runtime or year to get this page, so "drop the
-    runtime" can be advice to redo what was already done; and this text becomes
-    assistant history feeding the next turn's interpret call, the same hazard
-    _capability_message documents below."""
-    if cause == "all_judged":
-        return (
-            "I found things, but you've rated all of them already. Try "
-            "asking for something different."
-        )
-    if cause == "all_shown":
-        # "everything I found", not "everything there is": the read can stop at
-        # the page ceiling, the clock, or a failed call, and every query is
-        # filtered by a vote floor the user never stated (tmdb.py's
-        # MIN_VOTE_COUNT), which only the rating sort's rung bends and only
-        # back to that same floor. What this search got to is the most it can
-        # claim.
-        return (
-            "I've already shown you everything I found for that. Try "
-            "something different and I'll keep looking."
-        )
-    if not relaxed:
-        return "Nothing matched that. Try loosening what you're looking for."
-    labels = _relaxed_labels(relaxed)
-    return f"Nothing matched, even after loosening {labels}. Try a different request."
-
-
-def _relaxed_note(relaxed: Sequence[str], exact_matches: int, total: int) -> str:
-    """The line above a result set the ladder had to widen to fill.
-
-    Composed here rather than in the gateway so _RELAXED_LABELS isn't
-    duplicated across two services and left to drift.
-
-    Without this the widening is invisible and reads as the assistant ignoring
-    half the request. It describes what is on screen rather than the catalog —
-    "only the first two match exactly" holds whether the narrow query found
-    nothing or found things the user had already rated. finish_search() orders
-    picks exactness-first, so "the first" is accurate.
-
-    Empty when nothing was relaxed, and also when widening changed nothing
-    that reached the screen — a note about a wider search that contributed no
-    pick would send the user looking for results that aren't there.
-
-    The zero-exact wording says "nothing left" rather than "nothing matched":
-    a query can be widened because the exact matches were all shown on an
-    earlier turn, and telling that user nothing matched their request
-    contradicts the results they are still scrolled past.
-    """
-    if not relaxed or exact_matches >= total:
-        return ""
-    labels = _relaxed_labels(relaxed)
-    if exact_matches == 0:
-        return f"Nothing left that matches exactly, so I widened past {labels}."
-    lead = (
-        "Only the first matches"
-        if exact_matches == 1
-        else f"Only the first {exact_matches} match"
-    )
-    return f"{lead} exactly what you asked for — I widened past {labels}."
-
-
-def _capability_message(provider_names: Sequence[str]) -> str:
-    """The fallback for an answer turn whose model-written text came back
-    blank. Keeping it is what holds the guarantee gateway/chat.go's
-    runTurn relies on for "message": that its text is never empty,
-    and so can be stored as the turn's answer unguarded.
-
-    Names the caller's own services (if
-    resolved — provider_names can be empty while the per-country name
-    cache warms up) plus example phrasing, never a feature list. No concrete
-    numbers in the example: this text becomes conversation history and feeds
-    the next turn's interpret call (_turn_messages, above).
-    """
-    where = f" on {_human_join(provider_names)}" if provider_names else ""
-    return (
-        f"I can find something to watch{where} — try something like "
-        '"something funny and short" or "a slow-burn thriller with '
-        "[actor].\" Tell me what you're in the mood for."
-    )
-
-
-async def _outcome_text(
-    message: str,
-    cause: OutcomeCause,
-    *,
-    model: Composer,
-    config: RunnableConfig,
-    title: str,
-    relaxed: Sequence[str],
-) -> str:
-    """The model's own sentence for a turn that ended with nothing to show,
-    bounded by COMPOSE_TIMEOUT_SECONDS and degrading to the template behind it.
-
-    The detail the composer is given and the template it falls back to are
-    chosen here, from the one cause, so the sentence a user reads cannot
-    describe a different turn from the duty the model was set. Only
-    nothing_matched has a detail the prompt defines beyond the title: the other
-    two are about what the user has already seen or rated, where naming what
-    the ladder loosened would merge two answers.
-
-    Degrade, don't fail, the same split catalog_tool's _safe() makes: the turn
-    already has its answer and only the wording is at stake.
-
-    Warning, not exception: compose() flattens every model failure into
-    CatalogToolError, so a free-tier refusal and a schema fault arrive here
-    identically and this function has no signal to tell them apart. The
-    traceback is kept because a schema or wiring fault fails every call and
-    would otherwise show up only as prose that never got warmer. The SDK's own
-    timeout is in that arm too, compose() having wrapped it; the deadline this
-    function owns is the other one.
-
-    A blank result falls back too: ComposedReply.text is required of the model,
-    which still leaves "" satisfying the schema, and an empty "message" event
-    would persist an empty assistant turn.
-    """
-    if cause == "title_not_found":
-        fallback, detail = _title_not_found_message(title), title
-    else:
-        fallback = _nothing_found_message(cause, relaxed)
-        detail = _relaxed_labels(relaxed) if cause == "nothing_matched" else ""
-    try:
-        async with asyncio.timeout(COMPOSE_TIMEOUT_SECONDS):
-            composed = await compose(message, cause, detail, model=model, config=config)
-    except TimeoutError:
-        logger.info("outcome composer timed out, degraded", extra={"cause": cause})
-        return fallback
-    except CatalogToolError:
-        logger.warning(
-            "outcome composer failed, degraded", exc_info=True, extra={"cause": cause}
-        )
-        return fallback
-    return composed.text.strip() or fallback
 
 
 def _error_reason(exc: Exception) -> str:
@@ -399,12 +182,37 @@ def _error_reason(exc: Exception) -> str:
     return "internal"
 
 
+def _wire(event: TurnEvent | Outcome) -> dict[str, Any]:
+    """The NDJSON dict for one thing a turn yielded, built by hand because the
+    wire is not the type: a Results' exact_matches stays here, and an intent
+    loses its reply."""
+    if isinstance(event, Opener):
+        return {"type": "reply", "text": event.text}
+    if isinstance(event, Intent):
+        args = event.args
+        # A lookup's is title alone, which gateway/chat.go's interpretingLine
+        # templates off. A search's is SearchArgs by JSON name, which its
+        # agentIntent mirrors; reply leaves it because it has its own event.
+        if isinstance(args, LookUpArgs):
+            return {"type": "intent", "intent": {"title": args.title}}
+        intent = args.model_dump(exclude={"reply"}, exclude_none=True)
+        return {"type": "intent", "intent": intent}
+    if isinstance(event, Results):
+        return {
+            "type": "results",
+            "kind": event.kind,
+            "relaxed": event.relaxed,
+            "note": event.note,
+            "picks": event.picks,
+        }
+    return {"type": "message", "text": event.text}
+
+
 async def stream_chat(
     req: ChatRequest,
     *,
     client: TMDBClient,
     agent: CatalogGraph,
-    compose_model: Composer,
     correlation_id: str | None,
 ) -> AsyncGenerator[dict[str, Any]]:
     # gateway's runTurn skips loading verdicts entirely for a caller
@@ -416,7 +224,6 @@ async def stream_chat(
         yield {"type": "done"}
         return
 
-    messages = _turn_messages(req.message, req.history[-MAX_HISTORY_TURNS:])
     # Logged where the history backstop above is not: that one sits at twice a
     # window the gateway enforces, so only a gateway bug reaches it, while this
     # one has no window behind it at all — see MAX_SHOWN.
@@ -435,131 +242,30 @@ async def stream_chat(
         verdicts=req.verdicts,
         shown=shown,
     )
-    # One config for every run the turn starts — the graph's and the outcome
-    # composer's — so both carry the request's correlation id, the one this
-    # service's log lines for it carry. LangSmith receives these runs only when
-    # tracing is switched on; see README.md.
+    # The turn's run carries the request's correlation id, the one this
+    # service's log lines for it carry, and every run inside it inherits that.
+    # LangSmith receives these runs only when tracing is switched on; see
+    # README.md.
     config = RunnableConfig(
         run_name="chat_turn", metadata={"correlation_id": correlation_id}
     )
 
     try:
-        # "custom" is what the interpret node writes — the opener and the
-        # intent — passed through as they arrive. "values" is the whole state
-        # after each step; the last one is the turn's result.
-        state: TurnState | None = None
-        # astream is an async generator, typed as the iterator it returns.
-        stream = cast(
-            AsyncGenerator[tuple[str, Any]],
-            agent.astream(
-                {"messages": [*messages]},
-                config=config,
-                context=context,
-                stream_mode=["custom", "values"],
-            ),
+        stream = stream_turn(
+            agent,
+            message=req.message,
+            history=req.history[-MAX_HISTORY_TURNS:],
+            context=context,
+            config=config,
         )
         async with contextlib.aclosing(stream):
-            async for mode, chunk in stream:
-                if mode == "custom":
-                    yield cast(dict[str, Any], chunk)
-                else:
-                    state = cast(TurnState, chunk)
-
-        # Every empty-result branch below composes its sentence with a model
-        # call, and every one of them has a call to spare: a lookup made one,
-        # and a search whose pick list is empty made no rank call — an empty
-        # pick list means an empty candidate list, since finish_search()'s
-        # top-up otherwise fills the list to `floor`, which
-        # min(RESULT_FLOOR, limit) and SearchArgs.limit's `ge=1` hold at one
-        # or more, and the graph skips the rank call on no candidates.
-        if state is not None and "answer_kind" in state:
-            # The model's own answer, written with the caller's services in
-            # its system prompt (catalog_tool's _interpret_system_message) — no
-            # second call, and no template unless it came back blank. The
-            # template serves a blank reply of any kind: it says what the
-            # assistant is for and asks what they are in the mood for.
-            yield {
-                "type": "message",
-                "text": state["answer_text"]
-                or _capability_message(req.watch_provider_names),
-            }
-        elif state is not None and "lookup_picks" in state:
-            if state["lookup_picks"]:
-                yield {
-                    "type": "results",
-                    "kind": "lookup",
-                    "relaxed": [],
-                    "note": "",
-                    "picks": state["lookup_picks"],
-                }
-            else:
-                yield {
-                    "type": "message",
-                    "text": await _outcome_text(
-                        req.message,
-                        "title_not_found",
-                        model=compose_model,
-                        config=config,
-                        title=state["lookup_title"],
-                        relaxed=[],
-                    ),
-                }
-        elif state is not None and "found" in state:
-            result = await finish_search(
-                state["found"],
-                state.get("ranked"),
-                client=client,
-                watch_region=req.watch_region,
-                watch_providers=req.watch_providers,
-            )
-            if result.picks:
-                yield {
-                    "type": "results",
-                    "kind": "search",
-                    "relaxed": result.relaxed,
-                    "note": _relaxed_note(
-                        result.relaxed, result.exact_matches, len(result.picks)
-                    ),
-                    "picks": result.picks,
-                }
-            elif result.cause is not None:
-                yield {
-                    "type": "message",
-                    "text": await _outcome_text(
-                        req.message,
-                        result.cause,
-                        model=compose_model,
-                        config=config,
-                        title="",
-                        relaxed=result.relaxed,
-                    ),
-                }
-            else:
-                # Unreachable by construction: finish_search() sets a cause
-                # whenever it returns no picks.
-                yield {
-                    "type": "message",
-                    "text": _nothing_found_message("nothing_matched", []),
-                }
-        else:
-            # Unreachable by construction — every path through the graph
-            # passes through search, lookup or answer. Total anyway: a turn that
-            # emitted only "done" would leave the gateway nothing to persist and
-            # the user a blank answer.
-            yield {
-                "type": "message",
-                "text": _nothing_found_message("nothing_matched", []),
-            }
+            async for event in stream:
+                yield _wire(event)
         yield {"type": "done"}
     except Exception as exc:
         # Not `except BaseException` — a cancelled turn (asyncio.CancelledError)
         # and a closed stream (GeneratorExit) must propagate, not be reported
         # as an error.
-        #
-        # Spans the whole body, not just the graph: the outcome branch awaits
-        # a model call of its own, and an exception escaping it would
-        # otherwise end the turn with no event at all, which the gateway would
-        # see as a stream that stopped rather than an error frame.
         reason = _error_reason(exc)
         if reason == "internal":
             logger.exception("chat pipeline failed")

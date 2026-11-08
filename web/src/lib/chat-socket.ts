@@ -69,7 +69,7 @@ export interface AgentPick {
 // and rendered above it. Separate from `token` because a token renders below
 // the cards and a later `message` on the same turn replaces it; the gateway
 // also never stores this one, so a reloaded conversation shows no opener.
-// `note` is `relaxed` said in a sentence — the agent composes it (chat.py's
+// `note` is `relaxed` said in a sentence — the agent composes it (holster_catalog's
 // _relaxed_note) and it is what gets rendered; `relaxed` stays alongside as
 // the machine-readable form. Both are `omitempty`, so both are optional here.
 export type ChatEvent =

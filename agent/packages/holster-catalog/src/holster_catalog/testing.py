@@ -18,7 +18,7 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.outputs import ChatResult
-from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel, Field
@@ -271,8 +271,7 @@ class RecordingComposer:
     """Records every outcome call instead of raising when it is unwanted.
 
     Recorded rather than raising, for the same reason FakeTMDB records
-    requests: compose() wraps anything a Composer
-    raises as CatalogToolError, which _outcome_text degrades from — so a double
+    requests: the compose node degrades from anything a Composer raises, so a double
     that raised would answer from the template and assert nothing. A call this
     turn should not have made is asserted on `calls` after it finishes.
     """
@@ -280,29 +279,27 @@ class RecordingComposer:
     def __init__(self, text: str = COMPOSED_TEXT) -> None:
         self._text = text
         self.calls: list[tuple[OutcomeCause, str]] = []
+        self.messages: list[str] = []
 
     @property
     def causes(self) -> list[OutcomeCause]:
         return [cause for cause, _ in self.calls]
 
     def __call__(self) -> Composer:
-        async def call(
-            message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
-        ) -> ComposedReply:
+        async def call(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
             self.calls.append((cause, detail))
+            self.messages.append(message)
             return ComposedReply(text=self._text)
 
         return call
 
 
-async def ok_compose(
-    message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
-) -> ComposedReply:
+async def ok_compose(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
     return ComposedReply(text=COMPOSED_TEXT)
 
 
 async def failing_compose(
-    message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
+    message: str, cause: OutcomeCause, detail: str
 ) -> ComposedReply:
-    """Drives chat.py back onto the templates that are now fallbacks."""
+    """Drives the compose node back onto its templates."""
     raise CatalogToolError("composer unavailable")

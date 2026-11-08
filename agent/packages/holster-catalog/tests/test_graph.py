@@ -1,6 +1,6 @@
 """The turn's graph, offline: the edges that hold the two-call bound, what each
 model binding carried, and the nodes refusing a misbehaving model, each called
-on its own with a hand-built Runtime. chat.py's tests run most of those refusals
+on its own with a hand-built Runtime. test_turn.py runs most of those refusals
 through a whole turn.
 """
 
@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 from langgraph.graph import END, START
 from langgraph.runtime import Runtime
 
@@ -21,12 +22,15 @@ from holster_catalog.catalog_tool import (
     Candidates,
     CatalogToolError,
     RankResult,
+    SearchCause,
+    _nothing_found_message,
 )
 from holster_catalog.graph import (
     MODEL_NODES,
     RECURSION_LIMIT,
     TurnContext,
     TurnState,
+    _empty_outcome,
     build_turn,
     interpret_node,
     rank_node,
@@ -36,13 +40,18 @@ from holster_catalog.testing import (
     FakeTMDB,
     _tool_call,
     lookup_call,
+    make_intent,
+    ok_compose,
     scripted,
     search_call,
 )
 
 
 def _edges() -> list[tuple[str, str]]:
-    return [(e.source, e.target) for e in build_turn(scripted()).get_graph().edges]
+    return [
+        (e.source, e.target)
+        for e in build_turn(scripted(), ok_compose).get_graph().edges
+    ]
 
 
 def _paths() -> list[list[str]]:
@@ -70,6 +79,14 @@ def test_no_path_passes_through_more_than_two_model_nodes() -> None:
     assert max(len(MODEL_NODES.intersection(path)) for path in paths) == 2
 
 
+def test_finish_ends_the_turn_and_compose_follows_no_rank_call() -> None:
+    """finish ends the turn and compose is entered only where no rank call was
+    made, which keeps a third model node off every path."""
+    edges = _edges()
+    assert [t for s, t in edges if s == "finish"] == [END]
+    assert sorted(s for s, t in edges if t == "compose") == ["lookup", "search"]
+
+
 def test_nothing_leads_back_to_the_interpret_node() -> None:
     """It alone is offered tools, so nothing read after it can pick an action."""
     assert [s for s, target in _edges() if target == "interpret"] == [START]
@@ -82,7 +99,7 @@ def test_the_recursion_limit_is_the_longest_path_plus_one() -> None:
 
 
 def test_every_run_of_the_graph_carries_the_recursion_limit() -> None:
-    config = build_turn(scripted()).config
+    config = build_turn(scripted(), ok_compose).config
     assert config is not None and config["recursion_limit"] == RECURSION_LIMIT
 
 
@@ -91,7 +108,7 @@ def test_each_binding_carries_only_what_its_call_needs() -> None:
     format, and the rank call must answer with a ranking, so it has no tools."""
     model = scripted()
 
-    build_turn(model)
+    build_turn(model, ok_compose)
 
     assert model.bound == [
         {
@@ -116,7 +133,8 @@ def _runtime(events: list[Any]) -> Runtime[TurnContext]:
 
 def _state() -> TurnState:
     return TurnState(
-        messages=[HumanMessage("a heist movie")],
+        message="a heist movie",
+        history=[],
         found=Candidates(
             candidates=[tmdb._trim_title(MOVIE_A, "movie")],
             rung_of={101: 0},
@@ -168,3 +186,24 @@ def test_the_rank_node_refuses_anything_but_a_ranking(reply: AIMessage) -> None:
 
     with pytest.raises(CatalogToolError):
         asyncio.run(node(_state(), _runtime([])))
+
+
+@pytest.mark.parametrize(
+    ("cause", "all_judged", "all_shown"),
+    [("all_judged", True, False), ("all_shown", False, True)],
+)
+def test_a_seen_or_rated_cause_names_nothing_the_ladder_loosened(
+    cause: SearchCause, all_judged: bool, all_shown: bool
+) -> None:
+    found = replace(
+        _state()["found"],
+        relaxed=["runtime"],
+        all_judged=all_judged,
+        all_shown=all_shown,
+    )
+
+    assert _empty_outcome(TurnState(intent=make_intent(), found=found)) == (
+        cause,
+        "",
+        _nothing_found_message(cause, ["runtime"]),
+    )

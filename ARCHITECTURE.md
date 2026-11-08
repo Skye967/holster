@@ -53,18 +53,17 @@ survivable rather than trying to prevent it:
 That last point is the load-bearing one. An open-ended "fetch this URL for me" tool
 would be less code and would undo everything above.
 
-The menu is offered once. The turn is a LangGraph graph with no cycle, bounded to
-two model calls with tools offered on the first alone, so nothing read within a turn
-after the user's message — overviews included — can pick an action. A manipulated
-overview can sway the ranking, win a bad blurb or make the turn fail, but a card's
-title, year and availability always come from TMDB. Earlier turns are another matter:
-history reaches both calls, carrying the titles each turn showed and the assistant's
-earlier replies, and the first can act on it. History is text only, never a turn's tool
-results, so an earlier turn's overviews do not come back. There the fixed menu above is
-the bound: history can choose which declared tool runs and with what arguments or reply
-text, never where a request goes. The edges `build_turn` wires in
-`holster_catalog/graph.py` hold the two-call bound inside the graph, and `stream_chat`
-calls the composer, after the graph ends, only on a turn that made no rank call; those
+The menu is offered once. The turn is a LangGraph graph with no cycle, bounded to two
+model calls with tools offered on the first alone, so nothing read within a turn after the
+user's message — overviews included — can pick an action. A manipulated overview can sway
+the ranking, win a bad blurb or make the turn fail, but a card's title, year and
+availability always come from TMDB. Earlier turns are another matter: history reaches both
+calls, carrying the titles each turn showed and the assistant's earlier replies, and the
+first can act on it. History is text only, never a turn's tool results, so an earlier
+turn's overviews do not come back. There the fixed menu above is the bound: history can
+choose which declared tool runs and with what arguments or reply text, never where a
+request goes. The edges `build_turn` wires in `holster_catalog/graph.py` hold the two-call
+bound, the composer being a step entered only by a turn that made no rank call; those
 edges and the bindings in `rank_node` and `google_composer`, which offer no tools, hold
 the first-call-only rule. `agent/README.md` *Catalog tool* walks each call.
 

@@ -53,9 +53,8 @@ to that list either way, by _merge_enrichment, whichever query produced the
 row.
 
 LangChain lives at the bottom of this file — the prompts and the composer's
-model binding — and in graph.py. Everything above it is plain TMDB and Python,
-tested without a model. The one LangChain type up there is the RunnableConfig
-compose() passes on unread.
+model binding. Everything above it is plain TMDB and Python, tested without a
+model.
 """
 
 from __future__ import annotations
@@ -65,7 +64,7 @@ import json
 import logging
 import re
 import unicodedata
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal, cast
@@ -73,7 +72,6 @@ from typing import Any, Literal, cast
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from holster_catalog.tmdb import (
@@ -375,28 +373,30 @@ MAX_DISCOVER_PAGES = 25
 # ever yielding to its own deadline.
 DISCOVER_BATCH_PAGES = 3
 
+# The causes a search can end on, _empty_cause's three. A lookup has the fourth.
+SearchCause = Literal["nothing_matched", "all_shown", "all_judged"]
+
 # Why a turn ended with nothing to show. Fed to the composer, never guessed by
 # it: each cause owes the user a different sentence, and a model asked to work
 # out which case it is in can pick the wrong duty.
 #
 # A caller with no ticked services is not here: that turn answers from
-# chat.py's NO_PROVIDERS_MESSAGE without reaching a model at all, which is what
+# agent/chat.py's NO_PROVIDERS_MESSAGE without reaching a model at all, which is what
 # gateway/chat.go's guest throttle assumes when it meters only frames
 # carrying providers.
-OutcomeCause = Literal["nothing_matched", "all_shown", "all_judged", "title_not_found"]
+OutcomeCause = Literal[SearchCause, "title_not_found"]
 
 # What the answer tool was asked to say: a question about the assistant, a
 # question back about what to watch, film and TV talk that wants no search, or
-# a decline for something that is not film or TV. Agent-internal: chat.py reads
-# only that a kind is present, and emits every one as the same "message" event,
-# so the gateway never sees which it was.
+# a decline for something that is not film or TV. Agent-internal: every kind
+# ends the turn as the same Message outcome, so the gateway never sees which it
+# was.
 AnswerKind = Literal["capability", "clarifying", "chat", "off_topic"]
 
 
 @dataclass
 class CatalogResult:
-    """finish_search()'s output: what a search turn shows, and why when it
-    shows nothing."""
+    """finish_search()'s output: what a search turn shows."""
 
     # Each dict is the real Title, merged with the model's blurb and TMDB
     # enrichment (genre_names, runtime_minutes, cast, and where it can be
@@ -408,25 +408,16 @@ class CatalogResult:
     # Soft constraints find_candidates() had to drop to get any candidates, in the order
     # dropped; empty when the first query returned results. Reflects only the
     # rungs actually tried — the ladder stops at the first one that returns
-    # candidates, so picks == [] doesn't imply every rung was exhausted. Nor
-    # is this the explanation for an empty result — the rank call finding
-    # nothing worth surfacing, and the verdict exclusion filter, both empty picks
-    # without touching this field. It only ever describes the query.
+    # candidates. It only ever describes the query.
     relaxed: list[RelaxedConstraint]
     # How many of `picks` came from the query as originally asked, rather than
     # from a rung that dropped something. Counted over the picks themselves,
-    # not over candidates, so the note chat.py puts above a widened result set
+    # not over candidates, so the note above a widened result set
     # ("only the first two match exactly what you asked for") describes what
     # is actually on screen. picks are ordered exactness-first, so these are
     # always the leading ones. Meaningless when `relaxed` is empty, where
     # every pick is exact by definition.
     exact_matches: int = 0
-    # Why this search has nothing to show, for the sentence the caller
-    # composes; None exactly when picks is non-empty. finish_search() decides
-    # it where it computes the facts behind it, so the composer's duty and the
-    # fallback's wording cannot be settled separately and then disagree on the
-    # degraded path.
-    cause: OutcomeCause | None = None
 
 
 class ComposedReply(BaseModel):
@@ -440,38 +431,161 @@ class ComposedReply(BaseModel):
 # The user's message, why the turn came back empty, and one cause-specific
 # detail — what the ladder loosened, or the name that resolved to nothing.
 # google_composer fills them into _COMPOSE_PROMPT's slots rather than this
-# signature growing a field per cause. The config is the turn's own, so a
-# trace shows this call under the turn's run name and correlation id.
-Composer = Callable[[str, OutcomeCause, str, RunnableConfig], Awaitable[ComposedReply]]
+# signature growing a field per cause.
+Composer = Callable[[str, OutcomeCause, str], Awaitable[ComposedReply]]
 
 
-async def compose(
-    message: str,
-    cause: OutcomeCause,
-    detail: str,
-    *,
-    model: Composer,
-    config: RunnableConfig,
-) -> ComposedReply:
-    """Write the sentence for a turn that found nothing to show.
+# Keep the keys in sync with RelaxedConstraint by hand — .get()
+# below falls back to the raw code, so a missed label reads oddly rather than
+# raising, the same trade gateway/chat.go's friendlyError() makes against
+# agent/chat.py's _error_reason().
+_RELAXED_LABELS = {
+    "runtime": "how long",
+    "year": "the year",
+    "keywords": "the mood",
+    "genres": "the genre",
+    "rating": "the rating bar",
+}
 
-    Wraps any failure from ``model`` as CatalogToolError, the way graph.py's
-    _model_call wraps the graph's own calls. ``except Exception``, not BaseException, so
-    the caller's own timeout still cancels this.
+
+def _human_join(items: Sequence[str]) -> str:
+    """ "Netflix, Hulu and Max" — mirrors gateway/chat.go's
+    humanJoin so the same kind of list reads the same way wherever it
+    reaches the user (the interpreting line, a capability answer, here)."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def _relaxed_labels(relaxed: Sequence[str]) -> str:
+    """What the ladder dropped, in the caller's words. _relaxed_note and
+    _nothing_found_message both read it, so the two can't describe the same
+    relaxation differently."""
+    return _human_join([_RELAXED_LABELS.get(r, r) for r in relaxed])
+
+
+def _title_not_found_message(title: str) -> str:
+    """The fallback when the outcome composer cannot write this one — see
+    graph.py's compose_fallback.
+
+    A named title nothing carried — TMDB returned no rows, or none of the
+    rows it did return actually bear the name. Distinct from
+    _nothing_found_message because the advice differs: there is nothing to
+    loosen, and "try loosening what you're looking for" reads as nonsense in
+    reply to a name. Quotes the name back so a misheard or misspelled one is
+    visible to the user, which is the likeliest cause -- and saying so is
+    honest where a card for the nearest real title would assert an answer
+    about something they never asked about."""
+    return (
+        f'I couldn\'t find anything called "{title}". Check the spelling, or '
+        "tell me what you're in the mood for instead."
+    )
+
+
+def _nothing_found_message(
+    cause: SearchCause,
+    relaxed: Sequence[str],
+) -> str:
+    """The fallback when the outcome composer cannot write this one — see
+    graph.py's compose_fallback.
+
+    Why nothing came back, in the caller's words. Keyed on the cause
+    _empty_cause decided rather than on the flags behind it, so the
+    sentence the user reads and the duty the composer was given cannot describe
+    the turn differently.
+
+    On nothing_matched the copy names no constraint, deliberately: the ladder
+    may already have dropped runtime or year to get this page, so "drop the
+    runtime" can be advice to redo what was already done; and this text becomes
+    assistant history feeding the next turn's interpret call, the same hazard
+    _capability_message documents below."""
+    if cause == "all_judged":
+        return (
+            "I found things, but you've rated all of them already. Try "
+            "asking for something different."
+        )
+    if cause == "all_shown":
+        # "everything I found", not "everything there is": the read can stop at
+        # the page ceiling, the clock, or a failed call, and every query is
+        # filtered by a vote floor the user never stated (tmdb.py's
+        # MIN_VOTE_COUNT), which only the rating sort's rung bends and only
+        # back to that same floor. What this search got to is the most it can
+        # claim.
+        return (
+            "I've already shown you everything I found for that. Try "
+            "something different and I'll keep looking."
+        )
+    if not relaxed:
+        return "Nothing matched that. Try loosening what you're looking for."
+    labels = _relaxed_labels(relaxed)
+    return f"Nothing matched, even after loosening {labels}. Try a different request."
+
+
+def _relaxed_note(relaxed: Sequence[str], exact_matches: int, total: int) -> str:
+    """The line above a result set the ladder had to widen to fill.
+
+    Composed here rather than in the gateway so _RELAXED_LABELS isn't
+    duplicated across two services and left to drift.
+
+    Without this the widening is invisible and reads as the assistant ignoring
+    half the request. It describes what is on screen rather than the catalog —
+    "only the first two match exactly" holds whether the narrow query found
+    nothing or found things the user had already rated. finish_search() orders
+    picks exactness-first, so "the first" is accurate.
+
+    Empty when nothing was relaxed, and also when widening changed nothing
+    that reached the screen — a note about a wider search that contributed no
+    pick would send the user looking for results that aren't there.
+
+    The zero-exact wording says "nothing left" rather than "nothing matched":
+    a query can be widened because the exact matches were all shown on an
+    earlier turn, and telling that user nothing matched their request
+    contradicts the results they are still scrolled past.
     """
-    try:
-        reply = await model(message, cause, detail, config)
-    except Exception as exc:
-        raise CatalogToolError(str(exc)) from exc
-    # Shape faults in the graph's calls land inside stream_chat's own except and
-    # become an error frame, which is the right answer when the turn has no
-    # other; this turn already has its answer in the template beside it, so a
-    # fault here has to degrade to that instead. with_structured_output can hand
-    # back something else entirely, and the cast in google_composer is erased at
-    # runtime.
-    if not isinstance(reply, ComposedReply):
-        raise CatalogToolError(f"composer returned {type(reply).__name__}")
-    return reply
+    if not relaxed or exact_matches >= total:
+        return ""
+    labels = _relaxed_labels(relaxed)
+    if exact_matches == 0:
+        return f"Nothing left that matches exactly, so I widened past {labels}."
+    lead = (
+        "Only the first matches"
+        if exact_matches == 1
+        else f"Only the first {exact_matches} match"
+    )
+    return f"{lead} exactly what you asked for — I widened past {labels}."
+
+
+def _capability_message(provider_names: Sequence[str]) -> str:
+    """The fallback for an answer turn whose model-written text came back
+    blank. Keeping it is what holds the guarantee gateway/chat.go's
+    runTurn relies on for "message": that its text is never empty,
+    and so can be stored as the turn's answer unguarded.
+
+    Names the caller's own services (if
+    resolved — provider_names can be empty while the per-country name
+    cache warms up) plus example phrasing, never a feature list. No concrete
+    numbers in the example: this text becomes conversation history and feeds
+    the next turn's interpret call (graph.py's _history_messages).
+    """
+    where = f" on {_human_join(provider_names)}" if provider_names else ""
+    return (
+        f"I can find something to watch{where} — try something like "
+        '"something funny and short" or "a slow-burn thriller with '
+        "[actor].\" Tell me what you're in the mood for."
+    )
+
+
+def _empty_cause(found: Candidates) -> SearchCause:
+    """Why a search has nothing to show. Mutually exclusive by
+    construction: all_judged needs every candidate judged, all_shown needs one
+    that survived the verdicts."""
+    if found.all_judged:
+        return "all_judged"
+    if found.all_shown:
+        return "all_shown"
+    return "nothing_matched"
 
 
 async def _safe[T](coro: Awaitable[T], *, tmdb_id: int, what: str) -> T | None:
@@ -483,7 +597,7 @@ async def _safe[T](coro: Awaitable[T], *, tmdb_id: int, what: str) -> T | None:
 
     TMDBUnavailable (transient) and a bare TMDBError (a bug in how this one
     request was built) both degrade to the same None, but are logged at
-    different severity — same split chat.py's _error_reason already makes
+    different severity — same split agent/chat.py's _error_reason makes
     between an expected "try later" and an internal bug worth a traceback.
     What None means to the caller is theirs to interpret — see
     _safe_details/_safe_availability below."""
@@ -893,8 +1007,8 @@ async def lookup_title(
     it is empty.
 
     Returns [] when nothing carried the name, TMDB returning nothing at all
-    included; the caller turns that into its own message rather than
-    presenting an unrelated title as the answer (see chat.py).
+    included; the graph routes that to the compose node rather than presenting
+    an unrelated title as the answer.
     """
     exact, article, continued = _matching_titles(
         query, await client.search_titles(query)
@@ -1104,8 +1218,9 @@ def _with_target_count(message: str, *, limit: int, floor: int) -> str:
 
 @dataclass
 class Candidates:
-    """find_candidates()' output: what the rank call reads, plus what
-    finish_search() needs to order, cut and explain the picks it returns."""
+    """find_candidates()' output: what the rank call reads, what finish_search()
+    needs to order, cut and explain the picks it returns, and what _empty_cause
+    reads when there are none."""
 
     # Already filtered by verdicts and shown, in TMDB's own ranking order,
     # rung 0 first.
@@ -1278,7 +1393,7 @@ async def find_candidates(
     # Exclusion-aware on purpose: a "show me more" whose whole first page is
     # already shown sits at zero survivors, and a blind count would never widen
     # for it. A rung that buys nothing costs only a wasted call, since rungs
-    # accumulate rather than replace, and finish_search()'s cause ladder settles which
+    # accumulate rather than replace, and _empty_cause settles which
     # story the turn tells, so the user is never told the wrong one.
     def surviving() -> int:
         return sum(1 for c in candidates if key(c) not in excluded)
@@ -1518,11 +1633,9 @@ async def find_candidates(
     )
 
 
-def _valid_picks(
-    result: RankResult | None, candidates: list[Title]
-) -> list[RankedPick]:
+def _valid_picks(result: RankResult, candidates: list[Title]) -> list[RankedPick]:
     """The rank call's picks that name a real candidate, in the model's own
-    best-first order. None — no rank call, because no candidates — is no picks.
+    best-first order.
 
     A pick naming a tmdb_id outside ``candidates`` is dropped with a warning,
     mirroring tmdb.py's "unresolved constraint dropped" idiom — this is the
@@ -1530,8 +1643,6 @@ def _valid_picks(
     introduce a title that was never in the filtered set. Duplicates are
     dropped too.
     """
-    if result is None:
-        return []
     valid_ids = {c["tmdb_id"] for c in candidates}
     seen: set[int] = set()
     picks: list[RankedPick] = []
@@ -1548,7 +1659,7 @@ def _valid_picks(
 
 async def finish_search(
     found: Candidates,
-    ranked: RankResult | None,
+    ranked: RankResult,
     *,
     client: TMDBClient,
     watch_region: str,
@@ -1556,7 +1667,7 @@ async def finish_search(
 ) -> CatalogResult:
     """Turn the rank call's answer into the picks a search turn shows: keep the
     ids that are real candidates, top up to the floor, put the exact matches
-    first, cut to ``limit``, enrich, and say why when nothing is left.
+    first, cut to ``limit`` and enrich.
 
     Sizing lives here, not in the rank call: cutting in the model's fit order,
     before the exact matches are put first, could lose every exact match a
@@ -1638,23 +1749,7 @@ async def finish_search(
             for p in ranked_picks
         )
     )
-    # Mutually exclusive by construction: all_judged needs every candidate
-    # judged, all_shown needs one that survived the verdicts. Neither is
-    # reported when picks exist; the turn has its answer.
-    if picks:
-        cause: OutcomeCause | None = None
-    elif found.all_judged:
-        cause = "all_judged"
-    elif found.all_shown:
-        cause = "all_shown"
-    else:
-        cause = "nothing_matched"
-    return CatalogResult(
-        picks=picks,
-        relaxed=relaxed,
-        exact_matches=exact_matches,
-        cause=cause,
-    )
+    return CatalogResult(picks=picks, relaxed=relaxed, exact_matches=exact_matches)
 
 
 # ---------------------------------------------------------------------------
@@ -1704,8 +1799,8 @@ _TONE = (
 # The duties that come with writing the whole of a turn's answer, rather than a
 # line alongside it. Carried by _OUTCOME_SYSTEM_PROMPT, and by
 # _INTERPRET_SYSTEM_PROMPT for every answer kind — those two produce the
-# text the gateway stores as the turn's assistant text, which chat.py's
-# _turn_messages feeds back to the next turn's interpret call, where a film this
+# text the gateway stores as the turn's assistant text, which graph.py's
+# _history_messages feeds back to the next turn's interpret call, where a film this
 # turn invented reads as a title request and a number reads as a limit. A
 # search turn's opener is never stored, and a blurb reaches history only as
 # summarizePicks' "Suggested: ...".
@@ -1973,9 +2068,7 @@ def google_composer(model: BaseChatModel) -> Composer:
     """Bind ComposedReply's schema to ``model``."""
     chain = _COMPOSE_PROMPT | model.with_structured_output(ComposedReply)
 
-    async def call(
-        message: str, cause: OutcomeCause, detail: str, config: RunnableConfig
-    ) -> ComposedReply:
+    async def call(message: str, cause: OutcomeCause, detail: str) -> ComposedReply:
         # ensure_ascii=False where _format_candidates needs True: the prompt
         # asks for the detail quoted back exactly, and an escaped
         # "Am\u00e9lie" is not the name the user typed. The separators
@@ -1983,15 +2076,14 @@ def google_composer(model: BaseChatModel) -> Composer:
         # LookUpArgs' validator passes the title through _one_line. The accepted
         # cost is the other half of _format_candidates' reason: a lone surrogate,
         # which the model's own JSON can carry, raises when the request body is
-        # encoded, which compose() turns into a CatalogToolError the turn answers
-        # from its template.
+        # encoded, which the compose node's error handler answers from its
+        # template.
         result = await chain.ainvoke(
             {
                 "message": message,
                 "cause": cause,
                 "detail": json.dumps(detail, ensure_ascii=False),
-            },
-            config=config,
+            }
         )
         return cast(ComposedReply, result)
 

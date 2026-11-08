@@ -26,14 +26,15 @@ from langchain.chat_models import init_chat_model
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from chat import ChatRequest, stream_chat
-from holster_catalog.catalog_tool import (
-    Composer,
+from holster_catalog import (
+    CatalogGraph,
+    RegionProvider,
     TitlesRequest,
+    TMDBClient,
+    build_turn,
     enrich_watchlist,
     google_composer,
 )
-from holster_catalog.graph import CatalogGraph, build_turn
-from holster_catalog.tmdb import RegionProvider, TMDBClient
 
 # Lower-case because the ASGI server lower-cases header names in scope, so the
 # byte-exact lookup in CorrelationIdMiddleware matches a sender's X-Correlation-ID.
@@ -163,13 +164,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # exponential and ignores the Retry-After the response carries, so the one
     # retry fires too soon to land.
     model = init_chat_model(model_id, timeout=15.0, max_retries=2)
-    app.state.agent = build_turn(model)
-    # One attempt where the graph's two calls get a retry: this call's answer already
-    # exists in the template beside it (chat.py's _outcome_text), so a retry
-    # against a free-tier refusal spends a second request of the same minute to
-    # arrive at the sentence that was already there.
+    # One attempt where the interpret and rank calls get a retry: this call's
+    # answer already exists in the template beside it (holster_catalog.graph's
+    # compose_fallback), so a retry against a free-tier refusal spends a second
+    # request of the same minute to arrive at the sentence that was already there.
+    # Its timeout couples to that module's COMPOSE_TIMEOUT_SECONDS.
     compose_llm = init_chat_model(model_id, timeout=15.0, max_retries=1)
-    app.state.compose_model = google_composer(compose_llm)
+    app.state.agent = build_turn(model, google_composer(compose_llm))
     try:
         yield
     finally:
@@ -181,20 +182,16 @@ asgi_app = CorrelationIdMiddleware(app)
 
 
 # Plain functions, not a class: request.app.state is the one instance-per-process
-# TMDBClient, the agent and the composer built in lifespan() above. Depends()
+# TMDBClient and the graph built in lifespan() above. Depends()
 # (rather than reading request.app.state directly in the route) is what lets
 # tests swap in fakes via app.dependency_overrides, the same seam TMDBClient's
-# transport= and catalog_tool's Composer callable already use.
+# transport= and the graph's Composer callable already use.
 def get_tmdb_client(request: Request) -> TMDBClient:
     return cast(TMDBClient, request.app.state.tmdb_client)
 
 
 def get_agent(request: Request) -> CatalogGraph:
     return cast(CatalogGraph, request.app.state.agent)
-
-
-def get_compose_model(request: Request) -> Composer:
-    return cast(Composer, request.app.state.compose_model)
 
 
 @app.get("/health")
@@ -207,7 +204,6 @@ async def chat(
     req: ChatRequest,
     tmdb_client: TMDBClient = Depends(get_tmdb_client),
     agent: CatalogGraph = Depends(get_agent),
-    compose_model: Composer = Depends(get_compose_model),
 ) -> StreamingResponse:
     """Streams chat.stream_chat()'s events as newline-delimited JSON. A plain
     chunked HTTP response, not a second WebSocket — the browser's socket is the
@@ -222,7 +218,6 @@ async def chat(
             req,
             client=tmdb_client,
             agent=agent,
-            compose_model=compose_model,
             correlation_id=_correlation_id.get(),
         ):
             yield json.dumps(event, default=str).encode() + b"\n"

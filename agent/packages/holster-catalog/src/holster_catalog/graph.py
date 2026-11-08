@@ -1,9 +1,10 @@
 """The catalog turn as a LangGraph graph: the steps catalog_tool.py defines, and
 the edges that bound them.
 
-    START -> interpret -+-> search -+-> rank -> END
-                        |           +-> END           (no candidates)
-                        +-> lookup -> END
+    START -> interpret -+-> search -+-> rank -> finish -> END
+                        |           +-> compose -> END    (no candidates)
+                        +-> lookup -+-> END
+                        |           +-> compose -> END    (title not found)
                         +-> answer -> END
 
 interpret is the one node offered tools, and no edge leads back to it, so
@@ -12,12 +13,12 @@ can pick an action. That is the graph's shape rather than a check at run time:
 there is no loop to stop, and rank binds a response schema and no tools.
 
 Nothing executes a tool: the model fills one declared schema and the router
-reads which. chat.py reads the final state, then runs finish_search() and writes
-the turn's answer.
+reads which. turn.py's outcome_of reads the turn's answer off the final state.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -25,6 +26,7 @@ from typing import Any, Protocol, TypedDict, cast
 
 from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import (
+    AIMessage,
     AnyMessage,
     BaseMessage,
     HumanMessage,
@@ -32,6 +34,7 @@ from langchain_core.messages import (
 )
 from langchain_core.output_parsers import PydanticToolsParser
 from langchain_core.runnables import Runnable
+from langgraph.errors import NodeError, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
@@ -40,21 +43,32 @@ from holster_catalog.catalog_tool import (
     _RANK_SYSTEM_PROMPT,
     CATALOG_TOOLS,
     AnswerArgs,
-    AnswerKind,
     Candidates,
+    CatalogResult,
     CatalogToolError,
+    Composer,
     LookUpArgs,
+    OutcomeCause,
     RankResult,
     SearchArgs,
     TitleRef,
     TitleVerdict,
+    _capability_message,
+    _empty_cause,
     _interpret_system_message,
+    _nothing_found_message,
     _one_line,
     _rank_content,
+    _relaxed_labels,
+    _title_not_found_message,
     find_candidates,
+    finish_search,
     lookup_title,
 )
 from holster_catalog.tmdb import TMDBClient
+from holster_catalog.turn import Intent, Opener, Turn
+
+logger = logging.getLogger("holster.graph")
 
 # The node names that count as a model call. No path from START to END may pass
 # through more than two of them.
@@ -69,17 +83,28 @@ from holster_catalog.tmdb import TMDBClient
 # a call that reads no third-party text, and room under turnDeadline and
 # defaultGuestRateLimit.
 #
-# compose is listed though this graph has no such node, so that a node of that
-# name counts toward the two as soon as it exists. Today chat.py's stream_chat
-# calls the composer once the graph has ended, and only on a turn that made no
-# rank call, so it takes the rank call's place in the two. These edges do not
-# hold that.
+# compose takes the rank call's place in the two, and every turn that reaches it
+# has that call to spare: it is entered from search and lookup alone. That rests
+# on finish having one edge, which rests on a rank call never leaving an empty
+# pick list: finish_search()'s top-up fills the list to `floor`, which
+# min(RESULT_FLOOR, limit) and SearchArgs.limit's `ge=1` hold at one or more, and
+# search routes to rank only with candidates.
 MODEL_NODES = frozenset({"interpret", "rank", "compose"})
 
-# One super-step for each node on the longest path — interpret, search, rank —
-# plus the input step LangGraph runs first. A run that needs more raises
-# GraphRecursionError, which chat.py's _error_reason reports as internal.
-RECURSION_LIMIT = 4
+# One super-step for each node on the longest path — interpret, search, rank,
+# finish — plus the input step LangGraph runs first. A run that needs more raises
+# GraphRecursionError, which agent/chat.py's _error_reason reports as internal.
+RECURSION_LIMIT = 5
+
+# What the outcome composer gets before the turn answers from its template. The
+# SDK's own envelope is no bound worth resting on: agent/main.py builds the
+# composer's model with timeout=15.0, three times this cap on its own.
+#
+# It bounds what this call adds, not what the turn has already spent — an empty
+# turn arrives here having run page 1 and the whole ladder — so a turn already
+# near the gateway's 30s turnDeadline still passes it, and the dropped-stream
+# fallback is what the user sees.
+COMPOSE_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -91,10 +116,10 @@ class TurnContext:
 
     client: TMDBClient
     watch_region: str
-    # Never empty: chat.py answers a caller with no ticked services before the
+    # Never empty: agent/chat.py answers a caller with no ticked services before the
     # graph runs, and discover() raises on an empty list.
     watch_providers: list[int]
-    # Read by the interpret call alone, never the rank call — see
+    # Read by the interpret and answer nodes, never rank — see
     # _interpret_system_message.
     watch_provider_names: list[str]
     verdicts: list[TitleVerdict]
@@ -102,30 +127,24 @@ class TurnContext:
 
 
 class TurnState(TypedDict, total=False):
-    """The turn's input, plus what each node wrote, typed for chat.py to read.
-    One of search, lookup and answer runs a turn, so at most one group below
-    `intent` is set.
+    """The turn's input, plus what each node wrote. `message` and `history` are
+    the input and no node writes them. One of search, lookup and answer runs a
+    turn, and compose adds `text` to what search or lookup wrote, which is why
+    turn.py's outcome_of reads `text` first."""
 
-    A history turn in `messages` is text only, never a replayed tool call:
-    chat.py's HistoryTurn has no tool fields. Giving it some would let an
-    earlier turn's tool results, TMDB overviews included, reach the interpret
-    call, which picks the action."""
-
-    # The input chat.py always sends: the history, oldest first, then the
-    # current message last. No node writes it.
-    messages: list[AnyMessage]
+    message: str
+    # Oldest first, the current message not included.
+    history: list[Turn]
     # interpret: the one declared schema the model filled.
     intent: SearchArgs | LookUpArgs | AnswerArgs
-    # search, and rank when there were candidates.
+    # search, and rank and finish when there were candidates.
     found: Candidates
     ranked: RankResult
-    # lookup: the enriched rows, and the name asked about, which the composer
-    # quotes back when nothing carries it.
+    result: CatalogResult
+    # lookup: the enriched rows.
     lookup_picks: list[dict[str, Any]]
-    lookup_title: str
-    # answer
-    answer_kind: AnswerKind
-    answer_text: str
+    # answer or compose: the turn's reply, never empty.
+    text: str
 
 
 # A Protocol because add_node's types want the parameter named `runtime`, which
@@ -142,7 +161,7 @@ async def _model_call[T](
     """Run the call, wrapping any failure — a network/API error, a tool call
     that names no declared tool or carries arguments its schema rejects, or a
     ranking that doesn't satisfy RankResult's schema — as CatalogToolError,
-    which chat.py's _error_reason maps to model_unavailable. There is no handing
+    which agent/chat.py's _error_reason maps to model_unavailable. There is no handing
     the error back to the model, which would be another call. ``except
     Exception``, not ``BaseException``, so a cancelled step still propagates."""
     try:
@@ -151,29 +170,41 @@ async def _model_call[T](
         raise CatalogToolError(str(exc)) from exc
 
 
-def _narrate(runtime: Runtime[TurnContext], reply: str, intent: dict[str, Any]) -> None:
+def _history_messages(history: Sequence[Turn]) -> list[AnyMessage]:
+    """Each earlier turn as its own message, oldest first. Both the interpret and
+    the rank call are sent these ahead of their own last message."""
+    return [
+        HumanMessage(t.text) if t.role == "user" else AIMessage(t.text) for t in history
+    ]
+
+
+def _narrate(runtime: Runtime[TurnContext], args: SearchArgs | LookUpArgs) -> None:
     """The opener, then the intent the gateway templates its interpreting line
     from, both before any TMDB call. The opener goes first because it is prose
     above the interpreting line and the gateway forwards in arrival order.
     The opener is cut to one line, and skipped when blank rather than sent
     empty — reply is defaulted, so a response can leave it out."""
-    reply = _one_line(reply)
+    reply = _one_line(args.reply)
     if reply:
-        runtime.stream_writer({"type": "reply", "text": reply})
-    runtime.stream_writer({"type": "intent", "intent": intent})
+        runtime.stream_writer(Opener(reply))
+    runtime.stream_writer(Intent(args))
 
 
 def interpret_node(model: BaseChatModel) -> _ModelNode:
     """The interpret call around ``model``: the interpret prompt, the three
-    declared tools and tool_choice="any". The messages go through as chat.py
-    sent them, history included, unlike the rank call's."""
+    declared tools and tool_choice="any"."""
     bound = model.bind_tools(CATALOG_TOOLS, tool_choice="any")
     interpreter = bound | PydanticToolsParser(tools=[*CATALOG_TOOLS])
 
     async def interpret(state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
         names = runtime.context.watch_provider_names
         system = _interpret_system_message(names, today=date.today())
-        picked = await _model_call(interpreter, [system, *state["messages"]])
+        messages = [
+            system,
+            *_history_messages(state["history"]),
+            HumanMessage(state["message"]),
+        ]
+        picked = await _model_call(interpreter, messages)
         # Never the first of several: a message asking two things at once can
         # draw two tool calls, and taking one would answer half of it.
         if len(picked) != 1:
@@ -181,19 +212,8 @@ def interpret_node(model: BaseChatModel) -> _ModelNode:
         args = picked[0]
         # An answer narrates nothing: its reply is the answer itself, and an
         # interpreting line above it would announce a search that never runs.
-        if isinstance(args, SearchArgs):
-            # The intent event is SearchArgs by JSON name, which
-            # gateway/chat.go's agentIntent mirrors. reply leaves it because it
-            # has its own event.
-            _narrate(
-                runtime,
-                args.reply,
-                args.model_dump(exclude_none=True, exclude={"reply"}),
-            )
-        elif isinstance(args, LookUpArgs):
-            # The gateway templates a lookup's interpreting line off title
-            # alone (gateway/chat.go's interpretingLine).
-            _narrate(runtime, args.reply, {"title": args.title})
+        if not isinstance(args, AnswerArgs):
+            _narrate(runtime, args)
         return {"intent": args}
 
     return interpret
@@ -213,23 +233,24 @@ async def search(state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
 
 
 async def lookup(state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
-    title = cast(LookUpArgs, state["intent"]).title
     context = runtime.context
     picks = await lookup_title(
-        title,
+        cast(LookUpArgs, state["intent"]).title,
         client=context.client,
         watch_region=context.watch_region,
         watch_providers=context.watch_providers,
     )
-    return {"lookup_picks": picks, "lookup_title": title}
+    return {"lookup_picks": picks}
 
 
-async def answer(state: TurnState) -> TurnState:
+async def answer(state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
     args = cast(AnswerArgs, state["intent"])
-    # _one_line turns whitespace-only text into "", which chat.py answers with
-    # its capability template instead; a plain line break it flattens would
+    # _one_line turns whitespace-only text into "", and the capability template
+    # serves a blank reply of any kind: it says what the assistant is for and
+    # asks what they are in the mood for. A plain line break it flattens would
     # render as a space in the web's <p> anyway.
-    return {"answer_kind": args.kind, "answer_text": _one_line(args.text)}
+    names = runtime.context.watch_provider_names
+    return {"text": _one_line(args.text) or _capability_message(names)}
 
 
 def rank_node(model: BaseChatModel) -> _ModelNode:
@@ -247,12 +268,81 @@ def rank_node(model: BaseChatModel) -> _ModelNode:
     ranker = model.with_structured_output(RankResult, method="json_schema")
 
     async def rank(state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
-        *history, current = state["messages"]
-        request = HumanMessage(_rank_content(current.text, state["found"]))
-        messages = [SystemMessage(_RANK_SYSTEM_PROMPT), *history, request]
+        request = HumanMessage(_rank_content(state["message"], state["found"]))
+        messages = [
+            SystemMessage(_RANK_SYSTEM_PROMPT),
+            *_history_messages(state["history"]),
+            request,
+        ]
         return {"ranked": cast(RankResult, await _model_call(ranker, messages))}
 
     return rank
+
+
+async def finish(state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
+    context = runtime.context
+    result = await finish_search(
+        state["found"],
+        state["ranked"],
+        client=context.client,
+        watch_region=context.watch_region,
+        watch_providers=context.watch_providers,
+    )
+    return {"result": result}
+
+
+def _empty_outcome(state: TurnState) -> tuple[OutcomeCause, str, str]:
+    """The cause, the composer's detail and the template, chosen together from
+    the one cause, so the sentence a user reads cannot describe a different turn
+    from the duty the model was set. Only nothing_matched has a detail the
+    prompt defines beyond the title: the other two are about what the user has
+    already seen or rated, where naming what the ladder loosened would merge two
+    answers."""
+    intent = state["intent"]
+    if isinstance(intent, LookUpArgs):
+        return "title_not_found", intent.title, _title_not_found_message(intent.title)
+    found = state["found"]
+    cause = _empty_cause(found)
+    detail = _relaxed_labels(found.relaxed) if cause == "nothing_matched" else ""
+    return cause, detail, _nothing_found_message(cause, found.relaxed)
+
+
+def compose_node(composer: Composer) -> _ModelNode:
+    """The model's own sentence for a turn that ended with nothing to show. A
+    blank result answers from the template: ComposedReply.text is required of
+    the model, which still leaves "" satisfying the schema, and an empty reply
+    would persist an empty assistant turn."""
+
+    async def compose_outcome(
+        state: TurnState, runtime: Runtime[TurnContext]
+    ) -> TurnState:
+        cause, detail, fallback = _empty_outcome(state)
+        composed = await composer(state["message"], cause, detail)
+        return {"text": composed.text.strip() or fallback}
+
+    return compose_outcome
+
+
+async def compose_fallback(state: TurnState, error: NodeError) -> TurnState:
+    """Degrade, don't fail, the same split catalog_tool's _safe() makes: the turn
+    already has its answer and only the wording is at stake.
+
+    Every composer failure lands here, a reply of the wrong shape included:
+    google_composer's cast is erased at runtime, so compose_outcome's .text raises
+    on it. Warning, not exception, for that same reason; the traceback is kept
+    because a schema or wiring fault fails every call and would otherwise show up
+    only as prose that never got warmer. A timeout inside the SDK is in that arm
+    too; NodeTimeoutError is the deadline this graph owns."""
+    cause, _, fallback = _empty_outcome(state)
+    if isinstance(error.error, NodeTimeoutError):
+        logger.info("outcome composer timed out, degraded", extra={"cause": cause})
+    else:
+        logger.warning(
+            "outcome composer failed, degraded",
+            exc_info=error.error,
+            extra={"cause": cause},
+        )
+    return {"text": fallback}
 
 
 def _route_intent(state: TurnState) -> str:
@@ -265,29 +355,42 @@ def _route_intent(state: TurnState) -> str:
 
 
 def _route_search(state: TurnState) -> str:
-    return "rank" if state["found"].candidates else END
+    return "rank" if state["found"].candidates else "compose"
+
+
+def _route_lookup(state: TurnState) -> str:
+    return END if state["lookup_picks"] else "compose"
 
 
 CatalogGraph = CompiledStateGraph[TurnState, TurnContext]
 
 
-def build_turn(model: BaseChatModel) -> CatalogGraph:
-    """The turn's graph around ``model``, each binding made once, here. Every
-    run gets RECURSION_LIMIT from the compiled graph, so no caller can leave it
-    out."""
+def build_turn(model: BaseChatModel, composer: Composer) -> CatalogGraph:
+    """The turn's graph around ``model`` and ``composer``, each binding made once,
+    here. Every run gets RECURSION_LIMIT from the compiled graph, so no caller can
+    leave it out."""
     graph = StateGraph(TurnState, context_schema=TurnContext)
     graph.add_node("interpret", interpret_node(model))
     graph.add_node("search", search)
     graph.add_node("lookup", lookup)
     graph.add_node("answer", answer)
     graph.add_node("rank", rank_node(model))
+    graph.add_node("finish", finish)
+    graph.add_node(
+        "compose",
+        compose_node(composer),
+        timeout=COMPOSE_TIMEOUT_SECONDS,
+        error_handler=compose_fallback,
+    )
     graph.add_edge(START, "interpret")
     # path_map is what puts a conditional edge's targets in get_graph().
     graph.add_conditional_edges(
         "interpret", _route_intent, path_map=["search", "lookup", "answer"]
     )
-    graph.add_conditional_edges("search", _route_search, path_map=["rank", END])
-    graph.add_edge("lookup", END)
+    graph.add_conditional_edges("search", _route_search, path_map=["rank", "compose"])
+    graph.add_conditional_edges("lookup", _route_lookup, path_map=[END, "compose"])
+    graph.add_edge("rank", "finish")
+    graph.add_edge("finish", END)
     graph.add_edge("answer", END)
-    graph.add_edge("rank", END)
+    graph.add_edge("compose", END)
     return graph.compile().with_config(recursion_limit=RECURSION_LIMIT)
