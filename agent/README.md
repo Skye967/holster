@@ -359,6 +359,7 @@ uv run pytest                                                       # both packa
 uv run ruff check . && uv run ruff format --check .
 uv run mypy main.py chat.py tests
 (cd packages/holster-catalog && uv run mypy src tests)
+uv export --no-dev --format requirements-txt --no-emit-workspace | uvx pip-audit@2.10.1 -r /dev/stdin --strict --disable-pip
 ```
 
 Mypy runs once per package, because each has a `conftest.py` and one strict run cannot
@@ -379,3 +380,9 @@ service's are in `tests/`: `test_chat.py`, on the NDJSON the gateway reads, and
 the next scripted message and records what each call was sent. Nothing here calls TMDB
 or the model — prompt behaviour is checked by running the app, not by asserting on a
 model's output.
+
+The audit needs the network. It turns red when a new advisory names a locked runtime
+dependency, with no change here: bump the package with `uv lock --upgrade-package
+<name>` rather than wait out Dependabot's cooldown, or, when no fixed version exists
+yet, add `--ignore-vuln <ID>` with a comment saying why, both here and in `ci.yml`'s
+step.

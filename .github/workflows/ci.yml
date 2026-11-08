@@ -136,6 +136,18 @@ jobs:
         run: uv run mypy main.py chat.py tests
       - name: pytest
         run: uv run pytest
+      # Last, because a newly published advisory turns it red on a PR that changed
+      # nothing here, and it should not hide the other steps' results when it does.
+      # pip-audit rather than `uv audit`, which is still experimental. The root
+      # export pins the library's dependencies too. --disable-pip audits the export
+      # as written instead of re-resolving it, which pip-audit allows only for a
+      # hashed file; --no-emit-workspace drops holster-catalog, the one line uv
+      # writes as an unhashed editable path. `shell: bash` adds pipefail, so a
+      # failed export fails the step itself.
+      # Bump pip-audit together with agent/README.md's Tests block.
+      - name: pip-audit
+        shell: bash
+        run: uv export --no-dev --format requirements-txt --no-emit-workspace | uvx pip-audit@2.10.1 -r /dev/stdin --strict --disable-pip
 
   # The library alone: fastapi, uvicorn and the Google provider are not installed,
   # so a stray import of one fails here.
