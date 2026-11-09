@@ -38,8 +38,8 @@ name do what it already claimed, or any other change to the dependency ranges in
 `pyproject.toml` or to its code outside `holster_catalog.testing`, is a patch. The PR
 that makes the change also bumps `version` in `pyproject.toml` and adds its entry to
 [CHANGELOG.md](CHANGELOG.md), dated the day it merges. A change only to
-`holster_catalog.testing`, the tests, the docs or `uv.lock` is not a release and needs
-neither.
+`holster_catalog.testing`, the tests, `evals/`, the docs or `uv.lock` is not a release
+and needs neither.
 
 After the merge, tag `holster-catalog/vX.Y.Z` on main. The tag runs
 `.github/workflows/release-catalog.yml`, which fails before building when the tag is not
@@ -56,4 +56,6 @@ uv run mypy src tests
 uv run pytest
 ```
 
-Run them from this directory. The suite is offline.
+Run them from this directory. The suite is offline. `evals/`, a live measure of the
+interpret call's routing, is not part of it or of the package; `agent/README.md`'s
+*Tests* says how to run it.

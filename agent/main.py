@@ -39,6 +39,8 @@ from holster_catalog import (
 # Lower-case because the ASGI server lower-cases header names in scope, so the
 # byte-exact lookup in CorrelationIdMiddleware matches a sender's X-Correlation-ID.
 CORRELATION_ID_HEADER = "x-correlation-id"
+# packages/holster-catalog/evals/run.py's DEFAULT_MODEL, and the model it builds,
+# mirror this and lifespan's `model`.
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 # Set per request by CorrelationIdMiddleware, read by JsonFormatter so every line

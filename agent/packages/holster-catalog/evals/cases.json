@@ -1,0 +1,210 @@
+[
+  {
+    "id": "lookup-by-name",
+    "message": "is The Matrix on Netflix?",
+    "tool": "look_up_title",
+    "args": {"title": "The Matrix"}
+  },
+  {
+    "id": "lookup-copies-title-as-typed",
+    "message": "do you have the matrx",
+    "tool": "look_up_title",
+    "args": {"title": "the matrx"}
+  },
+  {
+    "id": "comparison-title-is-a-search",
+    "message": "something like Heat",
+    "tool": "search_catalog",
+    "args": {"media_type": "movie"}
+  },
+  {
+    "id": "opinion-is-chat",
+    "message": "is Heat any good?",
+    "tool": "answer",
+    "args": {"kind": "chat"}
+  },
+  {
+    "id": "chat-or-search-is-a-search",
+    "message": "I'm kind of in a heist mood",
+    "tool": "search_catalog",
+    "args": {}
+  },
+  {
+    "id": "named-genre-sets-genres",
+    "message": "a horror movie",
+    "tool": "search_catalog",
+    "args": {"media_type": "movie", "genres": ["horror"]}
+  },
+  {
+    "id": "mood-word-is-not-a-genre",
+    "message": "something scary for tonight",
+    "tool": "search_catalog",
+    "args": {"genres": []}
+  },
+  {
+    "id": "good-thriller-invents-no-mood",
+    "message": "a good thriller",
+    "tool": "search_catalog",
+    "args": {"keywords": []}
+  },
+  {
+    "id": "capability-question",
+    "message": "what can you do?",
+    "tool": "answer",
+    "args": {"kind": "capability"}
+  },
+  {
+    "id": "surprise-me-is-a-search",
+    "message": "surprise me",
+    "tool": "search_catalog",
+    "args": {}
+  },
+  {
+    "id": "nothing-to-search-on-clarifies",
+    "message": "hey, I'm bored",
+    "tool": "answer",
+    "args": {"kind": "clarifying"}
+  },
+  {
+    "id": "second-vague-message-searches",
+    "message": "idk, whatever",
+    "history": [
+      {"role": "user", "text": "hey, I'm bored"},
+      {"role": "assistant", "text": "Cozy night in, or something that'll keep you up?"}
+    ],
+    "tool": "search_catalog",
+    "args": {}
+  },
+  {
+    "id": "off-topic",
+    "message": "what's the weather like tomorrow?",
+    "tool": "answer",
+    "args": {"kind": "off_topic"}
+  },
+  {
+    "id": "offer-has-not-asked",
+    "message": "ok, what about a pasta recipe?",
+    "history": [
+      {"role": "user", "text": "what's the weather like tomorrow?"},
+      {"role": "assistant", "text": "Weather's not my thing — I'm here to find you something to watch. Want me to dig something up?"}
+    ],
+    "tool": "answer",
+    "args": {"kind": "off_topic"}
+  },
+  {
+    "id": "game-adaptation-is-film-talk",
+    "message": "was The Last of Us show faithful to the game?",
+    "tool": "answer",
+    "args": {"kind": "chat"}
+  },
+  {
+    "id": "music-is-off-topic",
+    "message": "recommend me some jazz albums",
+    "tool": "answer",
+    "args": {"kind": "off_topic"}
+  },
+  {
+    "id": "soundtrack-is-chat",
+    "message": "who did the music for Interstellar?",
+    "tool": "answer",
+    "args": {"kind": "chat"}
+  },
+  {
+    "id": "tonight-is-not-rent",
+    "message": "I really need a good comedy movie tonight",
+    "tool": "search_catalog",
+    "args": {"genres": ["comedy"], "monetization": "subscription"}
+  },
+  {
+    "id": "rent-named",
+    "message": "a thriller I can rent",
+    "tool": "search_catalog",
+    "args": {"monetization": "rent"}
+  },
+  {
+    "id": "more-carries-the-request-forward",
+    "message": "show me more",
+    "history": [
+      {"role": "user", "text": "funny tv shows"},
+      {"role": "assistant", "text": "Suggested: Fleabag, Ted Lasso, Schitt's Creek"}
+    ],
+    "tool": "search_catalog",
+    "args": {"media_type": "tv", "limit": 10}
+  },
+  {
+    "id": "more-carries-rent-forward",
+    "message": "any others?",
+    "history": [
+      {"role": "user", "text": "a sci-fi movie I can rent"},
+      {"role": "assistant", "text": "Suggested: Arrival, Dune, Ex Machina"}
+    ],
+    "tool": "search_catalog",
+    "args": {"media_type": "movie", "monetization": "rent"}
+  },
+  {
+    "id": "best-is-vote-average",
+    "message": "the highest rated war movies",
+    "tool": "search_catalog",
+    "args": {"media_type": "movie", "genres": ["war"], "sort_by": "vote_average.desc"}
+  },
+  {
+    "id": "best-new-is-vote-count",
+    "message": "the best new movies",
+    "tool": "search_catalog",
+    "args": {"media_type": "movie", "sort_by": "vote_count.desc"}
+  },
+  {
+    "id": "best-of-a-past-year",
+    "message": "best shows from 2025",
+    "tool": "search_catalog",
+    "args": {
+      "media_type": "tv",
+      "sort_by": "vote_average.desc",
+      "release_year_gte": 2025,
+      "release_year_lte": 2025
+    }
+  },
+  {
+    "id": "just-came-out-is-newest",
+    "message": "what just came out on tv?",
+    "tool": "search_catalog",
+    "args": {"media_type": "tv", "sort_by": "newest"}
+  },
+  {
+    "id": "popular-is-vote-count",
+    "message": "popular comedy movies",
+    "tool": "search_catalog",
+    "args": {"media_type": "movie", "genres": ["comedy"], "sort_by": "vote_count.desc"}
+  },
+  {
+    "id": "named-count-sets-limit",
+    "message": "just a couple of science fiction movies",
+    "tool": "search_catalog",
+    "args": {"media_type": "movie", "genres": ["science fiction"], "limit": 2}
+  },
+  {
+    "id": "runtime-ceiling",
+    "message": "a movie under 90 minutes",
+    "tool": "search_catalog",
+    "args": {"media_type": "movie", "max_runtime_minutes": 90}
+  },
+  {
+    "id": "service-name-is-not-a-filter",
+    "message": "Tom Hanks movies from the 90s on Netflix",
+    "tool": "search_catalog",
+    "args": {
+      "media_type": "movie",
+      "cast": ["Tom Hanks"],
+      "keywords": [],
+      "genres": [],
+      "release_year_gte": 1990,
+      "release_year_lte": 1999
+    }
+  },
+  {
+    "id": "excluded-genre",
+    "message": "a comedy movie, nothing animated",
+    "tool": "search_catalog",
+    "args": {"media_type": "movie", "genres": ["comedy"], "without_genres": ["animation"]}
+  }
+]
