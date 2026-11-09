@@ -133,9 +133,14 @@ jobs:
       - name: ruff format
         run: uv run ruff format --check .
       - name: mypy
-        run: uv run mypy main.py chat.py tests
+        run: uv run mypy main.py chat.py tests packages/holster-catalog/evals/run.py
       - name: pytest
         run: uv run pytest
+      # Here rather than in the catalog job: run.py imports langchain's
+      # init_chat_model, which only the service installs. Validates the cases,
+      # calls nothing.
+      - name: eval cases
+        run: uv run python packages/holster-catalog/evals/run.py --check
       # Last, because a newly published advisory turns it red on a PR that changed
       # nothing here, and it should not hide the other steps' results when it does.
       # pip-audit rather than `uv audit`, which is still experimental. The root

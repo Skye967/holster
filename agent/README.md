@@ -357,17 +357,20 @@ out the first results entirely. The `genres` field's own description carries a s
 ```sh
 uv run pytest                                                       # both packages
 uv run ruff check . && uv run ruff format --check .
-uv run mypy main.py chat.py tests
+uv run mypy main.py chat.py tests packages/holster-catalog/evals/run.py
 (cd packages/holster-catalog && uv run mypy src tests)
+uv run python packages/holster-catalog/evals/run.py --check         # the eval's cases
 uv export --no-dev --format requirements-txt --no-emit-workspace | uvx pip-audit@2.10.1 -r /dev/stdin --strict --disable-pip
 ```
 
 Mypy runs once per package, because each has a `conftest.py` and one strict run cannot
-own two modules of that name. `uv run` leaves extra packages installed and the workspace
-shares one `.venv`, so a local run does not prove the library stands
-alone. CI's `catalog` job does, from a `uv sync --package holster-catalog` of its own.
-Run locally, that command leaves the library and its dependencies in `.venv` and removes
-the service's; a `uv sync` at this root restores them.
+own two modules of that name. `evals/run.py` is in the service's run, not the library's,
+because it imports `langchain`, which the library does not depend on. `uv run` leaves
+extra packages installed and the workspace shares one `.venv`, so a local run does not
+prove the library stands alone. CI's `catalog` job does, from a `uv sync --package
+holster-catalog` of its own. Run locally, that command leaves the library and its
+dependencies in `.venv` and removes the service's; a `uv sync` at this root restores
+them.
 
 The suite runs offline. The library's tests are in `packages/holster-catalog/tests/`:
 `test_tmdb.py` against a mock transport, `test_catalog_tool.py` against that plus plain
@@ -378,8 +381,22 @@ service's are in `tests/`: `test_chat.py`, on the NDJSON the gateway reads, and
 `test_main.py`, against the real graph. The graph is driven by
 `holster_catalog.testing.ScriptedChatModel`, a chat model that answers each call with
 the next scripted message and records what each call was sent. Nothing here calls TMDB
-or the model — prompt behaviour is checked by running the app, not by asserting on a
-model's output.
+or the model — prompt behaviour is otherwise checked by running the app, not by
+asserting on a model's output.
+
+One part of it, the interpret call's routing, is measured instead.
+`packages/holster-catalog/evals/cases.json` holds messages, each with the tool the
+interpret call should pick and the arguments it should fill. `evals/run.py` sends each
+to that one node against the live model, pacing them under the free tier, and prints
+which agree and their share of the cases that got a reply. It asserts nothing and exits
+0 whatever the score. It needs `GOOGLE_API_KEY`, reads `GOOGLE_MODEL` like the service,
+and costs one model call a case, two when that call is retried, and no TMDB request:
+
+```sh
+uv run python packages/holster-catalog/evals/run.py
+```
+
+Only `--check`, which validates the cases against the tool schemas, runs in CI.
 
 The audit needs the network. It turns red when a new advisory names a locked runtime
 dependency, with no change here: bump the package with `uv lock --upgrade-package

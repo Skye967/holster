@@ -9,6 +9,7 @@
 **/.mypy_cache
 **/.pytest_cache
 **/tests
+**/evals
 **/conftest.py
 README.md
 Dockerfile
