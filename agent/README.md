@@ -1,6 +1,7 @@
 # agent
 
-Python. FastAPI + LangChain. Turns a message into TMDB catalog queries and an answer.
+Python. FastAPI, LangGraph and LangChain. Turns a message into TMDB catalog queries and
+an answer.
 
 ## Responsibility
 
@@ -51,14 +52,8 @@ uv run uvicorn main:asgi_app --port 8000 --reload   # or: uv run python main.py
 curl -s localhost:8000/health                        # {"status": "ok"}
 ```
 
-uv 0.13.7 is the version `Dockerfile`, CI and the catalog release workflow pin.
-
-`agent/` is a uv workspace with one lockfile and one `.venv`. The service is `main.py`
-and `chat.py` at its root, run and never built; the catalog core is the
-[`holster-catalog`](packages/holster-catalog/README.md) library under `packages/`, which
-`uv sync` installs as an editable dependency and the image installs as a package. This
-file's `tmdb.py`, `catalog_tool.py`, `graph.py` and `turn.py` are in its
-`src/holster_catalog/`.
+uv 0.13.7 is the version `Dockerfile`, CI and the catalog release workflow pin. `uv sync`
+installs the service's dependencies and the catalog library.
 
 The container runs `python main.py`, which configures logging and serves; the uvicorn
 CLI above is the same thing with reload for local work.
@@ -88,6 +83,23 @@ whatever runs the container. Lines logged while handling a request carry its
 correlation id — adopted from an inbound `X-Correlation-ID` when one arrives, minted
 here otherwise.
 
+## Library
+
+`agent/` is a uv workspace with one lockfile and one `.venv`. The service is `main.py`
+and `chat.py` at its root, run and never built; the catalog core is the
+[`holster-catalog`](packages/holster-catalog/README.md) library under `packages/`, which
+`uv sync` installs as an editable dependency and the image installs as a package. This
+file's `tmdb.py`, `catalog_tool.py`, `graph.py` and `turn.py` are in its
+`src/holster_catalog/`.
+
+The library imports no model provider: `main.py` builds two chat models with
+`init_chat_model`, which loads the Google provider package from the service's
+dependencies. `build_turn` gets the first as it is, for the interpret and rank calls, and
+the second wrapped in the library's `google_composer`, for the compose call.
+
+[`holster-catalog`'s *Versioning*](packages/holster-catalog/README.md#versioning) says
+which changes are a release.
+
 ## TMDB client
 
 `tmdb.py` wraps the catalog API: title search, `discover` (filter by streaming
@@ -116,13 +128,58 @@ environment — the token is passed to `TMDBClient(...)`.
 ## Catalog tool
 
 `catalog_tool.py` puts a model in front of `tmdb.py`, and `graph.py` runs the turn: a
-LangGraph `StateGraph` with no cycle, whose edges allow two model calls at most. The
-first call — the interpret call — is offered three declared tools and must pick exactly
-one: `search_catalog`, `look_up_title`, or `answer`, for a capability, clarifying,
-chat or off-topic reply. Nothing executes a tool: the model fills that tool's schema
-and the graph routes on which one it filled. A search that found candidates then gets
-the second call — the rank call — with no tools and `RankResult` as its only answer. A
-lookup or an answer makes no rank call. A lookup answers with every title carrying that
+LangGraph `StateGraph` with no cycle, whose edges allow two model calls at most.
+
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__(<p>__start__</p>)
+	interpret(interpret)
+	search(search)
+	lookup(lookup)
+	answer(answer)
+	rank(rank)
+	finish(finish)
+	__error_handler__compose(__error_handler__compose)
+	compose(compose)
+	__end__(<p>__end__</p>)
+	__start__ --> interpret;
+	interpret -.-> answer;
+	interpret -.-> lookup;
+	interpret -.-> search;
+	lookup -.-> __end__;
+	lookup -.-> compose;
+	rank --> finish;
+	search -.-> compose;
+	search -.-> rank;
+	answer --> __end__;
+	compose --> __end__;
+	finish --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+
+Dashed edges are conditional. `finish` turns the rank call's answer into the picks the turn
+shows (`finish_search()`); `compose` writes the sentence for a turn with nothing to show and
+is entered only from `search` and `lookup`. `__error_handler__compose` is the node LangGraph
+adds for compose's error handler, `compose_fallback`, and is drawn without edges. Run from
+`agent/`, this regenerates the diagram:
+
+```sh
+uv run python -c 'from holster_catalog import build_turn; from holster_catalog.testing import ok_compose, scripted; print(build_turn(scripted(), ok_compose).get_graph().draw_mermaid(), end="")'
+```
+
+The first call — the interpret call — is offered three declared tools and must pick
+exactly one: `search_catalog`, `look_up_title`, or `answer`, for a capability,
+clarifying, chat or off-topic reply. Nothing executes a tool: the model fills that tool's
+schema and the graph routes on which one it filled. A search that found candidates then
+gets the second call — the rank call — with no tools and `RankResult` as its only answer.
+A lookup or an answer makes no rank call. A lookup answers with every title carrying that
 name — the film itself, and anything carrying it on, so "Star Wars" reaches the sequels
 too. The interpret call's system prompt carries today's date, the server's, so "this
 year" and "new" resolve against it rather than against the year the model believes it
@@ -195,9 +252,9 @@ argument the clamp cannot fix ends the turn rather than going back to the model,
 would be another call. Each node writes what it found onto the graph's state
 (`TurnState`), and `outcome_of` reads the turn's one outcome from that state.
 
-LangChain lives in `graph.py`, in `turn.py`'s `RunnableConfig`, and at the bottom of
-`catalog_tool.py`, which holds the prompts and the composer's model binding. The rest of
-that file is plain TMDB and Python.
+Of this file's library modules, LangChain lives in `graph.py`, in `turn.py`'s
+`RunnableConfig`, and at the bottom of `catalog_tool.py`, which holds the prompts and the
+composer's model binding. The rest of that file is plain TMDB and Python.
 
 ## Chat pipeline
 

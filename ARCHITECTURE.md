@@ -6,7 +6,7 @@
 flowchart TD
     U([User]) --> W["web<br/>Next.js + Clerk"]
     W --> G["gateway<br/>Go"]
-    G --> AG["agent<br/>Python + LangChain"]
+    G --> AG["agent<br/>Python + LangGraph"]
     G --> DB[("PostgreSQL")]
     AG -->|"catalog query"| TMDB([TMDB])
     AG -->|"read only"| DB
@@ -25,7 +25,7 @@ Every service recommends from its own catalog; Holster recommends across all of 
 |---|---|---|
 | `web` | TypeScript | UI, Clerk session |
 | `gateway` | Go | The only endpoint the browser reaches. Verifies session, owns all writes |
-| `agent` | Python | LangChain orchestration, TMDB catalog tools |
+| `agent` | Python | LangGraph turn, TMDB catalog tools |
 
 Three services and a database. There is no OAuth anywhere in the system: the streaming
 services publish none, so there is nothing to connect to, and adding a provider that did
@@ -65,7 +65,9 @@ choose which declared tool runs and with what arguments or reply text, never whe
 request goes. The edges `build_turn` wires in `holster_catalog/graph.py` hold the two-call
 bound, the composer being a step entered only by a turn that made no rank call; those
 edges and the bindings in `rank_node` and `google_composer`, which offer no tools, hold
-the first-call-only rule. `agent/README.md` *Catalog tool* walks each call.
+the first-call-only rule. The library's `tests/test_graph.py` walks `get_graph()` for the
+edges and reads the tools the interpret and rank calls were bound with; no test reads
+`google_composer`'s. `agent/README.md` *Catalog tool* walks each call.
 
 ## Trust boundaries
 
