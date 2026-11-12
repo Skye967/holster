@@ -95,7 +95,8 @@ survivable.
   two-call bound; `MODEL_NODES` names the nodes that count. The first-call-only
   rule rests on those edges, which lead nothing back to `interpret`, and on `rank_node`
   and `google_composer`, which bind no tools. `test_graph.py` walks `get_graph()` for
-  the edges and reads what the graph's bindings recorded for the tools.
+  the edges and reads the tools the interpret and rank calls were bound with; no test
+  reads `google_composer`'s.
 - **The agent holds no credential belonging to a user or a third-party account.** It
   may hold app-level API keys — TMDB, the LLM provider — whose compromise costs a key
   rotation, not a user. If a change would give it a credential that reaches a user's
@@ -141,7 +142,7 @@ features: connection management, and one chat. Resist additions.
 |---|---|
 | `web/` | Next.js, TypeScript, Tailwind, shadcn/ui, Clerk |
 | `gateway/` | Go |
-| `agent/` | Python, FastAPI, LangChain |
+| `agent/` | Python, FastAPI, LangGraph, LangChain |
 | `agent/packages/holster-catalog/` | The agent's catalog library; `holster_catalog/` paths mean its `src/holster_catalog/` |
 | `db/` | Supabase (PostgreSQL) |
 

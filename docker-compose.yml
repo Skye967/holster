@@ -73,7 +73,7 @@ services:
       agent:
         condition: service_healthy
 
-  # --- Agent: LangChain orchestration, read-only, not exposed ---------------
+  # --- Agent: LangGraph turn, read-only, not exposed ------------------------
   # No published port: reachable from other compose services, never from the host
   # or the internet. The read-only database URL and verdict/conversation reads
   # arrive with the tasks that use them.

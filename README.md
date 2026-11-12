@@ -17,7 +17,7 @@ the whole stack comes up from a single `docker compose up --build`.
 |---|---|---|
 | `web/` | Next.js, TypeScript, Tailwind, shadcn/ui | Built — in `docker-compose.yml` |
 | `gateway/` | Go | Built — in `docker-compose.yml` |
-| `agent/` | Python, FastAPI, LangChain | Built — in `docker-compose.yml` |
+| `agent/` | Python, FastAPI, LangGraph, LangChain | Built — in `docker-compose.yml` |
 | `db/` | Supabase (PostgreSQL) | Schema + RLS in place |
 
 ## Scope
@@ -39,7 +39,7 @@ connect, and nothing to leak.
 flowchart TD
     U([User]) --> W["web/<br/>Next.js + Clerk"]
     W --> G["gateway/<br/>Go — the only exposed service"]
-    G --> AG["agent/<br/>Python + LangChain"]
+    G --> AG["agent/<br/>Python + LangGraph"]
     G --> DB[("Supabase<br/>PostgreSQL")]
     AG -->|"catalog query"| TMDB([TMDB])
     AG -->|"read only"| DB
@@ -145,7 +145,7 @@ host both callers share one URL.
 holster/
 ├── web/                  Next.js frontend
 ├── gateway/              request handling, all database writes
-├── agent/                LangChain agent and catalog tools
+├── agent/                LangGraph agent and catalog tools
 ├── db/                   Schema reference
 ├── supabase/migrations/  Supabase migrations
 └── ARCHITECTURE.md       services, trust boundaries, data model

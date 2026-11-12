@@ -37,7 +37,8 @@ or a change to what one takes, returns or does) is a minor release; a fix that m
 name do what it already claimed, or any other change to the dependency ranges in its
 `pyproject.toml` or to its code outside `holster_catalog.testing`, is a patch. The PR
 that makes the change also bumps `version` in `pyproject.toml` and adds its entry to
-[CHANGELOG.md](CHANGELOG.md), dated the day it merges. A change only to
+[CHANGELOG.md](CHANGELOG.md), dated the day it merges. CI does not check the version
+bump, so a forgotten one shows up only at tagging. A change only to
 `holster_catalog.testing`, the tests, `evals/`, the docs or `uv.lock` is not a release
 and needs neither.
 
