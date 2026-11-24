@@ -1419,12 +1419,16 @@ func interpretingLine(intent agentIntent, providerNames []string) string {
 		clauses = append(clauses, "to rent or buy")
 	}
 	switch {
+	case intent.ReleaseYearGte != nil && intent.ReleaseYearLte != nil && *intent.ReleaseYearGte == *intent.ReleaseYearLte:
+		clauses = append(clauses, fmt.Sprintf("from %d", *intent.ReleaseYearGte))
 	case intent.ReleaseYearGte != nil && intent.ReleaseYearLte != nil:
 		clauses = append(clauses, fmt.Sprintf("from %d-%d", *intent.ReleaseYearGte, *intent.ReleaseYearLte))
 	case intent.ReleaseYearGte != nil:
 		clauses = append(clauses, fmt.Sprintf("from %d on", *intent.ReleaseYearGte))
 	case intent.ReleaseYearLte != nil:
-		clauses = append(clauses, fmt.Sprintf("before %d", *intent.ReleaseYearLte))
+		// "through", not "before": tmdb.py sends release_year_lte as
+		// YYYY-12-31, so that year's titles come back.
+		clauses = append(clauses, fmt.Sprintf("through %d", *intent.ReleaseYearLte))
 	}
 	if intent.MaxRuntimeMinutes != nil {
 		clauses = append(clauses, fmt.Sprintf("under %d minutes", *intent.MaxRuntimeMinutes))
@@ -1444,7 +1448,7 @@ func interpretingLine(intent agentIntent, providerNames []string) string {
 		clauses = append(clauses, "starring "+humanJoin(intent.Cast))
 	}
 	if len(intent.Crew) > 0 {
-		clauses = append(clauses, "from "+humanJoin(intent.Crew))
+		clauses = append(clauses, "by "+humanJoin(intent.Crew))
 	}
 
 	line := "Looking for " + subject

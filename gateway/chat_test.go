@@ -127,6 +127,47 @@ func TestInterpretingLineComposesGenreYearRuntimeAndProviders(t *testing.T) {
 	}
 }
 
+// The interpret prompt reads "this year" and "new" as a range of the current
+// year alone, which asks the model for equal bounds.
+func TestInterpretingLineReadsEqualYearBoundsAsOneYear(t *testing.T) {
+	year := 2026
+	line := interpretingLine(agentIntent{
+		MediaType:      "movie",
+		ReleaseYearGte: &year,
+		ReleaseYearLte: &year,
+	}, nil)
+
+	if want := "Looking for movies from 2026"; line != want {
+		t.Errorf("interpretingLine() = %q, want %q", line, want)
+	}
+}
+
+// tmdb.py sends release_year_lte as YYYY-12-31, so that year's titles come
+// back and "before" would deny them.
+func TestInterpretingLineReadsAnUpperBoundAsInclusive(t *testing.T) {
+	lte := 1999
+	line := interpretingLine(agentIntent{MediaType: "movie", ReleaseYearLte: &lte}, nil)
+
+	if want := "Looking for movies through 1999"; line != want {
+		t.Errorf("interpretingLine() = %q, want %q", line, want)
+	}
+}
+
+// Beside a year clause, "from" a director reads as a second "from" date.
+func TestInterpretingLineReadsCrewAsBy(t *testing.T) {
+	year := 2026
+	line := interpretingLine(agentIntent{
+		MediaType:      "movie",
+		ReleaseYearGte: &year,
+		ReleaseYearLte: &year,
+		Crew:           []string{"Christopher Nolan"},
+	}, nil)
+
+	if want := "Looking for movies from 2026, by Christopher Nolan"; line != want {
+		t.Errorf("interpretingLine() = %q, want %q", line, want)
+	}
+}
+
 // tmdb.py OR-joins with_keywords, and the interpret prompt now encourages
 // near-synonyms for one mood, so a comma list here promised a conjunction the
 // results provably do not satisfy.
